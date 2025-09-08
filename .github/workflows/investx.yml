@@ -48,3 +48,4 @@ jobs:
             -d chat_id="${CHAT_ID}" \
             -d parse_mode="HTML" \
             --data-urlencode text="⚡️ Test rápido enviado manualmente desde GitHub Actions 🚀"
+
