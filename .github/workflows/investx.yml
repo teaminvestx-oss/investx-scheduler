@@ -10,6 +10,7 @@ on:
 
 jobs:
   send:
+    if: github.event_name == 'schedule'   # Solo cuando se lanza por cron
     runs-on: ubuntu-latest
     steps:
       - name: Pick message
@@ -35,8 +36,8 @@ jobs:
             --data-urlencode text="${TEXT}"
 
   test:
+    if: github.event_name == 'workflow_dispatch'   # Solo cuando lo lanzas manualmente
     runs-on: ubuntu-latest
-    if: github.event_name == 'workflow_dispatch'
     steps:
       - name: Send custom test message
         env:
