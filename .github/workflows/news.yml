@@ -2,10 +2,10 @@ name: InvestX Market News
 
 on:
   schedule:
-    # Madrid en verano = UTC+2 → 08:30 y 20:30 locales
-    - cron: '30 6 * * 1-5'   # 08:30 Madrid (L-V)
-    - cron: '30 18 * * 1-5'  # 20:30 Madrid (L-V)
+    - cron: '0 11 * * 1-5'   # 13:00 Madrid (L-V)
+    - cron: '0 20 * * 1-5'   # 22:00 Madrid (L-V)
   workflow_dispatch: {}
+
 
 jobs:
   news:
