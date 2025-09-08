@@ -2,7 +2,6 @@ name: InvestX Telegram Scheduler
 
 on:
   schedule:
-    - cron: "*/2 * * * *"   # cada 2 min (prueba)
     - cron: "0 7 * * *"     # 09:00 Madrid
     - cron: "0 19 * * *"    # 21:00 Madrid
     - cron: "0 20 * * 1-5"  # 22:00 Madrid (L-V)
@@ -50,12 +49,4 @@ jobs:
             -d chat_id="${CHAT_ID}" \
             -d parse_mode="HTML" \
             --data-urlencode text="⚡️ Test rápido enviado manualmente desde GitHub Actions 🚀"
-
-
-  heartbeat:
-    if: github.event_name == 'schedule'
-    runs-on: ubuntu-latest
-    steps:
-      - run: echo "🫀 Heartbeat $(date -u) — schedule OK"
-
 
