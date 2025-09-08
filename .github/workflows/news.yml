@@ -1,0 +1,37 @@
+name: InvestX Market News
+
+on:
+  schedule:
+    # Madrid en verano = UTC+2 → 08:30 y 20:30 locales
+    - cron: '30 6 * * 1-5'   # 08:30 Madrid (L-V)
+    - cron: '30 18 * * 1-5'  # 20:30 Madrid (L-V)
+  workflow_dispatch: {}
+
+jobs:
+  news:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (no code needed, but keeps run context)
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install deps
+        run: |
+            python -m pip install --upgrade pip
+            pip install feedparser requests
+
+      - name: Run news fetcher
+        env:
+          INVESTX_TOKEN: ${{ secrets.INVESTX_TOKEN }}
+          CHAT_ID: ${{ secrets.CHAT_ID }}
+          TZ_OFFSET_MINUTES: "120"          # Madrid verano=120, invierno=60
+          LOOKBACK_HOURS: "12"
+          MAX_ITEMS: "5"
+          KEYWORDS: "fed,ecb,boe,ipc,cpi,pmi,ism,nonfarm,empleo,inflación,inflation,tipos,rates,hike,cut,earnings,resultados,forecast,guidance,merger,acquisition,m&a,opa,downgrade,upgrade,oil,gas,war,china,tariffs"
+          WATCHLIST: "AAPL,MSFT,AMZN,NVDA,GOOGL,META,TSLA,SAP,ASML,ADIDAS,CRM,SPOT,BTC,ETH"
+        run: |
+          python news.py
