@@ -2,11 +2,12 @@ name: InvestX Telegram Scheduler
 
 on:
   schedule:
-    - cron: '*/2 * * * *'     # TEMP: prueba cada 2 minutos (UTC)
-    - cron: '0 7 * * *'
-    - cron: '0 19 * * *'
-    - cron: '0 20 * * 1-5'
+    - cron: "*/2 * * * *"   # cada 2 min (prueba)
+    - cron: "0 7 * * *"     # 09:00 Madrid
+    - cron: "0 19 * * *"    # 21:00 Madrid
+    - cron: "0 20 * * 1-5"  # 22:00 Madrid (L-V)
   workflow_dispatch:
+
 
 
 jobs:
