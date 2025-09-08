@@ -89,7 +89,8 @@ def main():
     items = fetch_items()
     # cabecera con fecha local Madrid
     local = datetime.utcnow() + timedelta(minutes=TZ_OFFSET)
-    header = local.strftime("🗞️ <b>Noticias clave — %a %d %b %H:%M</b> (últ.%dh)\n" % LOOKBACK_HOURS)
+    header = local.strftime("🗞️ <b>Noticias clave — %a %d %b %H:%M</b>")
+    header += f" (últ.{LOOKBACK_HOURS}h)\n"
     if not items:
         text = header + "• No hay titulares destacados en la ventana seleccionada."
         send_message(text); return
