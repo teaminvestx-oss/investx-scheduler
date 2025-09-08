@@ -33,3 +33,17 @@ jobs:
             -d chat_id="${CHAT_ID}" \
             -d parse_mode="HTML" \
             --data-urlencode text="${TEXT}"
+
+  test:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch'
+    steps:
+      - name: Send custom test message
+        env:
+          BOT_TOKEN: ${{ secrets.INVESTX_TOKEN }}
+          CHAT_ID: ${{ secrets.CHAT_ID }}
+        run: |
+          curl -s "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+            -d chat_id="${CHAT_ID}" \
+            -d parse_mode="HTML" \
+            --data-urlencode text="⚡️ Test rápido enviado manualmente desde GitHub Actions 🚀"
