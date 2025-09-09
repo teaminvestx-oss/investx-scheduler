@@ -26,6 +26,6 @@ jobs:
           pip3 install --upgrade pip
           pip3 install feedparser requests
 
-      - name: Run News Script
-        run: |
-          python3 scripts/news.py
+   - name: Run News Script
+      run: |
+      python3 news.py
