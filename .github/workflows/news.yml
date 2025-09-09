@@ -1,37 +1,31 @@
-name: InvestX Market News
+name: Telegram | Noticias ES (L-V 12:55 y 21:55)
 
 on:
   schedule:
-    - cron: '0 11 * * 1-5'   # 13:00 Madrid (L-V)
-    - cron: '0 20 * * 1-5'   # 22:00 Madrid (L-V)
+    # En verano (CEST): Madrid 12:55 y 21:55 => UTC 10:55 y 19:55
+    - cron: "55 10,19 * * 1-5"
   workflow_dispatch: {}
-
 
 jobs:
   news:
     runs-on: ubuntu-latest
+    env:
+      CHAT_ID: ${{ secrets.CHAT_ID }}
+      INVESTX_TOKEN: ${{ secrets.INVESTX_TOKEN }}
+      DEEPL_API_KEY: ${{ secrets.DEEPL_API_KEY }}
+      LOCAL_TZ: "Europe/Madrid"
+      LOOKBACK_HOURS: "10"
+      MAX_ITEMS: "10"
     steps:
-      - name: Checkout (no code needed, but keeps run context)
+      - name: Check out repo
         uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-
-      - name: Install deps
+      - name: Setup Python
         run: |
-            python -m pip install --upgrade pip
-            pip install feedparser requests
+          python3 -V
+          pip3 install --upgrade pip
+          pip3 install feedparser requests
 
-      - name: Run news fetcher
-        env:
-          INVESTX_TOKEN: ${{ secrets.INVESTX_TOKEN }}
-          CHAT_ID: ${{ secrets.CHAT_ID }}
-          TZ_OFFSET_MINUTES: "120"          # Madrid verano=120, invierno=60
-          LOOKBACK_HOURS: "12"
-          MAX_ITEMS: "5"
-          KEYWORDS: "fed,ecb,boe,ipc,cpi,pmi,ism,nonfarm,empleo,inflación,inflation,tipos,rates,hike,cut,earnings,resultados,forecast,guidance,merger,acquisition,m&a,opa,downgrade,upgrade,oil,gas,war,china,tariffs"
-          WATCHLIST: "AAPL,MSFT,AMZN,NVDA,GOOGL,META,TSLA,SAP,ASML,ADIDAS,CRM,SPOT,BTC,ETH"
+      - name: Run News Script
         run: |
-          python news.py
+          python3 scripts/news.py
