@@ -145,7 +145,7 @@ def main():
     items = fetch_items()
     now_local = datetime.now(LOCAL_TZ)
     header = f"🗞️ <b>Noticias clave — {fecha_es(now_local)}</b>\n"
-    header += "Desde <b>InvestX</b> os recalcamos las noticias más importantes (máx. 10):\n\n"
+    header += "Desde <b>InvestX</b> os recalcamos las noticias más importantes recientes:\n\n"
 
     if not items:
         send_message(header + "• No hay titulares destacados en la ventana seleccionada.")
