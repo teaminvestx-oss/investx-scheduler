@@ -1,4 +1,4 @@
-# movers.py — Finviz Top Gainers/Losers por índices USA + Heatmap (JPEG seguro para Telegram)
+# movers.py — Finviz Top Movers por índices USA + Heatmap robusto
 import os, io, re, math, warnings
 import requests
 import pandas as pd
@@ -6,16 +6,16 @@ import matplotlib.pyplot as plt
 import squarify
 from PIL import Image
 
-# ---------- Config ----------
+# ---------------- Config ----------------
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 CHAT_ID   = os.environ.get("CHAT_ID")
 assert BOT_TOKEN and CHAT_ID, "Faltan BOT_TOKEN o CHAT_ID"
 
-ONLY_GAINERS = False              # True => solo ganadores (sin perdedores)
-LIMIT_PER_INDEX = 10              # Nº de filas por índice
-MAX_CAPTION = 1000                # Seguridad bajo límite telegram (1024)
+ONLY_GAINERS = False              # True => solo ganadores
+LIMIT_PER_INDEX = 10              # Nº filas por índice
+MAX_CAPTION = 1000                # < 1024 (límite Telegram)
 
-# Índices principales de USA en Finviz
+# Índices Finviz
 INDICES = {
     "S&P 500":      "idx_sp500",
     "Nasdaq-100":   "idx_nasdaq100",
@@ -27,7 +27,6 @@ HEADERS = {
     "User-Agent": "Mozilla/5.0",
     "Accept-Language": "en-US,en;q=0.9",
     "Referer": "https://finviz.com/",
-    "Cache-Control": "no-cache",
 }
 
 warnings.filterwarnings(
@@ -36,100 +35,135 @@ warnings.filterwarnings(
     category=FutureWarning
 )
 
-# ---------- Utilidades ----------
-def finviz_table(url: str) -> pd.DataFrame:
-    """Descarga la página del screener y devuelve la tabla principal."""
-    r = requests.get(url, headers=HEADERS, timeout=60)
-    r.raise_for_status()
-    dfs = pd.read_html(r.text)
-    # Busca una tabla con columnas típicas
-    for df in dfs:
-        cols = set(map(str, df.columns))
-        if {"Ticker", "Company", "Sector", "Change"} & cols:
-            return df.copy()
-    # Fallback
-    return dfs[-1].copy()
+# ---------------- Utilidades ----------------
+_TICKER_RE = re.compile(r"^[A-Z][A-Z0-9.\-]{0,5}$")  # patrón razonable de ticker
 
-def parse_change(x: str) -> float:
-    # "+3.45%" -> 3.45 ; "-1.2%" -> -1.2
-    if isinstance(x, str) and "%" in x:
-        s = x.strip().replace("%", "")
-        try:
-            val = float(s.replace("+", "").replace(",", ""))
-            return -val if x.strip().startswith("-") else val
-        except Exception:
-            return float("nan")
-    return float("nan")
+def pick_finviz_table(html_text: str) -> pd.DataFrame:
+    """
+    Lee todas las tablas y devuelve SOLO la tabla de resultados del screener.
+    Criterios:
+      - Debe tener columna 'Ticker'
+      - Al menos 5 filas con Ticker que cumpla el patrón regex
+      - Debe contener 'Change' o 'Price'
+    """
+    tables = pd.read_html(html_text)
+    best = None
+    best_score = -1
+    for df in tables:
+        cols = [str(c) for c in df.columns]
+        if "Ticker" not in cols:
+            continue
+        colset = set(cols)
+        if not ({"Change","Price"} & colset):
+            continue
 
-def parse_mcap(x: str) -> float:
-    # "1.23T" -> 1.23e12, "45.6B" -> 4.56e10, "320M" -> 3.2e8
-    if not isinstance(x, str):
-        return float("nan")
-    s = x.strip().upper().replace(",", "")
-    m = re.match(r"^([0-9]*\.?[0-9]+)\s*([KMBT])$", s)
-    if not m:
-        return float("nan")
-    val, suf = float(m.group(1)), m.group(2)
-    mult = {"K": 1e3, "M": 1e6, "B": 1e9, "T": 1e12}[suf]
-    return val * mult
+        # cuenta tickers válidos
+        valid = 0
+        tickers = df["Ticker"].astype(str).tolist()
+        for t in tickers:
+            t = t.strip()
+            if _TICKER_RE.match(t):
+                valid += 1
+        score = valid
 
-def get_movers(index_code: str, top: bool = True, limit: int = 10) -> pd.DataFrame:
-    """Obtiene top gainers/losers del índice en Finviz."""
+        if score > best_score:
+            best_score = score
+            best = df
+
+    if best is None:
+        # Fallback a la última, pero luego filtraremos y si queda vacía enviaremos solo texto
+        best = tables[-1]
+
+    return best.copy()
+
+def finviz_fetch(index_code: str, top: bool=True) -> pd.DataFrame:
     s = "ta_topgainers" if top else "ta_toplosers"
     url = f"https://finviz.com/screener.ashx?v=111&s={s}&f={index_code}"
-    df = finviz_table(url)
+    r = requests.get(url, headers=HEADERS, timeout=60)
+    r.raise_for_status()
+    df = pick_finviz_table(r.text)
 
-    # columnas que solemos ver en Finviz (algunas pueden faltar)
+    # Normaliza columnas esperadas
     pref_cols = ["Ticker","Company","Sector","Industry","Country","Market Cap","Price","Change","Volume"]
     cols = [c for c in pref_cols if c in df.columns]
-    df = df[cols].head(limit).copy()
+    df = df[cols].copy()
 
-    # normalizamos
-    if "Change" in df.columns:
-        df["chg_pct"] = df["Change"].apply(parse_change)
-    else:
-        df["chg_pct"] = float("nan")
+    # Limpieza: quita filas basura (Reset Filters, cabeceras, etc.)
+    def is_valid_ticker(x):
+        return isinstance(x, str) and bool(_TICKER_RE.match(x.strip()))
+    df = df[df["Ticker"].apply(is_valid_ticker)]
 
-    if "Market Cap" in df.columns:
-        df["mcap"] = df["Market Cap"].apply(parse_mcap)
-    else:
-        df["mcap"] = float("nan")
-
-    # Asegura columnas clave para formatear
-    for c in ["Company","Sector","Price","Volume"]:
+    # Asegura columnas
+    for c in pref_cols:
         if c not in df.columns:
             df[c] = ""
-    return df
+
+    # Parseos
+    def parse_change(x):
+        if isinstance(x, str) and "%" in x:
+            s = x.replace("%","").replace("+","").replace(",","").strip()
+            try:
+                val = float(s)
+                return -val if x.strip().startswith("-") else val
+            except:
+                return float("nan")
+        return float("nan")
+
+    def parse_mcap(x):
+        if not isinstance(x, str):
+            return float("nan")
+        s = x.strip().upper().replace(",","")
+        m = re.match(r"^([0-9]*\.?[0-9]+)\s*([KMBT])$", s)
+        if not m:
+            return float("nan")
+        val, suf = float(m.group(1)), m.group(2)
+        mult = {"K":1e3,"M":1e6,"B":1e9,"T":1e12}[suf]
+        return val*mult
+
+    df["chg_pct"] = df["Change"].apply(parse_change) if "Change" in df.columns else float("nan")
+    df["mcap"]    = df["Market Cap"].apply(parse_mcap) if "Market Cap" in df.columns else float("nan")
+
+    # Orden por cambio o por precio si no hay change
+    if df["chg_pct"].notna().any():
+        df = df.sort_values("chg_pct", ascending=not top)
+    elif "Price" in df.columns:
+        # si no hay change (raro), ordena por Price desc (placeholder)
+        df = df.sort_values("Price", ascending=False)
+
+    return df.head(LIMIT_PER_INDEX).reset_index(drop=True)
 
 def fmt_table(df: pd.DataFrame) -> str:
     if df.empty:
         return "—"
-    lines = []
-    for i, r in df.reset_index(drop=True).iterrows():
-        price = r["Price"] if str(r["Price"]) != "" else "—"
-        comp  = r["Company"] if str(r["Company"]) != "" else ""
-        lines.append(f"{i+1}) {r['Ticker']} {r['Change']} – {comp} (Price {price})")
-    return "\n".join(lines)
+    out = []
+    for i, r in df.iterrows():
+        change = r["Change"] if isinstance(r["Change"], str) and r["Change"] else f"{r['chg_pct']:+.2f}%"
+        price  = r["Price"] if str(r["Price"]) != "" else "—"
+        comp   = r["Company"] if str(r["Company"]) != "" else ""
+        out.append(f"{i+1}) {r['Ticker']} {change} – {comp} (Price {price})")
+    return "\n".join(out)
 
 def top_usa(df: pd.DataFrame, n=10, reverse=False) -> pd.DataFrame:
     if df.empty:
         return df
-    return df.sort_values("chg_pct", ascending=reverse).head(n)
+    if df["chg_pct"].notna().any():
+        return df.sort_values("chg_pct", ascending=reverse).head(n)
+    return df.head(n)
 
-# ---------- Descarga movers por índice ----------
+# ---------------- Descarga por índices ----------------
 frames_g, frames_l = [], []
 for idx_name, idx_code in INDICES.items():
     try:
-        g = get_movers(idx_code, top=True,  limit=LIMIT_PER_INDEX);  g["Index"] = idx_name; frames_g.append(g)
+        g = finviz_fetch(idx_code, top=True);  g["Index"] = idx_name; frames_g.append(g)
         if not ONLY_GAINERS:
-            l = get_movers(idx_code, top=False, limit=LIMIT_PER_INDEX); l["Index"] = idx_name; frames_l.append(l)
+            l = finviz_fetch(idx_code, top=False); l["Index"] = idx_name; frames_l.append(l)
     except Exception as e:
-        print(f"[WARN] No se pudo leer {idx_name}: {e}")
+        print(f"[WARN] {idx_name}: {e}")
 
 gainers_all = pd.concat(frames_g, ignore_index=True) if frames_g else pd.DataFrame()
 losers_all  = pd.concat(frames_l, ignore_index=True) if (frames_l and not ONLY_GAINERS) else pd.DataFrame()
 
-# ---------- Construcción del texto ----------
+# ---------------- Texto ----------------
 caption_parts = []
 caption_parts.append("📈 <b>InvestX – Top Movers USA</b>\nSPX + NDX + DJI + R2K (cierre)")
 
@@ -145,17 +179,19 @@ if not ONLY_GAINERS and not losers_all.empty:
 caption_parts.append("\n🗺️ Heatmap por movers en la imagen.")
 caption = "\n".join(caption_parts)
 
-# ---------- Heatmap (treemap) de ganadores + perdedores ----------
+# ---------------- Heatmap ----------------
 heat_df = pd.concat([gainers_all, losers_all], ignore_index=True) if not ONLY_GAINERS else gainers_all.copy()
+
 if heat_df.empty:
-    # sin datos, manda solo texto
+    # Si no hay datos válidos, envía solo el texto
     requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
                   data={"chat_id": CHAT_ID, "text": caption[:4096], "parse_mode": "HTML"}, timeout=60)
-    raise SystemExit("Sin datos que graficar")
+    raise SystemExit("Sin datos válidos para graficar")
 
-# tamaño: market cap (si falta => 1.0)
-sizes = [r["mcap"] if not math.isnan(r["mcap"]) else 1.0 for _, r in heat_df.iterrows()]
-# color: cambio %
+# Tamaño por market cap (fallback tamaño 1)
+sizes = [r["mcap"] if (isinstance(r["mcap"], (int,float)) and not math.isnan(r["mcap"])) else 1.0
+         for _, r in heat_df.iterrows()]
+# Color por % cambio
 chg = heat_df["chg_pct"].fillna(0.0)
 mn, mx = float(chg.min()), float(chg.max())
 if mx - mn < 1e-6:
@@ -170,50 +206,36 @@ squarify.plot(sizes=sizes, label=labels, color=colors, alpha=0.9, text_kwargs={"
 plt.axis("off")
 plt.title("InvestX – Movers (SPX + NDX + DJI + R2K)")
 
-# ---------- Guardar PNG del plot ----------
+# ---------- Export a JPEG 1280x720 y enviar ----------
 buf_png = io.BytesIO()
 plt.savefig(buf_png, format="png", dpi=140, bbox_inches="tight")
 plt.close()
 buf_png.seek(0)
 
-# ---------- Convertir a JPEG con tamaño fijo 1280x720 ----------
-from PIL import Image
-
-# Abrimos el PNG en memoria y lo pasamos a RGB (sin alpha)
 img = Image.open(buf_png).convert("RGB")
-
-# Creamos un lienzo fijo 1280x720 y centramos el gráfico manteniendo proporción
 TARGET_W, TARGET_H = 1280, 720
 canvas = Image.new("RGB", (TARGET_W, TARGET_H), (255, 255, 255))
-
-# Escalado máximo manteniendo aspecto al área disponible
 w, h = img.size
 ratio = min(TARGET_W / w, TARGET_H / h)
 new_w, new_h = max(1, int(w * ratio)), max(1, int(h * ratio))
 img = img.resize((new_w, new_h), Image.LANCZOS)
-
-# Pegamos centrado
 offset = ((TARGET_W - new_w) // 2, (TARGET_H - new_h) // 2)
 canvas.paste(img, offset)
 
-# Exportamos a JPEG (RGB) con calidad alta
 buf_jpg = io.BytesIO()
 canvas.save(buf_jpg, format="JPEG", quality=90, optimize=True, progressive=True)
 buf_jpg.seek(0)
 
-# ---------- Envío a Telegram (foto + caption) con fallback a sendDocument ----------
-MAX_CAPTION = 1000
 caption_safe = caption if len(caption) <= MAX_CAPTION else caption[:MAX_CAPTION] + "…"
 
+# Envío con fallback a documento
 files = {"photo": ("movers_heatmap.jpg", buf_jpg.getvalue(), "image/jpeg")}
 payload = {"chat_id": CHAT_ID, "caption": caption_safe, "parse_mode": "HTML"}
 
 resp = requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto",
                      data=payload, files=files, timeout=60)
 print("Telegram response (sendPhoto):", resp.text)
-
 if not resp.ok:
-    # Fallback sólido: enviar como documento (no aplica validación estricta de dimensiones)
     files_doc = {"document": ("movers_heatmap.jpg", buf_jpg.getvalue(), "image/jpeg")}
     payload_doc = {"chat_id": CHAT_ID, "caption": caption_safe, "parse_mode": "HTML"}
     resp2 = requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendDocument",
