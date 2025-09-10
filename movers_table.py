@@ -88,7 +88,11 @@ def pick_finviz_table(html_text: str) -> pd.DataFrame:
         valid = sum(bool(_TK.match(str(t).strip())) for t in df["Ticker"])
         if valid > score:
             best, score = df, valid
-    return (best or tables[-1]).copy()
+    if best is not None:
+        return best.copy()
+    else:
+        return tables[-1].copy()
+
 
 def ensure_columns(df: pd.DataFrame) -> pd.DataFrame:
     for c in BASE_COLS:
