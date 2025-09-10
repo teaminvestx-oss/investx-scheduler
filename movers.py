@@ -170,39 +170,58 @@ squarify.plot(sizes=sizes, label=labels, color=colors, alpha=0.9, text_kwargs={"
 plt.axis("off")
 plt.title("InvestX – Movers (SPX + NDX + DJI + R2K)")
 
-# ---------- Guardar PNG, convertir a JPEG seguro, y enviar ----------
-# Guardamos el plot en PNG en memoria
+# ---------- Guardar PNG del plot ----------
 buf_png = io.BytesIO()
 plt.savefig(buf_png, format="png", dpi=140, bbox_inches="tight")
 plt.close()
 buf_png.seek(0)
 
-# Convertimos a JPEG (RGB sin alpha) y normalizamos tamaño
-img = Image.open(buf_png).convert("RGB")
-max_w, max_h = 1600, 900
-w, h = img.size
-ratio = min(max_w / w, max_h / h, 1.0)
-if ratio < 1.0:
-    img = img.resize((int(w * ratio), int(h * ratio)), Image.LANCZOS)
-if img.size[0] < 10 or img.size[1] < 10:
-    img = img.resize((800, 450), Image.LANCZOS)
+# ---------- Convertir a JPEG con tamaño fijo 1280x720 ----------
+from PIL import Image
 
+# Abrimos el PNG en memoria y lo pasamos a RGB (sin alpha)
+img = Image.open(buf_png).convert("RGB")
+
+# Creamos un lienzo fijo 1280x720 y centramos el gráfico manteniendo proporción
+TARGET_W, TARGET_H = 1280, 720
+canvas = Image.new("RGB", (TARGET_W, TARGET_H), (255, 255, 255))
+
+# Escalado máximo manteniendo aspecto al área disponible
+w, h = img.size
+ratio = min(TARGET_W / w, TARGET_H / h)
+new_w, new_h = max(1, int(w * ratio)), max(1, int(h * ratio))
+img = img.resize((new_w, new_h), Image.LANCZOS)
+
+# Pegamos centrado
+offset = ((TARGET_W - new_w) // 2, (TARGET_H - new_h) // 2)
+canvas.paste(img, offset)
+
+# Exportamos a JPEG (RGB) con calidad alta
 buf_jpg = io.BytesIO()
-img.save(buf_jpg, format="JPEG", quality=90, optimize=True)
+canvas.save(buf_jpg, format="JPEG", quality=90, optimize=True, progressive=True)
 buf_jpg.seek(0)
 
+# ---------- Envío a Telegram (foto + caption) con fallback a sendDocument ----------
+MAX_CAPTION = 1000
 caption_safe = caption if len(caption) <= MAX_CAPTION else caption[:MAX_CAPTION] + "…"
 
 files = {"photo": ("movers_heatmap.jpg", buf_jpg.getvalue(), "image/jpeg")}
 payload = {"chat_id": CHAT_ID, "caption": caption_safe, "parse_mode": "HTML"}
 
-r = requests.post(
-    f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto",
-    data=payload,
-    files=files,
-    timeout=60
-)
-print("Telegram response:", r.text)
-r.raise_for_status()
+resp = requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto",
+                     data=payload, files=files, timeout=60)
+print("Telegram response (sendPhoto):", resp.text)
+
+if not resp.ok:
+    # Fallback sólido: enviar como documento (no aplica validación estricta de dimensiones)
+    files_doc = {"document": ("movers_heatmap.jpg", buf_jpg.getvalue(), "image/jpeg")}
+    payload_doc = {"chat_id": CHAT_ID, "caption": caption_safe, "parse_mode": "HTML"}
+    resp2 = requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendDocument",
+                          data=payload_doc, files=files_doc, timeout=60)
+    print("Telegram response (sendDocument):", resp2.text)
+    resp2.raise_for_status()
+else:
+    resp.raise_for_status()
+
 print("✔️ Enviado a Telegram")
 
