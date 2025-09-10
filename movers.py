@@ -155,9 +155,21 @@ plt.savefig(buf, format="png", dpi=140, bbox_inches="tight")
 plt.close()
 buf.seek(0)
 
-# ---- Envío a Telegram (foto + caption) ----
+# ---- Envío a Telegram ----
+MAX_CAPTION = 1000  # Telegram limita a 1024 caracteres
+caption_safe = caption
+if len(caption_safe) > MAX_CAPTION:
+    caption_safe = caption_safe[:MAX_CAPTION] + "…"
+
 files = {"photo": ("movers_heatmap.png", buf.getvalue(), "image/png")}
-payload = {"chat_id": CHAT_ID, "caption": caption, "parse_mode": "HTML"}
-r = requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto", data=payload, files=files, timeout=60)
+payload = {
+    "chat_id": CHAT_ID,
+    "caption": caption_safe,
+    "parse_mode": "HTML"
+}
+
+r = requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto",
+                  data=payload, files=files, timeout=60)
+print("Respuesta Telegram:", r.text)
 r.raise_for_status()
-print("✔️ Enviado a Telegram")
+
