@@ -2,12 +2,13 @@ name: InvestX – Daily Movers (22:30 Madrid)
 
 on:
   schedule:
-    - cron: "30 20 * * 1-5"   # 22:30 Europe/Madrid (CEST). Cambia a 21:30 UTC cuando acabe el horario de verano.
+    - cron: "30 20 * * 1-5"   # 22:30 Europe/Madrid (CEST). Cambia a 21:30 UTC cuando termine el horario de verano.
   workflow_dispatch:
 
 jobs:
   movers:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
