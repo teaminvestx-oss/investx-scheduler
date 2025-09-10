@@ -1,0 +1,33 @@
+name: InvestX – Daily Movers Tables (22:30 Madrid)
+
+on:
+  schedule:
+    - cron: "30 20 * * 1-5"   # 22:30 Europe/Madrid (CEST). Cambia a 21:30 UTC cuando acabe el horario de verano.
+  workflow_dispatch:
+
+jobs:
+  movers_table:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas requests lxml numpy playwright
+          python -m playwright install --with-deps chromium
+
+      - name: Send gainers/losers tables
+        env:
+          BOT_TOKEN: ${{ secrets.INVESTX_TOKEN }}
+          CHAT_ID:   ${{ secrets.CHAT_ID }}
+          USE_PLAYWRIGHT: "1"
+        run: |
+          python movers_table.py
