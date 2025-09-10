@@ -183,3 +183,4 @@ def to_prety_table(df, title):  # alias for safety if copy/paste
 
 if __name__ == "__main__":
     main()
+
