@@ -2,10 +2,11 @@ name: InvestX Telegram Scheduler
 
 on:
   schedule:
-    - cron: "0 7 * * *"      # 09:00 Madrid (CEST)
-    - cron: "0 19 * * *"     # 21:00 Madrid (CEST)
-    - cron: "0 20 * * 1-5"   # 22:00 Madrid (L-V, CEST)
-  workflow_dispatch: {}
+    - cron: "0 7 * * 1-5"     # 09:00 Madrid (L-V)
+    - cron: "0 19 * * 1-5"    # 21:00 Madrid (L-V)
+    - cron: "0 20 * * 1-5"    # 22:00 Madrid (L-V)
+  workflow_dispatch:
+
 
 jobs:
   diag:
