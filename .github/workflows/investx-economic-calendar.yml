@@ -10,12 +10,16 @@ jobs:
   econ-calendar:
     runs-on: ubuntu-latest
     steps:
-      - name: Install tools
+      - name: Install jq & pup
         run: |
           sudo apt-get update
-          sudo apt-get install -y jq pup
+          sudo apt-get install -y jq curl
+          # Instalar pup desde release
+          curl -sL https://github.com/ericchiang/pup/releases/download/v0.4.0/pup_v0.4.0_linux_amd64.zip -o pup.zip
+          sudo apt-get install -y unzip
+          unzip pup.zip
+          sudo mv pup /usr/local/bin/
 
-      # 1) Cargamos la página de Investing (ES) y guardamos cookies para evitar bloqueos
       - name: Fetch Investing page (with cookies)
         run: |
           UA="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
@@ -24,35 +28,21 @@ jobs:
             -H "User-Agent: $UA" \
             -H "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8" \
             -c cookies.txt -b cookies.txt -o cal.html
-          # Descargar también la versión en inglés por si ES cambia estructura
-          curl -sSL "https://www.investing.com/economic-calendar/" \
-            -H "User-Agent: $UA" \
-            -H "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8" \
-            -c cookies.txt -b cookies.txt -o cal_en.html
 
-      # 2) Extraemos filas del calendario desde el HTML (no JSON)
-      #    y filtramos: data-country="5" (USA) y data-importance 2 o 3
       - name: Parse events from HTML
         run: |
           set -euo pipefail
-          # Usamos la página ES si contiene filas; si no, probamos EN
-          for SRC in cal.html cal_en.html; do
-            pup 'tr[id^="eventRowId_"] json{}' < "$SRC" > rows.json || true
-            if [ -s rows.json ]; then break; fi
-          done
+          pup 'tr[id^="eventRowId_"] json{}' < cal.html > rows.json
 
-          # rows.json -> events.json con solo USA (5) e importancia 2/3
           jq -c '
             .[] |
             select(.attrs["data-country"]=="5" and (.attrs["data-importance"]=="2" or .attrs["data-importance"]=="3")) |
             {
               ts: ( .attrs["data-event-datetime"] | tonumber ),
               imp: ( .attrs["data-importance"] ),
-              # hora visible en la tabla
               time_txt: (
                 [.children[] | select(.tag=="td" and (.attrs.class//""|test("time"))) ][0].text // ""
               ),
-              # título del evento (preferimos atributo title del <a>)
               title: (
                 [.children[] | select(.tag=="td" and (.attrs.class//""|test("event"))) ][0]
                 | if has("children") then
@@ -64,8 +54,6 @@ jobs:
             }
           ' rows.json > events_raw.json
 
-          # Convertimos a estructura final con fecha local Europe/Madrid
-          # y ordenamos por timestamp
           TZ=Europe/Madrid jq -c '
             map({
               date: (.ts | todate | strptime("%Y-%m-%dT%H:%M:%S%z") | strftime("%Y-%m-%d")),
@@ -76,25 +64,22 @@ jobs:
             | sort_by(.date,.time)
           ' events_raw.json > events.json
 
-      # 3) Construimos y enviamos el mensaje a Telegram
       - name: Build & Send message
         env:
           BOT_TOKEN: ${{ secrets.INVESTX_TOKEN }}
           CHAT_ID: ${{ secrets.CHAT_ID }}
         run: |
           set -euo pipefail
-          DOW=$(date -u +%u)                     # 1..7
+          DOW=$(date -u +%u)
           TODAY=$(TZ=Europe/Madrid date +%Y-%m-%d)
           WEEK_START=$(TZ=Europe/Madrid date -d "monday this week" +%Y-%m-%d)
           WEEK_END=$(TZ=Europe/Madrid date -d "sunday this week" +%Y-%m-%d)
 
           if [ "$DOW" -eq 1 ]; then
-            # Lunes: resumen semanal
             HEADER="📣 <b>Desde InvestX os informamos del calendario económico de EE.UU. — Resumen semanal</b>%0A<i>Eventos relevantes (2⭐️ y 3⭐️) — Horario Europe/Madrid</i>%0A"
             jq --arg A "$WEEK_START" --arg B "$WEEK_END" -c \
               '[ .[] | select(.date >= $A and .date <= $B) ]' events.json > sel.json
           else
-            # Mar–Vie: diario
             DIA_FMT=$(TZ=Europe/Madrid date +'%A %d %b')
             HEADER="📣 <b>Desde InvestX os informamos del calendario económico de EE.UU. — Hoy (${DIA_FMT})</b>%0A<i>Eventos relevantes (2⭐️ y 3⭐️) — Horario Europe/Madrid</i>%0A"
             jq --arg D "$TODAY" -c \
@@ -107,7 +92,6 @@ jobs:
             exit 0
           fi
 
-          # Agrupamos por día y formateamos como lista
           BODY=""
           for DAY in $(jq -r 'map(.date) | unique[]' sel.json); do
             DIA_FMT=$(TZ=Europe/Madrid date -d "$DAY" +'%A %d %b')
