@@ -13,11 +13,9 @@ jobs:
       - name: Install jq & pup
         run: |
           sudo apt-get update
-          sudo apt-get install -y jq curl
-          # Instalar pup desde release
+          sudo apt-get install -y jq curl unzip
           curl -sL https://github.com/ericchiang/pup/releases/download/v0.4.0/pup_v0.4.0_linux_amd64.zip -o pup.zip
-          sudo apt-get install -y unzip
-          unzip pup.zip
+          unzip -o pup.zip
           sudo mv pup /usr/local/bin/
 
       - name: Fetch Investing page (with cookies)
@@ -29,20 +27,19 @@ jobs:
             -H "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8" \
             -c cookies.txt -b cookies.txt -o cal.html
 
-      - name: Parse events from HTML
+      - name: Parse events from HTML (USD, 2-3 estrellas)
         run: |
           set -euo pipefail
-          pup 'tr[id^="eventRowId_"] json{}' < cal.html > rows.json
+          # Extrae filas del calendario
+          pup 'tr[id^="eventRowId_"] json{}' < cal.html > rows.json || echo "[]" > rows.json
 
+          # Filtra USA (data-country=5) e importancia 2/3
           jq -c '
             .[] |
             select(.attrs["data-country"]=="5" and (.attrs["data-importance"]=="2" or .attrs["data-importance"]=="3")) |
             {
               ts: ( .attrs["data-event-datetime"] | tonumber ),
               imp: ( .attrs["data-importance"] ),
-              time_txt: (
-                [.children[] | select(.tag=="td" and (.attrs.class//""|test("time"))) ][0].text // ""
-              ),
               title: (
                 [.children[] | select(.tag=="td" and (.attrs.class//""|test("event"))) ][0]
                 | if has("children") then
@@ -54,6 +51,7 @@ jobs:
             }
           ' rows.json > events_raw.json
 
+          # Formato final con hora Europe/Madrid
           TZ=Europe/Madrid jq -c '
             map({
               date: (.ts | todate | strptime("%Y-%m-%dT%H:%M:%S%z") | strftime("%Y-%m-%d")),
@@ -64,48 +62,51 @@ jobs:
             | sort_by(.date,.time)
           ' events_raw.json > events.json
 
-      - name: Build & Send message
+      - name: Build & Send message (no links, sin preview)
         env:
           BOT_TOKEN: ${{ secrets.INVESTX_TOKEN }}
           CHAT_ID: ${{ secrets.CHAT_ID }}
         run: |
           set -euo pipefail
-          DOW=$(date -u +%u)
+
+          # Fechas en horario Madrid
           TODAY=$(TZ=Europe/Madrid date +%Y-%m-%d)
           WEEK_START=$(TZ=Europe/Madrid date -d "monday this week" +%Y-%m-%d)
           WEEK_END=$(TZ=Europe/Madrid date -d "sunday this week" +%Y-%m-%d)
 
+          # Lunes = semanal; Mar-Vie = diario
+          DOW=$(TZ=Europe/Madrid date +%u)
           if [ "$DOW" -eq 1 ]; then
-            HEADER="📣 <b>Desde InvestX os informamos del calendario económico de EE.UU. — Resumen semanal</b>%0A<i>Eventos relevantes (2⭐️ y 3⭐️) — Horario Europe/Madrid</i>%0A"
-            jq --arg A "$WEEK_START" --arg B "$WEEK_END" -c \
-              '[ .[] | select(.date >= $A and .date <= $B) ]' events.json > sel.json
+            jq --arg A "$WEEK_START" --arg B "$WEEK_END" -c '[ .[] | select(.date >= $A and .date <= $B) ]' events.json > sel.json
+            INTRO="📣 Desde <b>InvestX</b> os informamos del <b>calendario económico de EE.UU.</b> para esta semana.\n<i>Eventos relevantes (2⭐️ y 3⭐️) — Horario Europe/Madrid</i>"
           else
-            DIA_FMT=$(TZ=Europe/Madrid date +'%A %d %b')
-            HEADER="📣 <b>Desde InvestX os informamos del calendario económico de EE.UU. — Hoy (${DIA_FMT})</b>%0A<i>Eventos relevantes (2⭐️ y 3⭐️) — Horario Europe/Madrid</i>%0A"
-            jq --arg D "$TODAY" -c \
-              '[ .[] | select(.date == $D) ]' events.json > sel.json
+            jq --arg D "$TODAY" -c '[ .[] | select(.date == $D) ]' events.json > sel.json
+            FECHA=$(TZ=Europe/Madrid date +%Y-%m-%d)
+            INTRO="📣 Desde <b>InvestX</b> os informamos del <b>calendario económico de EE.UU.</b> — Hoy ${FECHA}.\n<i>Eventos relevantes (2⭐️ y 3⭐️) — Horario Europe/Madrid</i>"
           fi
 
           COUNT=$(jq 'length' sel.json)
           if [ "$COUNT" -eq 0 ]; then
-            echo "No hay eventos que cumplan el filtro. No se envía mensaje."
+            echo "Sin eventos -> no enviamos mensaje."
             exit 0
           fi
 
+          # Construir cuerpo (agrupado por fecha)
           BODY=""
           for DAY in $(jq -r 'map(.date) | unique[]' sel.json); do
-            DIA_FMT=$(TZ=Europe/Madrid date -d "$DAY" +'%A %d %b')
-            BODY="${BODY}%0A<b>• ${DIA_FMT}</b>%0A"
-            jq --arg DAY "$DAY" -r '
-              .[] | select(.date==$DAY) |
-              "• <b>\(.time)</b> — \(.title) (\(.imp))"
-            ' sel.json | sed 's/$/%0A/' | tr -d '\n' >> body.txt
-            BODY="${BODY}$(cat body.txt)"; rm -f body.txt
+            BODY="${BODY}\n<b>• ${DAY}</b>\n"
+            jq --arg DAY "$DAY" -r '.[] | select(.date==$DAY) | "• <b>\(.time)</b> — \(.title) (\(.imp))"' sel.json >> lines.txt
+            sed -e 's/&/&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' -e 's/"/\&quot;/g' lines.txt > lines_esc.txt
+            while IFS= read -r L; do BODY="${BODY}\n${L}"; done < lines_esc.txt
+            rm -f lines.txt lines_esc.txt
           done
 
-          TEXTO="${HEADER}${BODY}%0A%0A🔗 <a href=\"https://es.investing.com/economic-calendar/\">Ver calendario completo</a>"
+          # Unir mensaje final con saltos de línea reales (no %0A)
+          TEXTO="${INTRO}${BODY}"
 
+          # Evitar tarjetas de vista previa y mandar tal cual
           curl -sS "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
             -d chat_id="${CHAT_ID}" \
             -d parse_mode="HTML" \
-            --data-urlencode text="${TEXTO}"
+            -d disable_web_page_preview=true \
+            --data-urlencode text="$TEXTO"
