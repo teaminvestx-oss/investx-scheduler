@@ -1,0 +1,74 @@
+name: InvestX Economic Calendar
+
+on:
+  schedule:
+    - cron: "0 11 * * 1"   # Lunes 13:00 Madrid (11:00 UTC) — resumen semanal
+    - cron: "0 11 * * 2-5" # Mar-Vie 13:00 Madrid (11:00 UTC) — resumen diario
+  workflow_dispatch:
+
+jobs:
+  econ-calendar:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install tools
+        run: sudo apt-get update && sudo apt-get install -y jq
+
+      - name: Fetch Investing Calendar
+        run: |
+          URL="https://www.investing.com/economic-calendar/Service/getCalendarFilteredData"
+          FROM=$(date -u +%Y-%m-%d)
+          TO=$(date -u -d "+7 days" +%Y-%m-%d)
+
+          # Pedimos USD (id país = 5), impacto medio y alto
+          curl -s "$URL" \
+            -H "Content-Type: application/x-www-form-urlencoded" \
+            --data "country=5&importance=2,3&timeZone=55&dateFrom=${FROM}&dateTo=${TO}" \
+            > calendar.json
+
+      - name: Build & Send Message
+        env:
+          BOT_TOKEN: ${{ secrets.INVESTX_TOKEN }}
+          CHAT_ID: ${{ secrets.CHAT_ID }}
+        run: |
+          set -euo pipefail
+          TODAY=$(date -u +%Y-%m-%d)
+          DOW=$(date -u +%u)
+
+          if [ "$DOW" -eq 1 ]; then
+            HEADER="🗓️ <b>Desde InvestX os informamos del calendario económico de EE.UU. para esta semana</b>%0A<i>Eventos relevantes (2⭐️ y 3⭐️)</i>%0A"
+            jq '.events[]' calendar.json > events.json
+          else
+            DIA_FMT=$(date +'%A %d %b')
+            HEADER="📅 <b>Desde InvestX os informamos del calendario económico de EE.UU. — Hoy (${DIA_FMT})</b>%0A<i>Eventos relevantes (2⭐️ y 3⭐️)</i>%0A"
+            jq --arg TODAY "$TODAY" '.events[] | select(.date == $TODAY)' calendar.json > events.json
+          fi
+
+          COUNT=$(wc -l < events.json || echo 0)
+          if [ "$COUNT" -eq 0 ]; then
+            echo "No hay eventos que cumplan el filtro, no se envía nada."
+            exit 0
+          fi
+
+          BODY=""
+          while read -r ev; do
+            TIME=$(echo "$ev" | jq -r '.time')
+            TITLE=$(echo "$ev" | jq -r '.title')
+            IMP=$(echo "$ev" | jq -r '.importance')
+            ACT=$(echo "$ev" | jq -r '.actual // empty')
+            FCAST=$(echo "$ev" | jq -r '.forecast // empty')
+            PREV=$(echo "$ev" | jq -r '.previous // empty')
+
+            LINE="• <b>${TIME}</b> — ${TITLE} (${IMP}⭐️)"
+            [ -n "$ACT" ] && LINE="${LINE} — <i>Actual:</i> ${ACT}"
+            [ -n "$FCAST" ] && LINE="${LINE} — <i>Previsión:</i> ${FCAST}"
+            [ -n "$PREV" ] && LINE="${LINE} — <i>Previo:</i> ${PREV}"
+
+            BODY="${BODY}%0A${LINE}"
+          done < events.json
+
+          TEXTO="${HEADER}${BODY}%0A%0A🔗 <a href=\"https://es.investing.com/economic-calendar/\">Ver calendario completo</a>"
+
+          curl -s "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+            -d chat_id="${CHAT_ID}" \
+            -d parse_mode="HTML" \
+            --data-urlencode text="${TEXTO}"
