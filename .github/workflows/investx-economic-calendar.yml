@@ -19,11 +19,15 @@ jobs:
           FROM=$(date -u +%Y-%m-%d)
           TO=$(date -u -d "+7 days" +%Y-%m-%d)
 
-          # Pedimos USD (id país = 5), impacto medio y alto
           curl -s "$URL" \
             -H "Content-Type: application/x-www-form-urlencoded" \
+            -H "X-Requested-With: XMLHttpRequest" \
+            -H "User-Agent: Mozilla/5.0" \
             --data "country=5&importance=2,3&timeZone=55&dateFrom=${FROM}&dateTo=${TO}" \
             > calendar.json
+
+          head -n 20 calendar.json
+
 
       - name: Build & Send Message
         env:
