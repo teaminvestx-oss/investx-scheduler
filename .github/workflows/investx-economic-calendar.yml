@@ -1,16 +1,92 @@
-      - name: Build & Send message (no links, sin preview)
+name: InvestX Economic Calendar
+
+on:
+  schedule:
+    - cron: "0 11 * * 1"   # Lunes 13:00 Madrid (11:00 UTC) — resumen semanal
+    - cron: "0 11 * * 2-5" # Mar–Vie 13:00 Madrid (11:00 UTC) — resumen diario
+  workflow_dispatch:
+
+jobs:
+  econ-calendar:
+    runs-on: ubuntu-latest
+    steps:
+      # ---------- Dependencias ----------
+      - name: Install jq & pup
+        run: |
+          set -e
+          sudo apt-get update
+          sudo apt-get install -y jq curl unzip
+          curl -sL https://github.com/ericchiang/pup/releases/download/v0.4.0/pup_v0.4.0_linux_amd64.zip -o pup.zip
+          unzip -o pup.zip
+          sudo mv pup /usr/local/bin/
+
+      # ---------- Descarga HTML de Investing ----------
+      - name: Fetch Investing page (with cookies)
+        run: |
+          set -e
+          UA="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+          CAL_URL="https://es.investing.com/economic-calendar/"
+          curl -sSL "$CAL_URL" \
+            -H "User-Agent: $UA" \
+            -H "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8" \
+            -c cookies.txt -b cookies.txt -o cal.html
+
+      # ---------- Parseo y filtrado (USA + 2-3 estrellas) ----------
+      - name: Parse events from HTML (USD, 2-3 stars)
+        run: |
+          set -euo pipefail
+          # Extrae filas del calendario a JSON
+          if ! pup 'tr[id^="eventRowId_"] json{}' < cal.html > rows.json; then
+            echo "[]" > rows.json
+          fi
+
+          # Filtra USA (data-country=5) e importancia 2 o 3
+          jq -c '
+            .[] |
+            select(.attrs["data-country"]=="5" and (.attrs["data-importance"]=="2" or .attrs["data-importance"]=="3")) |
+            {
+              ts: ( .attrs["data-event-datetime"] | tonumber ),
+              imp: ( .attrs["data-importance"] ),
+              title: (
+                [.children[] | select(.tag=="td" and (.attrs.class//""|test("event"))) ][0]
+                | if has("children") then
+                    (
+                      .children[]? | select(.tag=="a") | .attrs.title // .text
+                    ) // .text
+                  else .text end
+              ) | gsub("\\s+";" ") | sub("^\\s+";"") | sub("\\s+$";"")
+            }
+          ' rows.json > events_raw.json
+
+          # Estructura final con hora Europe/Madrid
+          TZ=Europe/Madrid jq -c '
+            map({
+              date: (.ts | todate | strptime("%Y-%m-%dT%H:%M:%S%z") | strftime("%Y-%m-%d")),
+              time: (.ts | todate | strptime("%Y-%m-%dT%H:%M:%S%z") | strftime("%H:%M")),
+              title: .title,
+              imp: (if .imp=="2" then "2⭐️" else "3⭐️" end)
+            })
+            | sort_by(.date,.time)
+          ' events_raw.json > events.json
+
+      # ---------- Construcción y envío del mensaje ----------
+      - name: Build & Send message (plain text, no preview)
         env:
           BOT_TOKEN: ${{ secrets.INVESTX_TOKEN }}
           CHAT_ID: ${{ secrets.CHAT_ID }}
         run: |
           set -euo pipefail
-
-          # Fechas en horario Madrid
           TZ_EUROPE=Europe/Madrid
           TODAY=$(TZ=$TZ_EUROPE date +%Y-%m-%d)
           WEEK_START=$(TZ=$TZ_EUROPE date -d "monday this week" +%Y-%m-%d)
           WEEK_END=$(TZ=$TZ_EUROPE date -d "sunday this week" +%Y-%m-%d)
           DOW=$(TZ=$TZ_EUROPE date +%u)   # 1..7 (lun..dom)
+
+          # No enviar jamás en fin de semana por ejecución manual
+          if [ "$DOW" -ge 6 ]; then
+            echo "Fin de semana: no se envía."
+            exit 0
+          fi
 
           if [ "$DOW" -eq 1 ]; then
             # Lunes -> resumen semanal
@@ -19,13 +95,13 @@
             HEADER=$(printf "📣 Desde <b>InvestX</b> os informamos del <b>calendario económico de EE.UU.</b> para esta semana.\n<i>Eventos relevantes (2⭐️ y 3⭐️) — Horario Europe/Madrid</i>")
           else
             # Mar–Vie -> diario
-            jq --arg D "$TODAY" -c '[ .[] | select(.date == $D) ]' events.json > sel.json
-            HEADER=$(printf "📣 Desde <b>InvestX</b> os informamos del <b>calendario económico de EE.UU.</b> — Hoy %s.\n<i>Eventos relevantes (2⭐️ y 3⭐️) — Horario Europe/Madrid</i>" "$TODAY")
+              jq --arg D "$TODAY" -c '[ .[] | select(.date == $D) ]' events.json > sel.json
+              HEADER=$(printf "📣 Desde <b>InvestX</b> os informamos del <b>calendario económico de EE.UU.</b> — Hoy %s.\n<i>Eventos relevantes (2⭐️ y 3⭐️) — Horario Europe/Madrid</i>" "$TODAY")
           fi
 
           COUNT=$(jq 'length' sel.json)
           if [ "$COUNT" -eq 0 ]; then
-            echo "Sin eventos -> no se envía mensaje."
+            echo "No hay eventos que cumplan el filtro. No se envía mensaje."
             exit 0
           fi
 
@@ -35,13 +111,14 @@
           for DAY in "${DAYS[@]}"; do
             BODY="${BODY}$(printf "\n<b>• %s</b>\n" "$DAY")"
             while IFS= read -r LINE; do
-              # Escapar HTML básico por seguridad
+              # Escapar HTML por seguridad
               LINE_ESC=$(printf "%s" "$LINE" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' -e 's/"/\&quot;/g')
-              BODY="${BODY}$(printf "• <b>%s</b> — %s\n" "$(echo "$LINE_ESC" | cut -d'|' -f1)" "$(echo "$LINE_ESC" | cut -d'|' -f2)")"
+              HORA=$(printf "%s" "$LINE_ESC" | cut -d'|' -f1)
+              TEXTO_EVENTO=$(printf "%s" "$LINE_ESC" | cut -d'|' -f2)
+              BODY="${BODY}$(printf "• <b>%s</b> — %s\n" "$HORA" "$TEXTO_EVENTO")"
             done < <(jq -r --arg DAY "$DAY" '.[] | select(.date==$DAY) | "\(.time)|\(.title) (\(.imp))"' sel.json)
           done
 
-          # Mensaje final con saltos reales
           TEXTO="${HEADER}${BODY}"
 
           curl -sS "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
