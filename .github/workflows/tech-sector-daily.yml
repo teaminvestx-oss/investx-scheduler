@@ -9,6 +9,11 @@ on:
 jobs:
   tech-sector-daily:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      BOT_TOKEN: "8470375437:AAEgRw-7eq7V_7mDU1z88DCqymhmkNJooNE"
+      CHAT_ID: "-1002885597510"
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -24,7 +29,4 @@ jobs:
           npm i puppeteer dayjs node-fetch form-data
 
       - name: Run capture & send
-        env:
-          BOT_TOKEN: "8470375437:AAEgRw-7eq7V_7mDU1z88DCqymhmkNJooNE"
-          CHAT_ID: "-1002885597510"
-        run: node scripts/tech_telegram.js
+        run: node tech_telegram.js
