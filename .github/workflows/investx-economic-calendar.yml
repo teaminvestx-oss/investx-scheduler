@@ -2,15 +2,15 @@ name: InvestX Economic Calendar
 
 on:
   schedule:
-    - cron: "0 11 * * 1"   # Lunes 13:00 Madrid (11:00 UTC) — resumen semanal
-    - cron: "0 11 * * 2-5" # Mar–Vie 13:00 Madrid (11:00 UTC) — resumen diario
+    - cron: "0 11 * * 1"   # Lunes 13:00 Madrid (11:00 UTC) — semanal
+    - cron: "0 11 * * 2-5" # Mar–Vie 13:00 Madrid (11:00 UTC) — diario
   workflow_dispatch:
 
 jobs:
   econ-calendar:
     runs-on: ubuntu-latest
     steps:
-      # ---------- Dependencias ----------
+      # ----- deps -----
       - name: Install jq & pup
         run: |
           set -e
@@ -20,32 +20,84 @@ jobs:
           unzip -o pup.zip
           sudo mv pup /usr/local/bin/
 
-      # ---------- Descarga HTML de Investing ----------
-      - name: Fetch Investing page (with cookies)
+      # ----- 1) Obtener cookies + HTML base -----
+      - name: Seed cookies & base HTML
         run: |
           set -e
           UA="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
-          CAL_URL="https://es.investing.com/economic-calendar/"
-          curl -sSL "$CAL_URL" \
-            -H "User-Agent: $UA" \
-            -H "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8" \
-            -c cookies.txt -b cookies.txt -o cal.html
+          for URL in "https://es.investing.com/economic-calendar/" "https://www.investing.com/economic-calendar/"; do
+            curl -sSL "$URL" \
+              -H "User-Agent: $UA" \
+              -H "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8" \
+              -c cookies.txt -b cookies.txt -o /dev/null || true
+          done
 
-      # ---------- Parseo y filtrado (USA + 2-3 estrellas) ----------
-      - name: Parse events from HTML (USD, 2-3 stars)
+      # ----- 2) Intento preferente: endpoint AJAX (devuelve HTML en 'data') -----
+      - name: Try AJAX endpoint (preferred)
         run: |
-          set -euo pipefail
-          # Extrae filas del calendario a JSON
-          if ! pup 'tr[id^="eventRowId_"] json{}' < cal.html > rows.json; then
-            echo "[]" > rows.json
+          set -e
+          UA="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+          FROM=$(TZ=Europe/Madrid date -d "monday this week" +%Y-%m-%d)
+          TO=$(TZ=Europe/Madrid date -d "sunday this week" +%Y-%m-%d)
+
+          curl -sSL "https://www.investing.com/economic-calendar/Service/getCalendarFilteredData" \
+            -H "User-Agent: $UA" \
+            -H "Content-Type: application/x-www-form-urlencoded; charset=UTF-8" \
+            -H "X-Requested-With: XMLHttpRequest" \
+            -H "Origin: https://www.investing.com" \
+            -H "Referer: https://www.investing.com/economic-calendar/" \
+            -b cookies.txt -c cookies.txt \
+            --data "country=5&importance=2,3&timeZone=55&dateFrom=${FROM}&dateTo=${TO}" \
+            -o ajax.json || echo '{}' > ajax.json
+
+          # Algunas variantes devuelven {"data":"<tr ...>...</tr>..."} otras devuelven html directo
+          if jq -e '.data' ajax.json >/dev/null 2>&1; then
+            jq -r '.data' ajax.json > ajax_data.html
+          else
+            # si no hay campo data, quizá devolvió HTML entero
+            cp ajax.json ajax_data.html || true
           fi
 
-          # Filtra USA (data-country=5) e importancia 2 o 3
+          # Parsear filas si existen
+          if [ -s ajax_data.html ]; then
+            pup 'tr[id^="eventRowId_"] json{}' < ajax_data.html > rows.json || echo "[]" > rows.json
+          else
+            echo "[]" > rows.json
+          fi
+          echo "AJAX rows count: $(jq 'length' rows.json)"
+
+      # ----- 3) Fallback: HTML completo (ES y EN) si no hubo filas -----
+      - name: Fallback to full HTML
+        if: ${{ always() }}
+        run: |
+          set -e
+          COUNT=$(jq 'length' rows.json || echo 0)
+          if [ "$COUNT" -gt 0 ]; then
+            echo "Saltamos fallback: ya hay filas desde AJAX."
+            exit 0
+          fi
+
+          UA="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+          for SRC in "https://es.investing.com/economic-calendar/" "https://www.investing.com/economic-calendar/"; do
+            curl -sSL "$SRC" -H "User-Agent: $UA" -b cookies.txt -c cookies.txt -o cal.html || true
+            pup 'tr[id^="eventRowId_"] json{}' < cal.html > rows_try.json || echo "[]" > rows_try.json
+            if [ -s rows_try.json ] && [ "$(jq 'length' rows_try.json)" -gt 0 ]; then
+              mv rows_try.json rows.json
+              break
+            fi
+          done
+          if [ ! -s rows.json ]; then echo "[]" > rows.json; fi
+          echo "Fallback rows count: $(jq 'length' rows.json)"
+
+      # ----- 4) Filtrado USA + 2-3 estrellas y formateo -----
+      - name: Filter & format events
+        run: |
+          set -euo pipefail
           jq -c '
             .[] |
             select(.attrs["data-country"]=="5" and (.attrs["data-importance"]=="2" or .attrs["data-importance"]=="3")) |
             {
-              ts: ( .attrs["data-event-datetime"] | tonumber ),
+              ts: ( .attrs["data-event-datetime"] | tonumber? ),
               imp: ( .attrs["data-importance"] ),
               title: (
                 [.children[] | select(.tag=="td" and (.attrs.class//""|test("event"))) ][0]
@@ -56,21 +108,24 @@ jobs:
                   else .text end
               ) | gsub("\\s+";" ") | sub("^\\s+";"") | sub("\\s+$";"")
             }
-          ' rows.json > events_raw.json
+          ' rows.json | jq -cs '.' > events_raw.json
 
-          # Estructura final con hora Europe/Madrid
+          # Si ts viene vacío (algunos eventos lo traen solo en HTML), descartamos esos
           TZ=Europe/Madrid jq -c '
-            map({
+            [ .[] | select(.ts != null) | {
               date: (.ts | todate | strptime("%Y-%m-%dT%H:%M:%S%z") | strftime("%Y-%m-%d")),
               time: (.ts | todate | strptime("%Y-%m-%dT%H:%M:%S%z") | strftime("%H:%M")),
               title: .title,
               imp: (if .imp=="2" then "2⭐️" else "3⭐️" end)
-            })
-            | sort_by(.date,.time)
+            } ] | sort_by(.date,.time)
           ' events_raw.json > events.json
 
-      # ---------- Construcción y envío del mensaje ----------
-      - name: Build & Send message (plain text, no preview)
+          echo "Final events count: $(jq 'length' events.json)"
+          echo "Sample:"
+          jq '.[0:5]' events.json || true
+
+      # ----- 5) Construcción y envío del mensaje -----
+      - name: Build & Send (only if there are events)
         env:
           BOT_TOKEN: ${{ secrets.INVESTX_TOKEN }}
           CHAT_ID: ${{ secrets.CHAT_ID }}
@@ -80,38 +135,36 @@ jobs:
           TODAY=$(TZ=$TZ_EUROPE date +%Y-%m-%d)
           WEEK_START=$(TZ=$TZ_EUROPE date -d "monday this week" +%Y-%m-%d)
           WEEK_END=$(TZ=$TZ_EUROPE date -d "sunday this week" +%Y-%m-%d)
-          DOW=$(TZ=$TZ_EUROPE date +%u)   # 1..7 (lun..dom)
+          DOW=$(TZ=$TZ_EUROPE date +%u)   # 1..7
 
-          # No enviar jamás en fin de semana por ejecución manual
-          if [ "$DOW" -ge 6 ]; then
-            echo "Fin de semana: no se envía."
+          # No enviar sáb/dom en ejecución manual
+          if [ "$DOW" -ge 6 ]; then echo "Fin de semana: no se envía."; exit 0; fi
+
+          if [ ! -s events.json ] || [ "$(jq 'length' events.json)" -eq 0 ]; then
+            echo "Sin eventos tras filtrado -> no se envía."
             exit 0
           fi
 
           if [ "$DOW" -eq 1 ]; then
-            # Lunes -> resumen semanal
-            jq --arg A "$WEEK_START" --arg B "$WEEK_END" -c \
-              '[ .[] | select(.date >= $A and .date <= $B) ]' events.json > sel.json
+            SEL=$(jq --arg A "$WEEK_START" --arg B "$WEEK_END" -c '[ .[] | select(.date >= $A and .date <= $B) ]' events.json)
             HEADER=$(printf "📣 Desde <b>InvestX</b> os informamos del <b>calendario económico de EE.UU.</b> para esta semana.\n<i>Eventos relevantes (2⭐️ y 3⭐️) — Horario Europe/Madrid</i>")
           else
-            # Mar–Vie -> diario
-              jq --arg D "$TODAY" -c '[ .[] | select(.date == $D) ]' events.json > sel.json
-              HEADER=$(printf "📣 Desde <b>InvestX</b> os informamos del <b>calendario económico de EE.UU.</b> — Hoy %s.\n<i>Eventos relevantes (2⭐️ y 3⭐️) — Horario Europe/Madrid</i>" "$TODAY")
+            SEL=$(jq --arg D "$TODAY" -c '[ .[] | select(.date == $D) ]' events.json)
+            HEADER=$(printf "📣 Desde <b>InvestX</b> os informamos del <b>calendario económico de EE.UU.</b> — Hoy %s.\n<i>Eventos relevantes (2⭐️ y 3⭐️) — Horario Europe/Madrid</i>" "$TODAY")
           fi
 
-          COUNT=$(jq 'length' sel.json)
-          if [ "$COUNT" -eq 0 ]; then
-            echo "No hay eventos que cumplan el filtro. No se envía mensaje."
+          echo "$SEL" > sel.json
+          if [ "$(jq 'length' sel.json)" -eq 0 ]; then
+            echo "No hay eventos en el rango pedido -> no se envía."
             exit 0
           fi
 
-          # Construir cuerpo agrupado por día
           BODY=""
           mapfile -t DAYS < <(jq -r 'map(.date) | unique[]' sel.json)
           for DAY in "${DAYS[@]}"; do
             BODY="${BODY}$(printf "\n<b>• %s</b>\n" "$DAY")"
             while IFS= read -r LINE; do
-              # Escapar HTML por seguridad
+              # Escapar HTML básicos
               LINE_ESC=$(printf "%s" "$LINE" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' -e 's/"/\&quot;/g')
               HORA=$(printf "%s" "$LINE_ESC" | cut -d'|' -f1)
               TEXTO_EVENTO=$(printf "%s" "$LINE_ESC" | cut -d'|' -f2)
