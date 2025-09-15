@@ -32,33 +32,35 @@ jobs:
               -c cookies.txt -b cookies.txt -o /dev/null || true
           done
 
-      # ----- 2) Intento preferente: endpoint AJAX (devuelve HTML en 'data') -----
+          # ----- 2) AJAX endpoint (actualizado: arrays + campos obligatorios) -----
       - name: Try AJAX endpoint (preferred)
         run: |
-          set -e
+          set -euo pipefail
           UA="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
           FROM=$(TZ=Europe/Madrid date -d "monday this week" +%Y-%m-%d)
           TO=$(TZ=Europe/Madrid date -d "sunday this week" +%Y-%m-%d)
 
-          curl -sSL "https://www.investing.com/economic-calendar/Service/getCalendarFilteredData" \
+          # NOTA: country[]=5  (USA), importance[]=2,3 ; timeZone=55 ~ Madrid (CEST/CET en Investing)
+          curl -sSL 'https://www.investing.com/economic-calendar/Service/getCalendarFilteredData' \
             -H "User-Agent: $UA" \
-            -H "Content-Type: application/x-www-form-urlencoded; charset=UTF-8" \
-            -H "X-Requested-With: XMLHttpRequest" \
-            -H "Origin: https://www.investing.com" \
-            -H "Referer: https://www.investing.com/economic-calendar/" \
+            -H 'Accept: application/json, text/javascript, */*; q=0.01' \
+            -H 'Content-Type: application/x-www-form-urlencoded; charset=UTF-8' \
+            -H 'X-Requested-With: XMLHttpRequest' \
+            -H 'Origin: https://www.investing.com' \
+            -H 'Referer: https://www.investing.com/economic-calendar/' \
             -b cookies.txt -c cookies.txt \
-            --data "country=5&importance=2,3&timeZone=55&dateFrom=${FROM}&dateTo=${TO}" \
+            --data "country[]=5&importance[]=2&importance[]=3&timeZone=55&timeFilter=time_only&currentTab=custom&limit_from=0&dateFrom=${FROM}&dateTo=${TO}&action=filter" \
             -o ajax.json || echo '{}' > ajax.json
 
-          # Algunas variantes devuelven {"data":"<tr ...>...</tr>..."} otras devuelven html directo
+          # La API devuelve {"data":"<tr>...</tr>"} o HTML directo
           if jq -e '.data' ajax.json >/dev/null 2>&1; then
             jq -r '.data' ajax.json > ajax_data.html
           else
-            # si no hay campo data, quizá devolvió HTML entero
+            # Puede venir HTML plano
             cp ajax.json ajax_data.html || true
           fi
 
-          # Parsear filas si existen
+          # Extraer filas <tr id="eventRowId_...">
           if [ -s ajax_data.html ]; then
             pup 'tr[id^="eventRowId_"] json{}' < ajax_data.html > rows.json || echo "[]" > rows.json
           else
@@ -66,11 +68,11 @@ jobs:
           fi
           echo "AJAX rows count: $(jq 'length' rows.json)"
 
-      # ----- 3) Fallback: HTML completo (ES y EN) si no hubo filas -----
+      # ----- 3) Fallback: HTML completo (ES/EN) si no hubo filas -----
       - name: Fallback to full HTML
         if: ${{ always() }}
         run: |
-          set -e
+          set -euo pipefail
           COUNT=$(jq 'length' rows.json || echo 0)
           if [ "$COUNT" -gt 0 ]; then
             echo "Saltamos fallback: ya hay filas desde AJAX."
@@ -89,42 +91,52 @@ jobs:
           if [ ! -s rows.json ]; then echo "[]" > rows.json; fi
           echo "Fallback rows count: $(jq 'length' rows.json)"
 
-      # ----- 4) Filtrado USA + 2-3 estrellas y formateo -----
+      # ----- 4) Filtrado USA + 2-3 estrellas y formateo (ts robusto + fallback título) -----
       - name: Filter & format events
         run: |
           set -euo pipefail
+          # 1) Reducimos filas a lo esencial (USA + 2/3 estrellas)
           jq -c '
             .[] |
             select(.attrs["data-country"]=="5" and (.attrs["data-importance"]=="2" or .attrs["data-importance"]=="3")) |
             {
-              ts: ( .attrs["data-event-datetime"] | tonumber? ),
-              imp: ( .attrs["data-importance"] ),
+              ts_raw: .attrs["data-event-datetime"],
+              imp: .attrs["data-importance"],
+              # intentar sacar título desde el <a> o texto del <td class="event">
               title: (
-                [.children[] | select(.tag=="td" and (.attrs.class//""|test("event"))) ][0]
-                | if has("children") then
-                    (
-                      .children[]? | select(.tag=="a") | .attrs.title // .text
-                    ) // .text
-                  else .text end
+                ( [ .children[] | select(.tag=="td" and (.attrs.class//""|test("event"))) ][0] ) as $td |
+                (
+                  ( $td.children[]? | select(.tag=="a") | .attrs.title // .text ) // $td.text // ""
+                )
               ) | gsub("\\s+";" ") | sub("^\\s+";"") | sub("\\s+$";"")
             }
-          ' rows.json | jq -cs '.' > events_raw.json
+          ' rows.json > events_raw0.json || echo "[]" > events_raw0.json
 
-          # Si ts viene vacío (algunos eventos lo traen solo en HTML), descartamos esos
-          TZ=Europe/Madrid jq -c '
-            [ .[] | select(.ts != null) | {
-              date: (.ts | todate | strptime("%Y-%m-%dT%H:%M:%S%z") | strftime("%Y-%m-%d")),
-              time: (.ts | todate | strptime("%Y-%m-%dT%H:%M:%S%z") | strftime("%H:%M")),
-              title: .title,
-              imp: (if .imp=="2" then "2⭐️" else "3⭐️" end)
-            } ] | sort_by(.date,.time)
-          ' events_raw.json > events.json
+          # 2) Normalizamos timestamp: puede venir vacío, en segundos o en milisegundos
+          jq -c '
+            [ .[] |
+              .tsn = (
+                if (.ts_raw|type=="number") then
+                  ( if .ts_raw > 1000000000000 then ((.ts_raw/1000)|floor) else .ts_raw end )
+                elif (.ts_raw|type=="string") then
+                  # a veces viene ISO; intentamos parsearlo
+                  ( .ts_raw | strptime("%Y-%m-%d %H:%M:%S")? // strptime("%Y-%m-%dT%H:%M:%S%z")? | mktime ) // null
+                else null end
+              )
+              | select(.tsn != null and .title != "")
+              | {
+                  date: ( .tsn | strflocaltime("%Y-%m-%d") ),
+                  time: ( .tsn | strflocaltime("%H:%M") ),
+                  title: .title,
+                  imp: (if .imp=="2" then "2⭐️" else "3⭐️" end)
+                }
+            ] | sort_by(.date,.time)
+          ' events_raw0.json > events.json
 
           echo "Final events count: $(jq 'length' events.json)"
-          echo "Sample:"
           jq '.[0:5]' events.json || true
 
-      # ----- 5) Construcción y envío del mensaje -----
+      # ----- 5) Construcción y envío del mensaje (sin cambios salvo conteo) -----
       - name: Build & Send (only if there are events)
         env:
           BOT_TOKEN: ${{ secrets.INVESTX_TOKEN }}
@@ -137,9 +149,7 @@ jobs:
           WEEK_END=$(TZ=$TZ_EUROPE date -d "sunday this week" +%Y-%m-%d)
           DOW=$(TZ=$TZ_EUROPE date +%u)   # 1..7
 
-          # No enviar sáb/dom en ejecución manual
           if [ "$DOW" -ge 6 ]; then echo "Fin de semana: no se envía."; exit 0; fi
-
           if [ ! -s events.json ] || [ "$(jq 'length' events.json)" -eq 0 ]; then
             echo "Sin eventos tras filtrado -> no se envía."
             exit 0
@@ -164,7 +174,6 @@ jobs:
           for DAY in "${DAYS[@]}"; do
             BODY="${BODY}$(printf "\n<b>• %s</b>\n" "$DAY")"
             while IFS= read -r LINE; do
-              # Escapar HTML básicos
               LINE_ESC=$(printf "%s" "$LINE" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' -e 's/"/\&quot;/g')
               HORA=$(printf "%s" "$LINE_ESC" | cut -d'|' -f1)
               TEXTO_EVENTO=$(printf "%s" "$LINE_ESC" | cut -d'|' -f2)
