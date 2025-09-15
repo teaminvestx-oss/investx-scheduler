@@ -91,71 +91,105 @@ jobs:
           if [ ! -s rows.json ]; then echo "[]" > rows.json; fi
           echo "Fallback rows count: $(jq 'length' rows.json)"
 
-           # ----- 4) Filtrado USA + 2-3 estrellas y formateo (lee TS desde <td class="time">) -----
+             # ----- 4) Filtrado USA + 2-3 estrellas y formateo (sin depender de timestamp) -----
       - name: Filter & format events
         run: |
           set -euo pipefail
 
-          # 1) Reducimos: solo filas de eventos
-          jq -c '
-            .[]
-            | select(.attrs.id? and (.attrs.id|test("^eventRowId_")))
-            | {
-                # importancia desde el <tr> o contando estrellas en la celda "sentiment"
-                imp: (.attrs["data-importance"] //
-                      (([ .children[]? | select(.tag=="td" and (.attrs.class//""|test("sentiment"))) ][0].children
-                        | map(select(.tag=="i")) | length) | tostring)),
-                country: .attrs["data-country"],
-                # título desde la celda "event"
-                title: (
-                  ( [ .children[] | select(.tag=="td" and (.attrs.class//""|test("event"))) ][0] ) as $td
-                  | (( $td.children[]? | select(.tag=="a") | .attrs.title // .text ) // $td.text // "")
-                ) | gsub("\\s+";" ") | sub("^\\s+";"") | sub("\\s+$";""),
-                # timestamp desde el <tr> o desde <td class="time">
-                ts_raw: (
-                  .attrs["data-event-datetime"] //
-                  ( [ .children[]? | select(.tag=="td" and (.attrs.class//""|test("time"))) ][0].attrs["data-event-datetime"] ) //
-                  ( [ .children[]? | select(.tag=="td" and (.attrs.class//""|test("time"))) ][0].attrs["data-value"] ) //
-                  ( [ .children[]? | select(.tag=="td" and (.attrs.class//""|test("time"))) ][0].attrs["data-timestamp"] )
-                ),
-                # moneda/país desde la celda de bandera por si falta data-country
-                flagCell: ( [ .children[]? | select(.tag=="td" and (.attrs.class//""|test("flagCur"))) ][0] | tostring )
-              }
-          ' rows.json > events_stage1.json
+          # A) Sacamos TODAS las filas <tr> (incluye separadores de día y eventos)
+          #    Usamos el HTML guardado por el fallback (cal.html)
+          if [ ! -s cal.html ]; then
+            echo "Falta cal.html (fallback). No se puede parsear." >&2
+            echo "[]" > events.json
+            exit 0
+          fi
 
-          # 2) Normalizamos timestamp (ms/seg/ISO) y filtramos USA + importancia 2/3
-          TZ=Europe/Madrid jq -c '
-            [ .[] 
-              # Filtro USA: data-country=="5" o, si falta, la celda de flag contiene "USD" o "United States"/"EE.UU."
-              | select(
-                  (.country=="5") or
-                  (.country==null and (.flagCell|test("USD|United States|Estados Unidos|EE\\.UU\\.")))
-                )
-              # Importancia 2 o 3 (si viene como número contado de <i>)
-              | .impn = ((.imp|tonumber?) // 0)
-              | select(.imp=="2" or .imp=="3" or .impn==2 or .impn==3)
-              # Timestamp
-              | .tsn = (
-                  if (.ts_raw|type)=="number" then
-                    (if .ts_raw>1000000000000 then ((.ts_raw/1000)|floor) else .ts_raw end)
-                  elif (.ts_raw|type)=="string" then
-                    ((.ts_raw|tonumber?) //
-                     ((.ts_raw|strptime("%Y-%m-%d %H:%M:%S")?|mktime)) //
-                     ((.ts_raw|strptime("%Y-%m-%dT%H:%M:%S%z")?|mktime)))
-                  else null end
-                )
-              | select(.tsn!=null and .title!="" )
-              | {
-                  date: (.tsn | strflocaltime("%Y-%m-%d")),
-                  time: (.tsn | strflocaltime("%H:%M")),
-                  title: .title,
-                  imp: (if (.imp=="2" or .impn==2) then "2⭐️" else "3⭐️" end)
+          pup 'tr json{}' < cal.html > tr_all.json || echo "[]" > tr_all.json
+
+          # B) JQ: arrastramos la fecha del separador de día hacia abajo y extraemos hora/título/estrella/país
+          jq -c '
+            # --- utilidades ---
+            def month_es_to_num:
+              {
+                "enero":"01","febrero":"02","marzo":"03","abril":"04","mayo":"05","junio":"06",
+                "julio":"07","agosto":"08","septiembre":"09","setiembre":"09","octubre":"10",
+                "noviembre":"11","diciembre":"12"
+              };
+            def parse_es_date($s):
+              # Ej: "Martes, 16 de septiembre de 2025"
+              #     ", 16 de septiembre de 2025" -> 2025-09-16
+              ($s | capture("(?<d>\\d{1,2})\\s+de\\s+(?<m>[[:alpha:]]+)\\s+de\\s+(?<y>\\d{4})") ) as $c
+              | "\($c.y)-\((month_es_to_num[$c.m]|.))-\($c.d|tonumber|tostring|lpad(2; "0"))";
+
+            # --- sacamos pares (tipo, payload) recorriendo los <tr> en orden ---
+            [ .[] |
+              (
+                # ¿Es separador de día?
+                ( .attrs.class // "" | test("theDay|newDay") )
+                # algunos sitios meten la fecha en un <td> único
+              ) as $is_day
+              |
+              if $is_day then
+                { kind:"day",
+                  date_txt: ( [ .children[]? | select(.tag=="td") ][0].text // "" ) | gsub("\\s+";" ") }
+              else
+                # Evento normal
+                { kind:"row",
+                  country_attr: .attrs["data-country"],
+                  # Hora desde la celda "time"
+                  time_txt: (
+                    ( [ .children[]? | select(.tag=="td" and (.attrs.class//""|test("time"))) ][0].text // "" )
+                    | gsub("\\s+";" ") | sub("^\\s+";"") | sub("\\s+$";"")
+                  ),
+                  # Cuenta estrellas en celda "sentiment"
+                  stars: (
+                    ( [ .children[]? | select(.tag=="td" and (.attrs.class//""|test("sentiment"))) ][0].children
+                      | map(select(.tag=="i")) | length ) // 0
+                  ),
+                  # Título desde celda "event"
+                  title: (
+                    ( [ .children[]? | select(.tag=="td" and (.attrs.class//""|test("event"))) ][0] ) as $td
+                    | ( ($td.children[]? | select(.tag=="a") | .attrs.title // .text) // $td.text // "" )
+                  ) | gsub("\\s+";" ") | sub("^\\s+";"") | sub("\\s+$";""),
+                  # Celda bandera/moneda para identificar USD si no hay data-country
+                  flag_cell: ( [ .children[]? | select(.tag=="td" and (.attrs.class//""|test("flagCur"))) ][0] | tostring )
                 }
-            ] | sort_by(.date,.time)
-          ' events_stage1.json > events.json
+              end
+            ] as $items
+            |
+            # C) Propagamos la fecha actual a cada fila (reduce carry)
+            (reduce $items[] as $it (
+              {current_date:null, out: []};
+              if $it.kind=="day" then
+                .current_date = ( try parse_es_date($it.date_txt) catch null )
+              elif $it.kind=="row" then
+                .out += [ $it + {date: .current_date} ]
+              else .
+              end
+            )).out
+            |
+            # D) Filtrado USA (country==5 o USD en la celda), importancia 2 o 3, hora válida y título no vacío
+            [ .[]
+              | select(.date != null and .time_txt != "")
+              | .imp = (if .stars==3 then "3⭐️" elif .stars==2 then "2⭐️" else null end)
+              | select(.imp != null)
+              | select(
+                  (.country_attr=="5") or
+                  (.flag_cell|test("USD|United States|Estados Unidos|EE\\.UU\\.", "i"))
+                )
+              | {
+                  date: .date,
+                  time: (.time_txt | capture("(?<hh>\\d{1,2}):(?<mm>\\d{2})") | "\(.hh|tonumber|tostring|lpad(2;\"0")):\(.mm)"),
+                  title: .title,
+                  imp: .imp
+                }
+            ]
+            | sort_by(.date,.time)
+          ' tr_all.json > events.json
 
           echo "Final events count: $(jq 'length' events.json)"
-          jq '.[0:5]' events.json || true
+          echo "Sample:"
+          jq '.[0:8]' events.json || true
 
 
       # ----- 5) Construcción y envío del mensaje (sin cambios salvo conteo) -----
