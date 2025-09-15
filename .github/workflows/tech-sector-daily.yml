@@ -1,0 +1,30 @@
+name: InvestX • Tecnología (cierre diario)
+
+on:
+  schedule:
+    # 22:15 Madrid (20:15 UTC) L-V
+    - cron: "15 20 * * 1-5"
+  workflow_dispatch:
+
+jobs:
+  tech-sector-daily:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install deps
+        run: |
+          npm init -y
+          npm i puppeteer dayjs node-fetch form-data
+
+      - name: Run capture & send
+        env:
+          BOT_TOKEN: "8470375437:AAEgRw-7eq7V_7mDU1z88DCqymhmkNJooNE"
+          CHAT_ID: "-1002885597510"
+        run: node scripts/tech_telegram.js
