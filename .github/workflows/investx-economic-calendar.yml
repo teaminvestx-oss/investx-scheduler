@@ -96,8 +96,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          # A) Sacamos TODAS las filas <tr> (incluye separadores de día y eventos)
-          #    Usamos el HTML guardado por el fallback (cal.html)
+          # Usamos el HTML del fallback (cal.html) que ya guardaste
           if [ ! -s cal.html ]; then
             echo "Falta cal.html (fallback). No se puede parsear." >&2
             echo "[]" > events.json
@@ -106,80 +105,78 @@ jobs:
 
           pup 'tr json{}' < cal.html > tr_all.json || echo "[]" > tr_all.json
 
-          # B) JQ: arrastramos la fecha del separador de día hacia abajo y extraemos hora/título/estrella/país
           jq -c '
-            # --- utilidades ---
+            # -------- utilidades --------
             def month_es_to_num:
               {
                 "enero":"01","febrero":"02","marzo":"03","abril":"04","mayo":"05","junio":"06",
                 "julio":"07","agosto":"08","septiembre":"09","setiembre":"09","octubre":"10",
                 "noviembre":"11","diciembre":"12"
               };
-            def parse_es_date($s):
-              # Ej: "Martes, 16 de septiembre de 2025"
-              #     ", 16 de septiembre de 2025" -> 2025-09-16
-              ($s | capture("(?<d>\\d{1,2})\\s+de\\s+(?<m>[[:alpha:]]+)\\s+de\\s+(?<y>\\d{4})") ) as $c
-              | "\($c.y)-\((month_es_to_num[$c.m]|.))-\($c.d|tonumber|tostring|lpad(2; "0"))";
 
-            # --- sacamos pares (tipo, payload) recorriendo los <tr> en orden ---
+            def parse_es_date($s):
+              # "Martes, 16 de septiembre de 2025" -> "2025-09-16"
+              ( $s | capture("(?<d>\\d{1,2})\\s+de\\s+(?<m>[[:alpha:]]+)\\s+de\\s+(?<y>\\d{4})") ) as $c
+              | ($c.y + "-" + (month_es_to_num[$c.m]) + "-" +
+                 ( ($c.d|tonumber|tostring) | if (.|length)==1 then "0"+. else . end ));
+
+            # ¿Es separador de día?
+            def is_dayrow:
+              (.attrs.class // "") | test("theDay|newDay");
+
+            # -------- extracción --------
             [ .[] |
-              (
-                # ¿Es separador de día?
-                ( .attrs.class // "" | test("theDay|newDay") )
-                # algunos sitios meten la fecha en un <td> único
-              ) as $is_day
-              |
-              if $is_day then
+              if (is_dayrow) then
                 { kind:"day",
                   date_txt: ( [ .children[]? | select(.tag=="td") ][0].text // "" ) | gsub("\\s+";" ") }
               else
-                # Evento normal
                 { kind:"row",
                   country_attr: .attrs["data-country"],
-                  # Hora desde la celda "time"
                   time_txt: (
                     ( [ .children[]? | select(.tag=="td" and (.attrs.class//""|test("time"))) ][0].text // "" )
                     | gsub("\\s+";" ") | sub("^\\s+";"") | sub("\\s+$";"")
                   ),
-                  # Cuenta estrellas en celda "sentiment"
                   stars: (
                     ( [ .children[]? | select(.tag=="td" and (.attrs.class//""|test("sentiment"))) ][0].children
                       | map(select(.tag=="i")) | length ) // 0
                   ),
-                  # Título desde celda "event"
                   title: (
                     ( [ .children[]? | select(.tag=="td" and (.attrs.class//""|test("event"))) ][0] ) as $td
                     | ( ($td.children[]? | select(.tag=="a") | .attrs.title // .text) // $td.text // "" )
                   ) | gsub("\\s+";" ") | sub("^\\s+";"") | sub("\\s+$";""),
-                  # Celda bandera/moneda para identificar USD si no hay data-country
                   flag_cell: ( [ .children[]? | select(.tag=="td" and (.attrs.class//""|test("flagCur"))) ][0] | tostring )
                 }
               end
             ] as $items
             |
-            # C) Propagamos la fecha actual a cada fila (reduce carry)
+            # Propagar la fecha del separador a las filas
             (reduce $items[] as $it (
               {current_date:null, out: []};
               if $it.kind=="day" then
-                .current_date = ( try parse_es_date($it.date_txt) catch null )
+                .current_date = ( (try parse_es_date($it.date_txt) catch null) )
               elif $it.kind=="row" then
                 .out += [ $it + {date: .current_date} ]
               else .
               end
             )).out
             |
-            # D) Filtrado USA (country==5 o USD en la celda), importancia 2 o 3, hora válida y título no vacío
+            # Filtrado + formateo final
             [ .[]
-              | select(.date != null and .time_txt != "")
-              | .imp = (if .stars==3 then "3⭐️" elif .stars==2 then "2⭐️" else null end)
+              | select(.date != null and .time_txt != "" and .title != "")
+              | .imp = (if .stars>=3 then "3⭐️" elif .stars==2 then "2⭐️" else null end)
               | select(.imp != null)
               | select(
                   (.country_attr=="5") or
                   (.flag_cell|test("USD|United States|Estados Unidos|EE\\.UU\\.", "i"))
                 )
+              | ( .time_txt | capture("(?<hh>\\d{1,2}):(?<mm>\\d{2})") ) as $c
+              | .hour = (
+                  ($c.hh|tonumber|tostring)
+                  | if (.|length)==1 then "0"+. else . end
+                )
               | {
                   date: .date,
-                  time: (.time_txt | capture("(?<hh>\\d{1,2}):(?<mm>\\d{2})") | "\(.hh|tonumber|tostring|lpad(2;\"0")):\(.mm)"),
+                  time: (.hour + ":" + $c.mm),
                   title: .title,
                   imp: .imp
                 }
