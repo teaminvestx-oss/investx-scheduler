@@ -91,7 +91,7 @@ jobs:
           if [ ! -s rows.json ]; then echo "[]" > rows.json; fi
           echo "Fallback rows count: $(jq 'length' rows.json)"
 
-         # ----- 4) Filtrado USA + 2-3 estrellas y formateo (robusto contra nulls) -----
+            # ----- 4) Filtrado USA + 2-3 estrellas y formateo (soporta ES + EN) -----
       - name: Filter & format events
         run: |
           set -euo pipefail
@@ -105,26 +105,39 @@ jobs:
 
           # Extrae TODOS los <tr> (separadores de día + filas de evento)
           pup 'tr json{}' < cal.html > tr_all.json || echo "null" > tr_all.json
-          if ! jq -e . tr_all.json >/dev/null 2>&1; then
-            echo "null" > tr_all.json
-          fi
+          if ! jq -e . tr_all.json >/dev/null 2>&1; then echo "null" > tr_all.json; fi
 
           jq -c '
-            # ---------- utilidades ----------
-            def month_es_to_num:
-              {
-                "enero":"01","febrero":"02","marzo":"03","abril":"04","mayo":"05","junio":"06",
-                "julio":"07","agosto":"08","septiembre":"09","setiembre":"09","octubre":"10",
-                "noviembre":"11","diciembre":"12"
-              };
+            # -------- utilidades --------
+            def month_es_to_num: {
+              "enero":"01","febrero":"02","marzo":"03","abril":"04","mayo":"05","junio":"06",
+              "julio":"07","agosto":"08","septiembre":"09","setiembre":"09","octubre":"10",
+              "noviembre":"11","diciembre":"12"
+            };
+            def month_en_to_num: {
+              "january":"01","february":"02","march":"03","april":"04","may":"05","june":"06",
+              "july":"07","august":"08","september":"09","october":"10","november":"11","december":"12"
+            };
             def textify: ( . // "" ) | gsub("\\s+";" ") | sub("^\\s+";"") | sub("\\s+$";"");
+
+            # ES: "Martes, 16 de septiembre de 2025"
             def parse_es_date($s):
-              # "Martes, 16 de septiembre de 2025" -> "2025-09-16"
               ( try ($s | capture("(?<d>\\d{1,2})\\s+de\\s+(?<m>[[:alpha:]]+)\\s+de\\s+(?<y>\\d{4})")) catch null ) as $c
               | if $c==null then null
-                else ($c.y + "-" + (month_es_to_num[$c.m]) + "-" +
-                      ( ($c.d|tonumber|tostring) | if (.|length)==1 then "0"+. else . end ))
+                else ($c.y + "-" + (month_es_to_num[($c.m|ascii_downcase)]) + "-" +
+                      ( ($c.d|tonumber|tostring) | if (.|length)==1 then "0"+. else . end ) )
                 end;
+
+            # EN: "Monday, September 16, 2025"
+            def parse_en_date($s):
+              ( try ($s | capture("(?<wd>[A-Za-z]+),\\s+(?<m>[A-Za-z]+)\\s+(?<d>\\d{1,2}),\\s*(?<y>\\d{4})")) catch null ) as $c
+              | if $c==null then null
+                else ($c.y + "-" + (month_en_to_num[($c.m|ascii_downcase)]) + "-" +
+                      ( ($c.d|tonumber|tostring) | if (.|length)==1 then "0"+. else . end ) )
+                end;
+
+            def parse_any_date($s): (parse_es_date($s)) // (parse_en_date($s));
+
             def is_dayrow: ((.attrs?.class // "") | test("theDay|newDay|dayHeader|theDayRow"));
 
             # ---------- entrada segura ----------
@@ -154,17 +167,22 @@ jobs:
 
             # ---------- propagar fecha ----------
             | (reduce $items[] as $it (
-                {current_date:null, out: []};
+                {current_date:null, out: [], day_cnt:0, row_cnt:0};
                 if $it.kind=="day" then
-                  .current_date = (parse_es_date($it.date_txt))
+                  .current_date = parse_any_date($it.date_txt)
+                  | .day_cnt += 1
                 elif $it.kind=="row" then
                   .out += [ $it + {date: .current_date} ]
+                  | .row_cnt += 1
                 else .
                 end
-              )).out
+              )) as $r
+
+            | ($r.day_cnt) as $DAYS | ($r.row_cnt) as $ROWS
+            | ( $r.out ) as $OUT
 
             # ---------- filtrar y formatear ----------
-            | [ .[]
+            | [ $OUT[]
                 | select(.date != null and (.time_txt // "") != "" and (.title // "") != "")
                 | .imp = (if .stars>=3 then "3⭐️" elif .stars==2 then "2⭐️" else null end)
                 | select(.imp != null)
@@ -181,6 +199,7 @@ jobs:
           ' tr_all.json > events.json || echo "[]" > events.json
 
           echo "Final events count: $(jq 'length' events.json)"
+          echo "Primeros 8:"
           jq '.[0:8]' events.json || true
 
 
