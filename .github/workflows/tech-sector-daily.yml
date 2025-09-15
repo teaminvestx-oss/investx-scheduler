@@ -26,7 +26,7 @@ jobs:
       - name: Install deps
         run: |
           npm init -y
-          npm i puppeteer dayjs node-fetch form-data
+          npm i puppeteer puppeteer-extra puppeteer-extra-plugin-stealth node-fetch form-data dayjs
 
       - name: Run capture & send
         run: node tech_telegram.js
