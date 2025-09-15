@@ -91,50 +91,72 @@ jobs:
           if [ ! -s rows.json ]; then echo "[]" > rows.json; fi
           echo "Fallback rows count: $(jq 'length' rows.json)"
 
-      # ----- 4) Filtrado USA + 2-3 estrellas y formateo (ts robusto + fallback título) -----
+           # ----- 4) Filtrado USA + 2-3 estrellas y formateo (lee TS desde <td class="time">) -----
       - name: Filter & format events
         run: |
           set -euo pipefail
-          # 1) Reducimos filas a lo esencial (USA + 2/3 estrellas)
-          jq -c '
-            .[] |
-            select(.attrs["data-country"]=="5" and (.attrs["data-importance"]=="2" or .attrs["data-importance"]=="3")) |
-            {
-              ts_raw: .attrs["data-event-datetime"],
-              imp: .attrs["data-importance"],
-              # intentar sacar título desde el <a> o texto del <td class="event">
-              title: (
-                ( [ .children[] | select(.tag=="td" and (.attrs.class//""|test("event"))) ][0] ) as $td |
-                (
-                  ( $td.children[]? | select(.tag=="a") | .attrs.title // .text ) // $td.text // ""
-                )
-              ) | gsub("\\s+";" ") | sub("^\\s+";"") | sub("\\s+$";"")
-            }
-          ' rows.json > events_raw0.json || echo "[]" > events_raw0.json
 
-          # 2) Normalizamos timestamp: puede venir vacío, en segundos o en milisegundos
+          # 1) Reducimos: solo filas de eventos
           jq -c '
-            [ .[] |
-              .tsn = (
-                if (.ts_raw|type=="number") then
-                  ( if .ts_raw > 1000000000000 then ((.ts_raw/1000)|floor) else .ts_raw end )
-                elif (.ts_raw|type=="string") then
-                  # a veces viene ISO; intentamos parsearlo
-                  ( .ts_raw | strptime("%Y-%m-%d %H:%M:%S")? // strptime("%Y-%m-%dT%H:%M:%S%z")? | mktime ) // null
-                else null end
-              )
-              | select(.tsn != null and .title != "")
+            .[]
+            | select(.attrs.id? and (.attrs.id|test("^eventRowId_")))
+            | {
+                # importancia desde el <tr> o contando estrellas en la celda "sentiment"
+                imp: (.attrs["data-importance"] //
+                      (([ .children[]? | select(.tag=="td" and (.attrs.class//""|test("sentiment"))) ][0].children
+                        | map(select(.tag=="i")) | length) | tostring)),
+                country: .attrs["data-country"],
+                # título desde la celda "event"
+                title: (
+                  ( [ .children[] | select(.tag=="td" and (.attrs.class//""|test("event"))) ][0] ) as $td
+                  | (( $td.children[]? | select(.tag=="a") | .attrs.title // .text ) // $td.text // "")
+                ) | gsub("\\s+";" ") | sub("^\\s+";"") | sub("\\s+$";""),
+                # timestamp desde el <tr> o desde <td class="time">
+                ts_raw: (
+                  .attrs["data-event-datetime"] //
+                  ( [ .children[]? | select(.tag=="td" and (.attrs.class//""|test("time"))) ][0].attrs["data-event-datetime"] ) //
+                  ( [ .children[]? | select(.tag=="td" and (.attrs.class//""|test("time"))) ][0].attrs["data-value"] ) //
+                  ( [ .children[]? | select(.tag=="td" and (.attrs.class//""|test("time"))) ][0].attrs["data-timestamp"] )
+                ),
+                # moneda/país desde la celda de bandera por si falta data-country
+                flagCell: ( [ .children[]? | select(.tag=="td" and (.attrs.class//""|test("flagCur"))) ][0] | tostring )
+              }
+          ' rows.json > events_stage1.json
+
+          # 2) Normalizamos timestamp (ms/seg/ISO) y filtramos USA + importancia 2/3
+          TZ=Europe/Madrid jq -c '
+            [ .[] 
+              # Filtro USA: data-country=="5" o, si falta, la celda de flag contiene "USD" o "United States"/"EE.UU."
+              | select(
+                  (.country=="5") or
+                  (.country==null and (.flagCell|test("USD|United States|Estados Unidos|EE\\.UU\\.")))
+                )
+              # Importancia 2 o 3 (si viene como número contado de <i>)
+              | .impn = ((.imp|tonumber?) // 0)
+              | select(.imp=="2" or .imp=="3" or .impn==2 or .impn==3)
+              # Timestamp
+              | .tsn = (
+                  if (.ts_raw|type)=="number" then
+                    (if .ts_raw>1000000000000 then ((.ts_raw/1000)|floor) else .ts_raw end)
+                  elif (.ts_raw|type)=="string" then
+                    ((.ts_raw|tonumber?) //
+                     ((.ts_raw|strptime("%Y-%m-%d %H:%M:%S")?|mktime)) //
+                     ((.ts_raw|strptime("%Y-%m-%dT%H:%M:%S%z")?|mktime)))
+                  else null end
+                )
+              | select(.tsn!=null and .title!="" )
               | {
-                  date: ( .tsn | strflocaltime("%Y-%m-%d") ),
-                  time: ( .tsn | strflocaltime("%H:%M") ),
+                  date: (.tsn | strflocaltime("%Y-%m-%d")),
+                  time: (.tsn | strflocaltime("%H:%M")),
                   title: .title,
-                  imp: (if .imp=="2" then "2⭐️" else "3⭐️" end)
+                  imp: (if (.imp=="2" or .impn==2) then "2⭐️" else "3⭐️" end)
                 }
             ] | sort_by(.date,.time)
-          ' events_raw0.json > events.json
+          ' events_stage1.json > events.json
 
           echo "Final events count: $(jq 'length' events.json)"
           jq '.[0:5]' events.json || true
+
 
       # ----- 5) Construcción y envío del mensaje (sin cambios salvo conteo) -----
       - name: Build & Send (only if there are events)
