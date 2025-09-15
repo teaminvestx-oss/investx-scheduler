@@ -28,7 +28,7 @@ jobs:
           BOT_TOKEN: ${{ secrets.INVESTX_TOKEN }}
           CHAT_ID: ${{ secrets.CHAT_ID }}
         run: |
-          TEXTO="🌞 ¡Buenos días, equipo!%0AArrancamos la jornada en InvestX con energía 💥.%0AHoy os esperan setups claros, niveles clave y oportunidades de mercado para no dejar escapar. 🚀"
+          TEXTO="🌞 ¡Buenos días, equipo!Arrancamos la jornada en InvestX con energía 💥.Hoy os esperan setups claros, niveles clave y oportunidades de mercado para no dejar escapar. 🚀"
           curl -sS "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
             -d chat_id="${CHAT_ID}" -d parse_mode="HTML" --data-urlencode text="${TEXTO}"
 
@@ -41,7 +41,7 @@ jobs:
           BOT_TOKEN: ${{ secrets.INVESTX_TOKEN }}
           CHAT_ID: ${{ secrets.CHAT_ID }}
         run: |
-          TEXTO="📌 TIP DEL DÍA%0A¿Sabías que si pulsas el ticker con \"#\" delante en el canal 📲 podrás ver al instante todas las menciones, informes y noticias de ese activo?%0A¡Aprovéchalo para no perder contexto ni oportunidades! 🔎"
+          TEXTO="📌 TIP DEL DÍA-¿Sabías que si pulsas el ticker con \"#\" delante en el canal 📲 podrás ver al instante todas las menciones, informes y noticias de ese activo?¡Aprovéchalo para no perder contexto ni oportunidades! 🔎"
           curl -sS "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
             -d chat_id="${CHAT_ID}" -d parse_mode="HTML" --data-urlencode text="${TEXTO}"
 
@@ -54,7 +54,7 @@ jobs:
           BOT_TOKEN: ${{ secrets.INVESTX_TOKEN }}
           CHAT_ID: ${{ secrets.CHAT_ID }}
         run: |
-          TEXTO="🔔 21:00 — Última hora del mercado 📉📈%0AEs el momento de revisar cómo cierra la sesión y qué setups siguen vivos.%0A👀 Preparad la lupa, porque aquí es donde aparecen las pistas para mañana."
+          TEXTO="🔔 21:00 — Última hora del mercado 📉📈Es el momento de revisar cómo cierra la sesión y qué setups siguen vivos.👀 Preparad la lupa, porque aquí es donde aparecen las pistas para mañana."
           curl -sS "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
             -d chat_id="${CHAT_ID}" -d parse_mode="HTML" --data-urlencode text="${TEXTO}"
 
@@ -67,6 +67,6 @@ jobs:
           BOT_TOKEN: ${{ secrets.INVESTX_TOKEN }}
           CHAT_ID: ${{ secrets.CHAT_ID }}
         run: |
-          TEXTO="🌙 El mercado ya ha cerrado, equipo.%0AAhora toca revisar con calma los movimientos finales de la sesión y preparar el terreno para mañana 📝.%0A💡 La volatilidad al cierre siempre deja oportunidades escondidas... ¡no las dejemos pasar!"
+          TEXTO="🌙 El mercado ya ha cerrado, equipo.Ahora toca revisar con calma los movimientos finales de la sesión y preparar el terreno para mañana 📝.💡 La volatilidad al cierre siempre deja oportunidades escondidas... ¡no las dejemos pasar!"
           curl -sS "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
             -d chat_id="${CHAT_ID}" -d parse_mode="HTML" --data-urlencode text="${TEXTO}"
