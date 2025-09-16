@@ -30,7 +30,7 @@ jobs:
         run: npm install puppeteer
 
       # ---------- Script principal ----------
-          - name: Build grab script (carga + filtro híbrido USA + 2/3⭐)
+      - name: Build grab script (carga + filtro híbrido USA + 2/3⭐)
         run: |
           cat > grab.js <<'EOF'
           const puppeteer = require('puppeteer');
