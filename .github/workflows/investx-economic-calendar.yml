@@ -74,7 +74,7 @@ jobs:
       - name: Run grabber
         run: node grab.js
 
-      - name: Send to Telegram (photo)
+      - name: Send to Telegram (robusto)
         env:
           BOT_TOKEN: ${{ secrets.INVESTX_TOKEN }}
           CHAT_ID: ${{ secrets.CHAT_ID }}
@@ -82,17 +82,45 @@ jobs:
           set -euo pipefail
           echo "➡️ Debug listado:"
           ls -lh
-          PHOTO="$PWD/calendar.png"
+
+          PHOTO="$(realpath calendar.png)"
           if [ ! -s "$PHOTO" ]; then
-            echo "❌ No existe calendar.png"; exit 1
+            echo "❌ No existe calendar.png o está vacío"; exit 1
           fi
+          echo "✔️ Archivo: $PHOTO  ($(wc -c < "$PHOTO") bytes)"
+          file "$PHOTO" || true
+
+          API="https://api.telegram.org/bot${BOT_TOKEN}"
           CAPTION="🗓️ Calendario Económico (⭐2 y ⭐3) — semana actual. Fuente: Investing (TZ Europe/Madrid)"
-          curl -v -sS "https://api.telegram.org/bot${BOT_TOKEN}/sendPhoto" \
+
+          echo "→ Intento 1: sendPhoto"
+          if curl -v -sS "${API}/sendPhoto" \
             --form "chat_id=${CHAT_ID}" \
-            --form "photo=@${PHOTO};type=image/png" \
-            --form-string "caption=${CAPTION}"
+            --form "photo=@${PHOTO};type=image/png;filename=calendar.png" \
+            --form-string "caption=${CAPTION}"; then
+            echo "✅ Enviado con sendPhoto"
+            exit 0
+          fi
 
+          echo "→ Intento 2: sendDocument"
+          if curl -v -sS "${API}/sendDocument" \
+            --form "chat_id=${CHAT_ID}" \
+            --form "document=@${PHOTO};type=image/png;filename=calendar.png" \
+            --form-string "caption=${CAPTION}"; then
+            echo "✅ Enviado con sendDocument"
+            exit 0
+          fi
 
-      - name: Post Setup Node
-        if: always()
-        run: echo "Job terminado"
+          echo "→ Intento 3: attach:// sintaxis"
+          if curl -v -sS "${API}/sendPhoto" \
+            --form "chat_id=${CHAT_ID}" \
+            --form "photo=attach://cal" \
+            --form "cal=@${PHOTO};type=image/png;filename=calendar.png" \
+            --form-string "caption=${CAPTION}"; then
+            echo "✅ Enviado con attach://"
+            exit 0
+          fi
+
+          echo "❌ No se pudo enviar por Telegram"
+          exit 1
+
