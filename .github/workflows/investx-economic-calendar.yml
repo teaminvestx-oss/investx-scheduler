@@ -80,47 +80,32 @@ jobs:
           CHAT_ID: ${{ secrets.CHAT_ID }}
         run: |
           set -euo pipefail
-          echo "➡️ Debug listado:"
           ls -lh
-
-          PHOTO="$(realpath calendar.png)"
-          if [ ! -s "$PHOTO" ]; then
-            echo "❌ No existe calendar.png o está vacío"; exit 1
-          fi
-          echo "✔️ Archivo: $PHOTO  ($(wc -c < "$PHOTO") bytes)"
-          file "$PHOTO" || true
-
+          PHOTO="$(pwd)/calendar.png"
+          [ -s "$PHOTO" ] || { echo "No existe calendar.png"; exit 1; }
           API="https://api.telegram.org/bot${BOT_TOKEN}"
           CAPTION="🗓️ Calendario Económico (⭐2 y ⭐3) — semana actual. Fuente: Investing (TZ Europe/Madrid)"
 
-          echo "→ Intento 1: sendPhoto"
+          echo "→ Intento 1: sendPhoto leyendo por STDIN"
           if curl -v -sS "${API}/sendPhoto" \
-            --form "chat_id=${CHAT_ID}" \
-            --form "photo=@${PHOTO};type=image/png;filename=calendar.png" \
-            --form-string "caption=${CAPTION}"; then
+              --form "chat_id=${CHAT_ID}" \
+              --form "photo=@-;filename=calendar.png;type=image/png" \
+              --form-string "caption=${CAPTION}" \
+              < "$PHOTO"; then
             echo "✅ Enviado con sendPhoto"
             exit 0
           fi
 
-          echo "→ Intento 2: sendDocument"
+          echo "→ Intento 2: sendDocument leyendo por STDIN"
           if curl -v -sS "${API}/sendDocument" \
-            --form "chat_id=${CHAT_ID}" \
-            --form "document=@${PHOTO};type=image/png;filename=calendar.png" \
-            --form-string "caption=${CAPTION}"; then
+              --form "chat_id=${CHAT_ID}" \
+              --form "document=@-;filename=calendar.png;type=image/png" \
+              --form-string "caption=${CAPTION}" \
+              < "$PHOTO"; then
             echo "✅ Enviado con sendDocument"
             exit 0
           fi
 
-          echo "→ Intento 3: attach:// sintaxis"
-          if curl -v -sS "${API}/sendPhoto" \
-            --form "chat_id=${CHAT_ID}" \
-            --form "photo=attach://cal" \
-            --form "cal=@${PHOTO};type=image/png;filename=calendar.png" \
-            --form-string "caption=${CAPTION}"; then
-            echo "✅ Enviado con attach://"
-            exit 0
-          fi
-
-          echo "❌ No se pudo enviar por Telegram"
+          echo "❌ No se pudo enviar a Telegram"
           exit 1
 
