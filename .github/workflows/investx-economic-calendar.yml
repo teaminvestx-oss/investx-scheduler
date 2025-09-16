@@ -79,11 +79,19 @@ jobs:
           BOT_TOKEN: ${{ secrets.INVESTX_TOKEN }}
           CHAT_ID: ${{ secrets.CHAT_ID }}
         run: |
+          set -euo pipefail
+          echo "➡️ Debug listado:"
           ls -lh
-          curl -v -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendPhoto" \
-            -F chat_id="${CHAT_ID}" \
-            -F photo="@calendar.png" \
-            -F caption="🗓️ Calendario Económico filtrado (⭐2 y ⭐3, semana actual)"
+          PHOTO="$PWD/calendar.png"
+          if [ ! -s "$PHOTO" ]; then
+            echo "❌ No existe calendar.png"; exit 1
+          fi
+          CAPTION="🗓️ Calendario Económico (⭐2 y ⭐3) — semana actual. Fuente: Investing (TZ Europe/Madrid)"
+          curl -v -sS "https://api.telegram.org/bot${BOT_TOKEN}/sendPhoto" \
+            --form "chat_id=${CHAT_ID}" \
+            --form "photo=@${PHOTO};type=image/png" \
+            --form-string "caption=${CAPTION}"
+
 
       - name: Post Setup Node
         if: always()
