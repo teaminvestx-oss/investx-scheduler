@@ -28,127 +28,10 @@ jobs:
       - name: Install Puppeteer
         run: npm install puppeteer
 
-      - name: Build grab script (filtra DOM: USA + 2/3⭐ y captura ajustada)
+      - name: Build grab script
         run: |
           cat > grab.js <<'EOF'
-          const puppeteer = require('puppeteer');
-          const sleep = (ms) => new Promise(r => setTimeout(r, ms));
-
-          // Click por texto (ES/EN) sin XPath
-          async function clickByText(page, selector, labels, timeoutMs = 8000) {
-            const deadline = Date.now() + timeoutMs;
-            const wants = labels.map(t => t.toLowerCase());
-            while (Date.now() < deadline) {
-              const ok = await page.evaluate(({selector, wants}) => {
-                for (const el of document.querySelectorAll(selector)) {
-                  const txt = (el.innerText || el.textContent || '').toLowerCase().trim();
-                  if (wants.some(w => txt.includes(w))) { el.click(); return true; }
-                }
-                return false;
-              }, {selector, wants});
-              if (ok) return true;
-              await sleep(250);
-            }
-            return false;
-          }
-
-          (async () => {
-            const browser = await puppeteer.launch({
-              headless: 'new',
-              args: ['--no-sandbox','--disable-setuid-sandbox','--lang=es-ES,es']
-            });
-            const page = await browser.newPage();
-            await page.setUserAgent('Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36');
-            await page.setViewport({ width: 1440, height: 2400, deviceScaleFactor: 2 });
-
-            // 1) Ir al calendario ES
-            await page.goto('https://es.investing.com/economic-calendar/', { waitUntil: 'domcontentloaded', timeout: 60000 });
-
-            // 2) Aceptar cookies si aparece
-            await page.evaluate(() => {
-              const btn = [...document.querySelectorAll("button,a")].find(b =>
-                /aceptar|accept|consent/i.test((b.innerText||'').toLowerCase())
-              ); btn?.click();
-            });
-            await sleep(800);
-
-            // 3) Seleccionar "Esta semana" (si existe)
-            await clickByText(page, 'a,button', ['esta semana', 'this week'], 8000);
-            await sleep(600);
-
-            // 4) (Opcional) abrir filtros y poner TZ Madrid (55). Si no existe, seguimos.
-            const opened = await clickByText(page, 'button,a', ['filtros', 'filter'], 6000);
-            if (opened) {
-              try { await page.select('select[name="timeZone"]', '55'); } catch {}
-              await clickByText(page, 'button,a', ['aplicar', 'apply'], 6000);
-              await sleep(800);
-            }
-
-            // 5) Esperar filas del calendario
-            await page.waitForSelector('tr[id^="eventRowId_"], tr.theDay, tr.newDay, tr.dayHeader, table.genTbl', { timeout: 20000 }).catch(()=>{});
-
-            // 6) FILTRO DURO SOBRE EL DOM: USA + 2/3 ⭐
-            await page.evaluate(() => {
-              const keepCountry = '5';                   // USA
-              const keepImp = new Set(['2','3']);        // 2 y 3 estrellas
-
-              // Ocultar anuncios/barras flotantes que estorben
-              for (const sel of [
-                '#topBarAndAds', '.midHeader', '#banner', '.stickyFooter', '.js-consent-banner',
-                'iframe', '.adsbygoogle', '.advertisement'
-              ]) document.querySelectorAll(sel).forEach(e => e.remove());
-
-              // Eventos
-              const rows = document.querySelectorAll('tr[id^="eventRowId_"], tr.js-event-item');
-              rows.forEach(tr => {
-                const cAttr = tr.getAttribute('data-country') || tr.dataset?.country || '';
-                const iAttr = tr.getAttribute('data-importance') || tr.dataset?.importance || '';
-
-                // Inferencias si faltan attrs
-                let countryOK = (cAttr === keepCountry);
-                if (!countryOK) {
-                  const flagCell = tr.querySelector('td.flagCur');
-                  const txt = (flagCell?.innerText || '').toUpperCase();
-                  const flagSpan = flagCell?.querySelector('span[class*="USA"]');
-                  if (txt.includes('USD') || flagSpan) countryOK = true;
-                }
-
-                let impOK = keepImp.has(iAttr);
-                if (!impOK) {
-                  const stars = tr.querySelector('td.sentiment')?.querySelectorAll('i').length || 0;
-                  if (stars >= 2) impOK = true;
-                }
-
-                if (!(countryOK && impOK)) tr.style.display = 'none';
-              });
-
-              // Ocultar headers de día sin eventos visibles debajo
-              const dayRows = Array.from(document.querySelectorAll('tr.theDay, tr.newDay, tr.dayHeader'));
-              const isVisibleEvent = (r) => (r.matches('tr[id^="eventRowId_"], tr.js-event-item') && r.style.display !== 'none');
-              for (const dr of dayRows) {
-                let hasAny = false;
-                for (let sib = dr.nextElementSibling; sib; sib = sib.nextElementSibling) {
-                  if (sib.matches('tr.theDay, tr.newDay, tr.dayHeader')) break;
-                  if (isVisibleEvent(sib)) { hasAny = true; break; }
-                }
-                if (!hasAny) dr.style.display = 'none';
-              }
-            });
-
-            // 7) Captura AJUSTADA del bloque de tabla; si no existe, full page
-            const table = await page.$('#economicCalendarData') || await page.$('table.genTbl');
-            await page.evaluate(() => window.scrollTo(0, 0));
-            await sleep(300);
-
-            if (table) {
-              await table.screenshot({ path: 'calendar.png' });
-            } else {
-              await page.screenshot({ path: 'calendar.png', fullPage: true });
-            }
-
-            console.log('✅ Captura filtrada generada: calendar.png');
-            await browser.close();
-          })().catch(err => { console.error(err); process.exit(1); });
+          // --- aquí va todo el código JS que te pasé antes ---
           EOF
 
       - name: Run grabber
@@ -170,17 +53,18 @@ jobs:
           chat = os.environ['CHAT_ID']
           photo_path = "calendar.png"
           if not os.path.exists(photo_path) or os.path.getsize(photo_path) == 0:
-            print("calendar.png no existe o está vacío", file=sys.stderr)
-            sys.exit(1)
+              print("calendar.png no existe o está vacío", file=sys.stderr)
+              sys.exit(1)
           url = f"https://api.telegram.org/bot{bot}/sendPhoto"
           caption = "🗓️ Calendario Económico (USA, ⭐⭐ y ⭐⭐⭐) — Semana actual · TZ Europe/Madrid · Fuente: Investing"
           with open(photo_path, "rb") as f:
-            files = {"photo": ("calendar.png", f, "image/png")}
-            data = {"chat_id": chat, "caption": caption, "parse_mode": "HTML"}
-            r = requests.post(url, data=data, files=files, timeout=60)
-            print(r.status_code, r.text)
-            r.raise_for_status()
+              files = {"photo": ("calendar.png", f, "image/png")}
+              data = {"chat_id": chat, "caption": caption, "parse_mode": "HTML"}
+              r = requests.post(url, data=data, files=files, timeout=60)
+              print(r.status_code, r.text)
+              r.raise_for_status()
           PY
 
       - name: Done
         run: echo "✅ Flujo completado"
+
