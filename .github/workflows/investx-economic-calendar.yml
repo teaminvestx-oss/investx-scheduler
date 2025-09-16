@@ -32,151 +32,131 @@ jobs:
               -c cookies.txt -b cookies.txt -o /dev/null || true
           done
 
-          # ----- 2) AJAX endpoint (actualizado: arrays + campos obligatorios) -----
-      - name: Try AJAX endpoint (preferred)
+              # ----- 2) Node + Puppeteer -----
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install Puppeteer
         run: |
-          set -euo pipefail
-          UA="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
-          FROM=$(TZ=Europe/Madrid date -d "monday this week" +%Y-%m-%d)
-          TO=$(TZ=Europe/Madrid date -d "sunday this week" +%Y-%m-%d)
+          npm init -y
+          npm i puppeteer@22
 
-          # NOTA: country[]=5  (USA), importance[]=2,3 ; timeZone=55 ~ Madrid (CEST/CET en Investing)
-          curl -sSL 'https://www.investing.com/economic-calendar/Service/getCalendarFilteredData' \
-            -H "User-Agent: $UA" \
-            -H 'Accept: application/json, text/javascript, */*; q=0.01' \
-            -H 'Content-Type: application/x-www-form-urlencoded; charset=UTF-8' \
-            -H 'X-Requested-With: XMLHttpRequest' \
-            -H 'Origin: https://www.investing.com' \
-            -H 'Referer: https://www.investing.com/economic-calendar/' \
-            -b cookies.txt -c cookies.txt \
-            --data "country[]=5&importance[]=2&importance[]=3&timeZone=55&timeFilter=time_only&currentTab=custom&limit_from=0&dateFrom=${FROM}&dateTo=${TO}&action=filter" \
-            -o ajax.json || echo '{}' > ajax.json
-
-          # La API devuelve {"data":"<tr>...</tr>"} o HTML directo
-          if jq -e '.data' ajax.json >/dev/null 2>&1; then
-            jq -r '.data' ajax.json > ajax_data.html
-          else
-            # Puede venir HTML plano
-            cp ajax.json ajax_data.html || true
-          fi
-
-          # Extraer filas <tr id="eventRowId_...">
-          if [ -s ajax_data.html ]; then
-            pup 'tr[id^="eventRowId_"] json{}' < ajax_data.html > rows.json || echo "[]" > rows.json
-          else
-            echo "[]" > rows.json
-          fi
-          echo "AJAX rows count: $(jq 'length' rows.json)"
-
-      # ----- 3) Fallback: HTML completo (ES/EN) si no hubo filas -----
-      - name: Fallback to full HTML
-        if: ${{ always() }}
+      # ----- 3) Script: abrir Investing, aplicar filtros y capturar tabla -----
+      - name: Build grab script
         run: |
-          set -euo pipefail
-          COUNT=$(jq 'length' rows.json || echo 0)
-          if [ "$COUNT" -gt 0 ]; then
-            echo "Saltamos fallback: ya hay filas desde AJAX."
-            exit 0
-          fi
+          cat > grab.js <<'EOF'
+          const puppeteer = require('puppeteer');
 
-          UA="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
-          for SRC in "https://es.investing.com/economic-calendar/" "https://www.investing.com/economic-calendar/"; do
-            curl -sSL "$SRC" -H "User-Agent: $UA" -b cookies.txt -c cookies.txt -o cal.html || true
-            pup 'tr[id^="eventRowId_"] json{}' < cal.html > rows_try.json || echo "[]" > rows_try.json
-            if [ -s rows_try.json ] && [ "$(jq 'length' rows_try.json)" -gt 0 ]; then
-              mv rows_try.json rows.json
-              break
-            fi
-          done
-          if [ ! -s rows.json ]; then echo "[]" > rows.json; fi
-          echo "Fallback rows count: $(jq 'length' rows.json)"
+          (async () => {
+            const browser = await puppeteer.launch({
+              headless: 'new',
+              args: ['--no-sandbox','--disable-setuid-sandbox','--lang=es-ES,es']
+            });
+            const page = await browser.newPage();
+            await page.setUserAgent('Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36');
+            await page.setViewport({ width: 1366, height: 2000, deviceScaleFactor: 2 });
 
-               # ----- 4) Filtrar USA + 2-3 estrellas y formatear (sin strptime) -----
-      - name: Filter & format events
-        run: |
-          set -euo pipefail
+            const url = 'https://es.investing.com/economic-calendar/';
+            await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
 
-          if [ ! -s rows.json ]; then
-            echo "[]" > rows.json
-          fi
+            // 1) Aceptar cookies si aparece
+            try {
+              await page.waitForSelector('button:has-text("Aceptar")', { timeout: 6000 });
+              await page.click('button:has-text("Aceptar")');
+            } catch (_) {}
 
-          jq -c '
-            [ .[] 
-              | select(.attrs["data-country"] == "5")
-              | select(.attrs["data-importance"] == "2" or .attrs["data-importance"] == "3")
-              | {
-                  rawdt: .attrs["data-event-datetime"],
-                  imp: (if .attrs["data-importance"]=="2" then "2⭐️" else "3⭐️" end),
-                  title: (
-                    ( [ .children[] | select(.tag=="td" and (.attrs.class//""|test("event"))) ][0] ) as $td
-                    | ( ($td.children[]? | select(.tag=="a") | .attrs.title // .text) // $td.text // "" )
-                    | gsub("\\s+";" ") | sub("^\\s+";"") | sub("\\s+$";"")
-                  )
-                }
-              | select(.rawdt != null and .title != "")
-              | {
-                  date: (.rawdt | sub(" .*";"") | gsub("/";"-")),   # "2025/09/16" -> "2025-09-16"
-                  time: (.rawdt | capture(" (?<hh>\\d{2}):(?<mm>\\d{2})") | "\(.hh):\(.mm)"),
-                  title: .title,
-                  imp: .imp
-                }
-            ]
-            | sort_by(.date, .time)
-          ' rows.json > events.json
+            // 2) Pestaña "Esta semana"
+            try {
+              await page.waitForSelector('a[data-test="calendar-thisWeek"]', { timeout: 8000 });
+              await page.click('a[data-test="calendar-thisWeek"]');
+            } catch (_) {}
 
-          echo "Final events count: $(jq 'length' events.json)"
-          jq '.[0:8]' events.json || true
+            // 3) Abrir filtros
+            try {
+              await page.waitForSelector('a[data-test="filterStateButton"]', { timeout: 10000 });
+              await page.click('a[data-test="filterStateButton"]');
+              await page.waitForSelector('[data-test="calendar-filters"]', { timeout: 10000 });
+            } catch (e) {
+              console.error('No pude abrir filtros:', e.message);
+            }
 
+            // 4) Filtro país: sólo Estados Unidos
+            try {
+              // Limpiar selección
+              const clearSel = await page.$('button[data-test="clear-countries"]');
+              if (clearSel) await clearSel.click();
+            } catch (_) {}
+            try {
+              await page.type('input[data-test="country-search"]', 'Estados Unidos', { delay: 30 });
+              await page.waitForSelector('li[role="option"]', { timeout: 8000 });
+              // El primer resultado debería ser USA
+              const usa = (await page.$x("//li[contains(@role,'option')]//*[contains(., 'Estados Unidos')]/ancestor::li"))[0];
+              if (usa) await usa.click();
+            } catch (_) {}
 
-      # ----- 5) Construcción y envío del mensaje (sin cambios salvo conteo) -----
-      - name: Build & Send (only if there are events)
+            // 5) Importancia: 2 y 3 estrellas
+            try {
+              // Desmarcar todas primero si procede
+              const allImp = await page.$$('[data-test^="importance-"] input[type="checkbox"]');
+              for (const cb of allImp) {
+                const checked = await (await cb.getProperty('checked')).jsonValue();
+                if (checked) await cb.click();
+              }
+              // Marcar 2 y 3
+              const imp2 = await page.$('[data-test="importance-2"] input[type="checkbox"]');
+              const imp3 = await page.$('[data-test="importance-3"] input[type="checkbox"]');
+              if (imp2) await imp2.click();
+              if (imp3) await imp3.click();
+            } catch (_) {}
+
+            // 6) Zona horaria: Madrid (si está disponible en selector)
+            try {
+              await page.select('select[name="timeZone"]', '55'); // 55 suele ser Madrid CET/CEST en Investing
+            } catch (_) {}
+
+            // 7) Aplicar filtros
+            try {
+              const applyBtn = await page.$('button[data-test="apply-filters"]') || await page.$('button:has-text("Aplicar")');
+              if (applyBtn) await applyBtn.click();
+            } catch (_) {}
+
+            // 8) Esperar a que renderice la tabla
+            await page.waitForSelector('#economicCalendarData, table.genTbl', { timeout: 20000 });
+
+            // 9) Desplazar para que aparezca toda la tabla (altura grande)
+            await page.evaluate(() => window.scrollTo(0, 0));
+            await page.waitForTimeout(1000);
+
+            const table = await page.$('#economicCalendarData') || await page.$('table.genTbl');
+            if (!table) {
+              console.error('No encontré la tabla del calendario');
+              await browser.close();
+              process.exit(2);
+            }
+
+            // 10) Captura del bloque (png)
+            await table.screenshot({ path: 'calendar.png' });
+
+            await browser.close();
+            console.log('CAPTURA OK: calendar.png');
+          })().catch(err => { console.error(err); process.exit(1); });
+          EOF
+
+      - name: Run grabber
+        run: node grab.js
+
+      # ----- 4) Enviar a Telegram -----
+      - name: Send to Telegram (photo)
+        if: ${{ success() }}
         env:
           BOT_TOKEN: ${{ secrets.INVESTX_TOKEN }}
           CHAT_ID: ${{ secrets.CHAT_ID }}
         run: |
-          set -euo pipefail
-          TZ_EUROPE=Europe/Madrid
-          TODAY=$(TZ=$TZ_EUROPE date +%Y-%m-%d)
-          WEEK_START=$(TZ=$TZ_EUROPE date -d "monday this week" +%Y-%m-%d)
-          WEEK_END=$(TZ=$TZ_EUROPE date -d "sunday this week" +%Y-%m-%d)
-          DOW=$(TZ=$TZ_EUROPE date +%u)   # 1..7
-
-          if [ "$DOW" -ge 6 ]; then echo "Fin de semana: no se envía."; exit 0; fi
-          if [ ! -s events.json ] || [ "$(jq 'length' events.json)" -eq 0 ]; then
-            echo "Sin eventos tras filtrado -> no se envía."
-            exit 0
-          fi
-
-          if [ "$DOW" -eq 1 ]; then
-            SEL=$(jq --arg A "$WEEK_START" --arg B "$WEEK_END" -c '[ .[] | select(.date >= $A and .date <= $B) ]' events.json)
-            HEADER=$(printf "📣 Desde <b>InvestX</b> os informamos del <b>calendario económico de EE.UU.</b> para esta semana.\n<i>Eventos relevantes (2⭐️ y 3⭐️) — Horario Europe/Madrid</i>")
-          else
-            SEL=$(jq --arg D "$TODAY" -c '[ .[] | select(.date == $D) ]' events.json)
-            HEADER=$(printf "📣 Desde <b>InvestX</b> os informamos del <b>calendario económico de EE.UU.</b> — Hoy %s.\n<i>Eventos relevantes (2⭐️ y 3⭐️) — Horario Europe/Madrid</i>" "$TODAY")
-          fi
-
-          echo "$SEL" > sel.json
-          if [ "$(jq 'length' sel.json)" -eq 0 ]; then
-            echo "No hay eventos en el rango pedido -> no se envía."
-            exit 0
-          fi
-
-          BODY=""
-          mapfile -t DAYS < <(jq -r 'map(.date) | unique[]' sel.json)
-          for DAY in "${DAYS[@]}"; do
-            BODY="${BODY}$(printf "\n<b>• %s</b>\n" "$DAY")"
-            while IFS= read -r LINE; do
-              LINE_ESC=$(printf "%s" "$LINE" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' -e 's/"/\&quot;/g')
-              HORA=$(printf "%s" "$LINE_ESC" | cut -d'|' -f1)
-              TEXTO_EVENTO=$(printf "%s" "$LINE_ESC" | cut -d'|' -f2)
-              BODY="${BODY}$(printf "• <b>%s</b> — %s\n" "$HORA" "$TEXTO_EVENTO")"
-            done < <(jq -r --arg DAY "$DAY" '.[] | select(.date==$DAY) | "\(.time)|\(.title) (\(.imp))"' sel.json)
-          done
-
-          TEXTO="${HEADER}${BODY}"
-
-          curl -sS "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
-            -d chat_id="${CHAT_ID}" \
-            -d parse_mode="HTML" \
-            -d disable_web_page_preview=true \
-            --data-urlencode text="$TEXTO"
+          CAPTION="📣 Desde <b>InvestX</b> — Calendario económico <b>EE.UU.</b> (2⭐️ y 3⭐️) — semana actual.\n<i>Fuente: Investing, TZ Europe/Madrid</i>"
+          curl -sS "https://api.telegram.org/bot${BOT_TOKEN}/sendPhoto" \
+            -F chat_id="${CHAT_ID}" \
+            -F parse_mode="HTML" \
+            -F caption="$CAPTION" \
+            -F photo="@calendar.png"
