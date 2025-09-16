@@ -138,13 +138,14 @@ jobs:
 
       - name: Run grabber
         run: node grab.js
-
+     
       - name: Send to Telegram (photo)
         env:
           BOT_TOKEN: ${{ secrets.INVESTX_TOKEN }}
           CHAT_ID: ${{ secrets.CHAT_ID }}
         run: |
-          curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendPhoto" \
-            -F chat_id="${CHAT_ID}" \
-            -F photo="@calendar.png" \
-            -F caption="🗓️ Calendario Económico filtrado (Importancia ⭐⭐ y ⭐⭐⭐, Esta semana)"
+         ls -lh   # 👈 Esto nos sirve para debug: ver si está calendar.png
+         curl -v -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendPhoto" \
+           -F chat_id="${CHAT_ID}" \
+           -F photo="@calendar.png" \
+           -F caption="🗓️ Calendario Económico filtrado (Importancia ⭐⭐ y ⭐⭐⭐, Esta semana)"
