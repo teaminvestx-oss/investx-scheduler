@@ -2,138 +2,91 @@ name: InvestX Economic Calendar
 
 on:
   schedule:
-    - cron: "0 11 * * 1"   # Lunes 13:00 Madrid (11:00 UTC) — semanal
-    - cron: "0 11 * * 2-5" # Mar–Vie 13:00 Madrid (11:00 UTC) — diario
+    - cron: "0 11 * * 1-5"   # Lunes-Viernes 13:00 Madrid (11:00 UTC)
   workflow_dispatch:
 
 jobs:
   econ-calendar:
     runs-on: ubuntu-latest
     steps:
-      # ----- deps -----
+      - name: Set up job
+        run: echo "Starting job..."
+
       - name: Install jq & pup
         run: |
-          set -e
           sudo apt-get update
           sudo apt-get install -y jq curl unzip
           curl -sL https://github.com/ericchiang/pup/releases/download/v0.4.0/pup_v0.4.0_linux_amd64.zip -o pup.zip
-          unzip -o pup.zip
+          unzip pup.zip
           sudo mv pup /usr/local/bin/
 
-      # ----- 1) Obtener cookies + HTML base -----
-      - name: Seed cookies & base HTML
-        run: |
-          set -e
-          UA="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
-          for URL in "https://es.investing.com/economic-calendar/" "https://www.investing.com/economic-calendar/"; do
-            curl -sSL "$URL" \
-              -H "User-Agent: $UA" \
-              -H "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8" \
-              -c cookies.txt -b cookies.txt -o /dev/null || true
-          done
-
-              # ----- 2) Node + Puppeteer -----
       - name: Setup Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v3
         with:
-          node-version: '20'
+          node-version: 18
 
       - name: Install Puppeteer
-        run: |
-          npm init -y
-          npm i puppeteer@22
+        run: npm install puppeteer
 
-      # ----- 3) Script: abrir Investing, (intentar) aplicar filtros y capturar tabla -----
       - name: Build grab script
         run: |
           cat > grab.js <<'EOF'
           const puppeteer = require('puppeteer');
 
-          // Helpers
           const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
-          // Click por texto (XPath), robusto español/inglés
-          async function clickByText(page, tag, texts, timeout = 8000) {
-            const start = Date.now();
-            while (Date.now() - start < timeout) {
-              for (const t of texts) {
-                const [el] = await page.$x(`//${tag}[contains(normalize-space(.), "${t}")]`);
-                if (el) { await el.click(); return true; }
-              }
+          async function clickByText(page, selector, texts, timeoutMs = 8000) {
+            const deadline = Date.now() + timeoutMs;
+            const textsLc = texts.map(t => t.toLowerCase());
+            while (Date.now() < deadline) {
+              const clicked = await page.evaluate(({ selector, textsLc }) => {
+                const els = Array.from(document.querySelectorAll(selector));
+                for (const el of els) {
+                  const txt = (el.innerText || el.textContent || '').toLowerCase().trim();
+                  if (textsLc.some(t => txt.includes(t))) { el.click(); return true; }
+                }
+                return false;
+              }, { selector, textsLc });
+              if (clicked) return true;
               await sleep(300);
             }
             return false;
           }
 
-          // Selecciona pestaña Esta semana (ES/EN)
           async function selectThisWeek(page) {
-            // intentos por data-test
             try {
               const weekSel = await page.$('a[data-test="calendar-thisWeek"]');
               if (weekSel) { await weekSel.click(); return true; }
             } catch {}
-            // fallback por texto
-            return await clickByText(page, 'a', ['Esta semana', 'This week'], 6000);
+            return await clickByText(page, 'a, button', ['esta semana', 'this week'], 6000);
           }
 
-          // Abre panel de filtros (si existe)
           async function openFilters(page) {
-            // algunos sitios usan <button>, otros <a>
-            const okBtn =
-              await clickByText(page, 'button', ['Filtros', 'Filter'], 6000) ||
-              await clickByText(page, 'a', ['Filtros', 'Filter'], 6000);
-            return okBtn;
+            return await clickByText(page, 'button, a', ['filtros', 'filter'], 6000);
           }
 
-          // Marca importancia 2 y 3 si el panel está abierto
           async function setImportance(page) {
             try {
-              // desmarcar todo si están marcados
-              const allCbs = await page.$$('[data-test^="importance-"] input[type="checkbox"]');
-              if (allCbs.length) {
-                for (const cb of allCbs) {
-                  const checked = await (await cb.getProperty('checked')).jsonValue();
-                  if (checked) await cb.click();
-                }
-                // marcar 2 y 3
-                const imp2 = await page.$('[data-test="importance-2"] input[type="checkbox"]');
-                const imp3 = await page.$('[data-test="importance-3"] input[type="checkbox"]');
-                if (imp2) await imp2.click();
-                if (imp3) await imp3.click();
-                return true;
-              }
+              await page.evaluate(() => {
+                document.querySelectorAll('[data-test^="importance-"] input[type="checkbox"]')
+                  .forEach(cb => { if (cb.checked) cb.click(); });
+              });
+              await page.evaluate(() => {
+                const sel = s => document.querySelector(s);
+                sel('[data-test="importance-2"] input[type="checkbox"]')?.click();
+                sel('[data-test="importance-3"] input[type="checkbox"]')?.click();
+              });
+              return true;
             } catch {}
             return false;
           }
 
-          // Selecciona país Estados Unidos si hay buscador de países
-          async function setCountryUSA(page) {
-            try {
-              const clearBtn = await page.$('button[data-test="clear-countries"]');
-              if (clearBtn) await clearBtn.click();
-            } catch {}
-            try {
-              const input = await page.$('input[data-test="country-search"]');
-              if (!input) return false;
-              await input.click({ clickCount: 3 });
-              await input.type('Estados Unidos', { delay: 20 });
-              await sleep(300);
-              // primer resultado que contenga Estados Unidos/United States
-              const [opt] = await page.$x(`//li[contains(@role,"option")]//*[contains(., "Estados Unidos") or contains(., "United States")]/ancestor::li`);
-              if (opt) { await opt.click(); return true; }
-            } catch {}
-            return false;
-          }
-
-          // Aplica filtros (botón aplicar)
           async function applyFilters(page) {
-            // por data-test
             try {
-              const apply = await page.$('button[data-test="apply-filters"]');
-              if (apply) { await apply.click(); return true; }
+              const byData = await page.$('button[data-test="apply-filters"]');
+              if (byData) { await byData.click(); return true; }
             } catch {}
-            // por texto
-            return await clickByText(page, 'button', ['Aplicar', 'Apply'], 5000);
+            return await clickByText(page, 'button, a', ['aplicar', 'apply'], 5000);
           }
 
           (async () => {
@@ -145,50 +98,38 @@ jobs:
             await page.setUserAgent('Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36');
             await page.setViewport({ width: 1440, height: 2200, deviceScaleFactor: 2 });
 
-            // 1) Ir a Investing
             await page.goto('https://es.investing.com/economic-calendar/', { waitUntil: 'domcontentloaded', timeout: 60000 });
 
-            // 2) Aceptar cookies si salen
-            try {
-              // botones típicos de consentimiento
-              await clickByText(page, 'button', ['Aceptar', 'Accept All', 'Aceptar todo', 'Consentir'], 4000);
-            } catch {}
+            await clickByText(page, 'button, a', ['aceptar', 'accept all', 'aceptar todo', 'consentir'], 4000);
 
-            // 3) Seleccionar "Esta semana" (si existe)
             await selectThisWeek(page);
-            await sleep(800);
+            await sleep(600);
 
-            // 4) Intentar abrir filtros y configurar (si no, continuamos sin filtrar y capturamos todo)
-            let filtersOpened = await openFilters(page);
-            if (filtersOpened) {
-              await sleep(500);
+            const openedFilters = await openFilters(page);
+            if (openedFilters) {
+              await sleep(400);
               await setImportance(page);
-              await setCountryUSA(page);
               await applyFilters(page);
               await sleep(1200);
             }
 
-            // 5) Esperar tabla y capturar
-            //   - #economicCalendarData se ancla en muchos layouts
-            //   - fallback a cualquier tabla con clase genTbl dentro del calendario
-            await page.waitForSelector('#economicCalendarData, table.genTbl', { timeout: 20000 });
+            await page.waitForSelector('#economicCalendarData, table.genTbl', { timeout: 20000 }).catch(() => {});
             await sleep(500);
 
-            const table =
+            const tableHandle =
               (await page.$('#economicCalendarData')) ||
               (await page.$('table.genTbl'));
 
-            if (!table) {
+            if (!tableHandle) {
               console.error('No encontré la tabla del calendario');
               await browser.close();
               process.exit(2);
             }
 
-            // Asegura que está en viewport top (evita cabecera fija)
             await page.evaluate(() => window.scrollTo(0, 0));
             await sleep(400);
 
-            await table.screenshot({ path: 'calendar.png' });
+            await tableHandle.screenshot({ path: 'calendar.png' });
             console.log('CAPTURA OK: calendar.png');
 
             await browser.close();
@@ -198,16 +139,12 @@ jobs:
       - name: Run grabber
         run: node grab.js
 
-      # ----- 4) Enviar a Telegram -----
       - name: Send to Telegram (photo)
-        if: ${{ success() }}
         env:
           BOT_TOKEN: ${{ secrets.INVESTX_TOKEN }}
           CHAT_ID: ${{ secrets.CHAT_ID }}
         run: |
-          CAPTION="📣 Desde <b>InvestX</b> — Calendario económico <b>EE.UU.</b> (2⭐️ y 3⭐️) — semana actual.\n<i>Fuente: Investing — TZ Europe/Madrid</i>"
-          curl -sS "https://api.telegram.org/bot${BOT_TOKEN}/sendPhoto" \
+          curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendPhoto" \
             -F chat_id="${CHAT_ID}" \
-            -F parse_mode="HTML" \
-            -F caption="$CAPTION" \
-            -F photo="@calendar.png"
+            -F photo="@calendar.png" \
+            -F caption="🗓️ Calendario Económico filtrado (Importancia ⭐⭐ y ⭐⭐⭐, Esta semana)"
