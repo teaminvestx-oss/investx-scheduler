@@ -10,7 +10,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Set up job
-        run: echo "Starting job..."
+        run: echo "▶️ Iniciando flujo Econ Calendar"
 
       - name: Install jq & pup
         run: |
@@ -32,62 +32,7 @@ jobs:
         run: |
           cat > grab.js <<'EOF'
           const puppeteer = require('puppeteer');
-
           const sleep = (ms) => new Promise(r => setTimeout(r, ms));
-
-          async function clickByText(page, selector, texts, timeoutMs = 8000) {
-            const deadline = Date.now() + timeoutMs;
-            const textsLc = texts.map(t => t.toLowerCase());
-            while (Date.now() < deadline) {
-              const clicked = await page.evaluate(({ selector, textsLc }) => {
-                const els = Array.from(document.querySelectorAll(selector));
-                for (const el of els) {
-                  const txt = (el.innerText || el.textContent || '').toLowerCase().trim();
-                  if (textsLc.some(t => txt.includes(t))) { el.click(); return true; }
-                }
-                return false;
-              }, { selector, textsLc });
-              if (clicked) return true;
-              await sleep(300);
-            }
-            return false;
-          }
-
-          async function selectThisWeek(page) {
-            try {
-              const weekSel = await page.$('a[data-test="calendar-thisWeek"]');
-              if (weekSel) { await weekSel.click(); return true; }
-            } catch {}
-            return await clickByText(page, 'a, button', ['esta semana', 'this week'], 6000);
-          }
-
-          async function openFilters(page) {
-            return await clickByText(page, 'button, a', ['filtros', 'filter'], 6000);
-          }
-
-          async function setImportance(page) {
-            try {
-              await page.evaluate(() => {
-                document.querySelectorAll('[data-test^="importance-"] input[type="checkbox"]')
-                  .forEach(cb => { if (cb.checked) cb.click(); });
-              });
-              await page.evaluate(() => {
-                const sel = s => document.querySelector(s);
-                sel('[data-test="importance-2"] input[type="checkbox"]')?.click();
-                sel('[data-test="importance-3"] input[type="checkbox"]')?.click();
-              });
-              return true;
-            } catch {}
-            return false;
-          }
-
-          async function applyFilters(page) {
-            try {
-              const byData = await page.$('button[data-test="apply-filters"]');
-              if (byData) { await byData.click(); return true; }
-            } catch {}
-            return await clickByText(page, 'button, a', ['aplicar', 'apply'], 5000);
-          }
 
           (async () => {
             const browser = await puppeteer.launch({
@@ -100,45 +45,35 @@ jobs:
 
             await page.goto('https://es.investing.com/economic-calendar/', { waitUntil: 'domcontentloaded', timeout: 60000 });
 
-            await clickByText(page, 'button, a', ['aceptar', 'accept all', 'aceptar todo', 'consentir'], 4000);
+            // Si hay banner de cookies
+            await page.evaluate(() => {
+              const btn = [...document.querySelectorAll("button, a")].find(b =>
+                /aceptar|accept/i.test(b.innerText)
+              );
+              if (btn) btn.click();
+            });
 
-            await selectThisWeek(page);
-            await sleep(600);
-
-            const openedFilters = await openFilters(page);
-            if (openedFilters) {
-              await sleep(400);
-              await setImportance(page);
-              await applyFilters(page);
-              await sleep(1200);
-            }
-
-            await page.waitForSelector('#economicCalendarData, table.genTbl', { timeout: 20000 }).catch(() => {});
-            await sleep(500);
+            await sleep(2000);
 
             const tableHandle =
               (await page.$('#economicCalendarData')) ||
               (await page.$('table.genTbl'));
 
             if (!tableHandle) {
-              console.error('No encontré la tabla del calendario');
-              await browser.close();
-              process.exit(2);
+              console.error('⚠️ No encontré la tabla, capturo toda la página como fallback');
+              await page.screenshot({ path: 'calendar.png', fullPage: true });
+            } else {
+              await tableHandle.screenshot({ path: 'calendar.png' });
             }
 
-            await page.evaluate(() => window.scrollTo(0, 0));
-            await sleep(400);
-
-            await tableHandle.screenshot({ path: 'calendar.png' });
-            console.log('CAPTURA OK: calendar.png');
-
+            console.log('✅ Captura generada: calendar.png');
             await browser.close();
           })().catch(err => { console.error(err); process.exit(1); });
           EOF
 
       - name: Run grabber
         run: node grab.js
-     
+
       - name: Send to Telegram (photo)
         env:
           BOT_TOKEN: ${{ secrets.INVESTX_TOKEN }}
@@ -147,6 +82,9 @@ jobs:
           ls -lh
           curl -v -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendPhoto" \
             -F chat_id="${CHAT_ID}" \
-            -F photo=@"./calendar.png" \
+            -F photo="@calendar.png" \
             -F caption="🗓️ Calendario Económico filtrado (⭐2 y ⭐3, semana actual)"
 
+      - name: Post Setup Node
+        if: always()
+        run: echo "Job terminado"
