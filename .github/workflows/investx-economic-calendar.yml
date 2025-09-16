@@ -91,79 +91,48 @@ jobs:
           if [ ! -s rows.json ]; then echo "[]" > rows.json; fi
           echo "Fallback rows count: $(jq 'length' rows.json)"
 
-             # ----- 4) Filtrar y formatear usando epoch en <td class="time" data-value> -----
+                 # ----- 4) Filtrar USA + 2-3 estrellas y formatear (soporta YYYY/MM/DD HH:MM:SS) -----
       - name: Filter & format events
         run: |
           set -euo pipefail
 
-          # rows.json viene del paso de fallback (45 filas). Si no existe, intenta regenerarlo.
           if [ ! -s rows.json ]; then
-            echo "rows.json no existe o está vacío; intento re-extraer desde cal.html..." >&2
-            if [ -s cal.html ]; then
-              pup 'tr[id^="eventRowId_"] json{}' < cal.html > rows.json || echo "[]" > rows.json
-            else
-              echo "[]" > rows.json
-            fi
+            echo "rows.json no existe; se crea vacío"
+            echo "[]" > rows.json
           fi
 
-          # Parseo robusto:
-          # - epoch desde td.time[data-value] o su <span> hijo
-          # - importancia desde atributo o contando <i> en 'sentiment'
-          # - título desde celda 'event'
           TZ=Europe/Madrid jq -c '
-            [ .[] |
-              {
-                country: .attrs["data-country"],
-                imp_attr: .attrs["data-importance"],
-                sent_cnt: (([ .children[]? | select(.tag=="td" and (.attrs.class//""|test("sentiment"))) ][0]?.children // []
-                           | map(select(.tag=="i")) | length) // 0),
-                time_td:  ( [ .children[]? | select(.tag=="td" and (.attrs.class//""|test("time"))) ][0] ),
-                event_td: ( [ .children[]? | select(.tag=="td" and (.attrs.class//""|test("event"))) ][0] )
-              }
-              |
-              .epoch_raw = (
-                .time_td.attrs["data-value"] //
-                ( [ .time_td.children[]? | select(.attrs?["data-value"]) ][0]?.attrs["data-value"] ) //
-                null
-              )
-              |
-              .epoch = (
-                if (.epoch_raw|type)=="string" then (.epoch_raw|tonumber?) else .epoch_raw end
-              )
-              |
-              .epoch = (
-                if .epoch==null then null
-                elif .epoch > 1000000000000 then ((.epoch/1000)|floor)  # ms -> s
-                else .epoch end
-              )
-              |
-              .title = (
-                (.event_td // {}) as $td
-                | ( ($td.children[]? | select(.tag=="a") | .attrs.title // .text) // $td.text // "" )
-                | gsub("\\s+";" ") | sub("^\\s+";"") | sub("\\s+$";"")
-              )
-              |
-              .impn = ((.imp_attr|tonumber?) // .sent_cnt)
-              |
-              select(.epoch != null and .title != "")
-              |
-              {
-                date: (.epoch | strflocaltime("%Y-%m-%d")),
-                time: (.epoch | strflocaltime("%H:%M")),
-                title: .title,
-                country: .country,
-                impn: .impn
-              }
+            [ .[] 
+              | select(.attrs["data-country"] == "5")                # Solo USA
+              | select(.attrs["data-importance"] == "2" or .attrs["data-importance"] == "3")  # Solo 2 o 3 estrellas
+              | {
+                  epoch: (
+                    if .attrs["data-event-datetime"] then
+                      # Convierte "2025/09/16 14:30:00" a timestamp
+                      (.attrs["data-event-datetime"] 
+                        | strptime("%Y/%m/%d %H:%M:%S") 
+                        | mktime)
+                    else null end
+                  ),
+                  imp: (if .attrs["data-importance"]=="2" then "2⭐️" else "3⭐️" end),
+                  title: (
+                    ( [ .children[] | select(.tag=="td" and (.attrs.class//""|test("event"))) ][0] ) as $td
+                    | ( ($td.children[]? | select(.tag=="a") | .attrs.title // .text) // $td.text // "" )
+                    | gsub("\\s+";" ") | sub("^\\s+";"") | sub("\\s+$";"")
+                  )
+                }
+              | select(.epoch != null and .title != "")
+              | {
+                  date: (.epoch | strflocaltime("%Y-%m-%d")),
+                  time: (.epoch | strflocaltime("%H:%M")),
+                  title: .title,
+                  imp: .imp
+                }
             ]
-            # USA (5) + importancia 2 o 3
-            | [ .[] | select(.country=="5" and (.impn==2 or .impn==3))
-                | {date, time, title, imp: (if .impn==2 then "2⭐️" else "3⭐️" end)}
-              ]
-            | sort_by(.date,.time)
+            | sort_by(.date, .time)
           ' rows.json > events.json || echo "[]" > events.json
 
           echo "Final events count: $(jq 'length' events.json)"
-          echo "Sample:"
           jq '.[0:8]' events.json || true
 
       # ----- 5) Construcción y envío del mensaje (sin cambios salvo conteo) -----
