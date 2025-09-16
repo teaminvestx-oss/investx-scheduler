@@ -149,28 +149,62 @@ jobs:
           ls -lh
           test -s calendar.png
 
-      - name: Send to Telegram (Python)
+      - name: Install Pillow (Python imaging)
+        run: pip3 install pillow requests
+
+      - name: Send to Telegram (Python, con conversión y fallback)
         env:
           BOT_TOKEN: ${{ secrets.INVESTX_TOKEN }}
           CHAT_ID: ${{ secrets.CHAT_ID }}
         run: |
           python3 - <<'PY'
-          import os, requests, sys
+          import os, io, sys, requests
+          from PIL import Image
+
           bot = os.environ['BOT_TOKEN']
           chat = os.environ['CHAT_ID']
-          photo_path = "calendar.png"
-          if not os.path.exists(photo_path) or os.path.getsize(photo_path) == 0:
-            print("calendar.png no existe o está vacío", file=sys.stderr)
-            sys.exit(1)
-          url = f"https://api.telegram.org/bot{bot}/sendPhoto"
+
+          # 1) Abrir PNG y convertir a JPEG (RGB) limitando lado largo
+          src = "calendar.png"
+          if not os.path.exists(src) or os.path.getsize(src)==0:
+            print("calendar.png no existe o está vacío", file=sys.stderr); sys.exit(1)
+
+          im = Image.open(src).convert("RGB")
+          w, h = im.size
+          MAX_SIDE = 4096  # seguro para Telegram
+          scale = min(1.0, MAX_SIDE / max(w, h))
+          if scale < 1.0:
+            im = im.resize((int(w*scale), int(h*scale)), Image.LANCZOS)
+
+          buf = io.BytesIO()
+          im.save(buf, format="JPEG", quality=85, optimize=True, progressive=True)
+          buf.seek(0)
+
           caption = "🗓️ Calendario Económico (USA, ⭐⭐ y ⭐⭐⭐) — Semana actual · TZ Europe/Madrid · Fuente: Investing"
-          with open(photo_path, "rb") as f:
-            files = {"photo": ("calendar.png", f, "image/png")}
-            data = {"chat_id": chat, "caption": caption, "parse_mode": "HTML"}
+
+          def send_photo():
+            url = f"https://api.telegram.org/bot{bot}/sendPhoto"
+            files = {"photo": ("calendar.jpg", buf, "image/jpeg")}
+            data  = {"chat_id": chat, "caption": caption, "parse_mode": "HTML"}
             r = requests.post(url, data=data, files=files, timeout=60)
-            print(r.status_code, r.text)
+            print("sendPhoto:", r.status_code, r.text[:200])
+            if r.ok:
+              return True
+            return False
+
+          def send_document():
+            url = f"https://api.telegram.org/bot{bot}/sendDocument"
+            buf.seek(0)
+            files = {"document": ("calendar.jpg", buf, "image/jpeg")}
+            data  = {"chat_id": chat, "caption": caption, "parse_mode": "HTML"}
+            r = requests.post(url, data=data, files=files, timeout=60)
+            print("sendDocument:", r.status_code, r.text[:200])
             r.raise_for_status()
+
+          if not send_photo():
+            send_document()
           PY
+
 
       - name: Done
         run: echo "✅ Flujo completado"
