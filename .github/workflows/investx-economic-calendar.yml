@@ -43,11 +43,98 @@ jobs:
           npm init -y
           npm i puppeteer@22
 
-      # ----- 3) Script: abrir Investing, aplicar filtros y capturar tabla -----
+      # ----- 3) Script: abrir Investing, (intentar) aplicar filtros y capturar tabla -----
       - name: Build grab script
         run: |
           cat > grab.js <<'EOF'
           const puppeteer = require('puppeteer');
+
+          // Helpers
+          const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+          // Click por texto (XPath), robusto español/inglés
+          async function clickByText(page, tag, texts, timeout = 8000) {
+            const start = Date.now();
+            while (Date.now() - start < timeout) {
+              for (const t of texts) {
+                const [el] = await page.$x(`//${tag}[contains(normalize-space(.), "${t}")]`);
+                if (el) { await el.click(); return true; }
+              }
+              await sleep(300);
+            }
+            return false;
+          }
+
+          // Selecciona pestaña Esta semana (ES/EN)
+          async function selectThisWeek(page) {
+            // intentos por data-test
+            try {
+              const weekSel = await page.$('a[data-test="calendar-thisWeek"]');
+              if (weekSel) { await weekSel.click(); return true; }
+            } catch {}
+            // fallback por texto
+            return await clickByText(page, 'a', ['Esta semana', 'This week'], 6000);
+          }
+
+          // Abre panel de filtros (si existe)
+          async function openFilters(page) {
+            // algunos sitios usan <button>, otros <a>
+            const okBtn =
+              await clickByText(page, 'button', ['Filtros', 'Filter'], 6000) ||
+              await clickByText(page, 'a', ['Filtros', 'Filter'], 6000);
+            return okBtn;
+          }
+
+          // Marca importancia 2 y 3 si el panel está abierto
+          async function setImportance(page) {
+            try {
+              // desmarcar todo si están marcados
+              const allCbs = await page.$$('[data-test^="importance-"] input[type="checkbox"]');
+              if (allCbs.length) {
+                for (const cb of allCbs) {
+                  const checked = await (await cb.getProperty('checked')).jsonValue();
+                  if (checked) await cb.click();
+                }
+                // marcar 2 y 3
+                const imp2 = await page.$('[data-test="importance-2"] input[type="checkbox"]');
+                const imp3 = await page.$('[data-test="importance-3"] input[type="checkbox"]');
+                if (imp2) await imp2.click();
+                if (imp3) await imp3.click();
+                return true;
+              }
+            } catch {}
+            return false;
+          }
+
+          // Selecciona país Estados Unidos si hay buscador de países
+          async function setCountryUSA(page) {
+            try {
+              const clearBtn = await page.$('button[data-test="clear-countries"]');
+              if (clearBtn) await clearBtn.click();
+            } catch {}
+            try {
+              const input = await page.$('input[data-test="country-search"]');
+              if (!input) return false;
+              await input.click({ clickCount: 3 });
+              await input.type('Estados Unidos', { delay: 20 });
+              await sleep(300);
+              // primer resultado que contenga Estados Unidos/United States
+              const [opt] = await page.$x(`//li[contains(@role,"option")]//*[contains(., "Estados Unidos") or contains(., "United States")]/ancestor::li`);
+              if (opt) { await opt.click(); return true; }
+            } catch {}
+            return false;
+          }
+
+          // Aplica filtros (botón aplicar)
+          async function applyFilters(page) {
+            // por data-test
+            try {
+              const apply = await page.$('button[data-test="apply-filters"]');
+              if (apply) { await apply.click(); return true; }
+            } catch {}
+            // por texto
+            return await clickByText(page, 'button', ['Aplicar', 'Apply'], 5000);
+          }
 
           (async () => {
             const browser = await puppeteer.launch({
@@ -56,91 +143,55 @@ jobs:
             });
             const page = await browser.newPage();
             await page.setUserAgent('Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36');
-            await page.setViewport({ width: 1366, height: 2000, deviceScaleFactor: 2 });
+            await page.setViewport({ width: 1440, height: 2200, deviceScaleFactor: 2 });
 
-            const url = 'https://es.investing.com/economic-calendar/';
-            await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
+            // 1) Ir a Investing
+            await page.goto('https://es.investing.com/economic-calendar/', { waitUntil: 'domcontentloaded', timeout: 60000 });
 
-            // 1) Aceptar cookies si aparece
+            // 2) Aceptar cookies si salen
             try {
-              await page.waitForSelector('button:has-text("Aceptar")', { timeout: 6000 });
-              await page.click('button:has-text("Aceptar")');
-            } catch (_) {}
+              // botones típicos de consentimiento
+              await clickByText(page, 'button', ['Aceptar', 'Accept All', 'Aceptar todo', 'Consentir'], 4000);
+            } catch {}
 
-            // 2) Pestaña "Esta semana"
-            try {
-              await page.waitForSelector('a[data-test="calendar-thisWeek"]', { timeout: 8000 });
-              await page.click('a[data-test="calendar-thisWeek"]');
-            } catch (_) {}
+            // 3) Seleccionar "Esta semana" (si existe)
+            await selectThisWeek(page);
+            await sleep(800);
 
-            // 3) Abrir filtros
-            try {
-              await page.waitForSelector('a[data-test="filterStateButton"]', { timeout: 10000 });
-              await page.click('a[data-test="filterStateButton"]');
-              await page.waitForSelector('[data-test="calendar-filters"]', { timeout: 10000 });
-            } catch (e) {
-              console.error('No pude abrir filtros:', e.message);
+            // 4) Intentar abrir filtros y configurar (si no, continuamos sin filtrar y capturamos todo)
+            let filtersOpened = await openFilters(page);
+            if (filtersOpened) {
+              await sleep(500);
+              await setImportance(page);
+              await setCountryUSA(page);
+              await applyFilters(page);
+              await sleep(1200);
             }
 
-            // 4) Filtro país: sólo Estados Unidos
-            try {
-              // Limpiar selección
-              const clearSel = await page.$('button[data-test="clear-countries"]');
-              if (clearSel) await clearSel.click();
-            } catch (_) {}
-            try {
-              await page.type('input[data-test="country-search"]', 'Estados Unidos', { delay: 30 });
-              await page.waitForSelector('li[role="option"]', { timeout: 8000 });
-              // El primer resultado debería ser USA
-              const usa = (await page.$x("//li[contains(@role,'option')]//*[contains(., 'Estados Unidos')]/ancestor::li"))[0];
-              if (usa) await usa.click();
-            } catch (_) {}
-
-            // 5) Importancia: 2 y 3 estrellas
-            try {
-              // Desmarcar todas primero si procede
-              const allImp = await page.$$('[data-test^="importance-"] input[type="checkbox"]');
-              for (const cb of allImp) {
-                const checked = await (await cb.getProperty('checked')).jsonValue();
-                if (checked) await cb.click();
-              }
-              // Marcar 2 y 3
-              const imp2 = await page.$('[data-test="importance-2"] input[type="checkbox"]');
-              const imp3 = await page.$('[data-test="importance-3"] input[type="checkbox"]');
-              if (imp2) await imp2.click();
-              if (imp3) await imp3.click();
-            } catch (_) {}
-
-            // 6) Zona horaria: Madrid (si está disponible en selector)
-            try {
-              await page.select('select[name="timeZone"]', '55'); // 55 suele ser Madrid CET/CEST en Investing
-            } catch (_) {}
-
-            // 7) Aplicar filtros
-            try {
-              const applyBtn = await page.$('button[data-test="apply-filters"]') || await page.$('button:has-text("Aplicar")');
-              if (applyBtn) await applyBtn.click();
-            } catch (_) {}
-
-            // 8) Esperar a que renderice la tabla
+            // 5) Esperar tabla y capturar
+            //   - #economicCalendarData se ancla en muchos layouts
+            //   - fallback a cualquier tabla con clase genTbl dentro del calendario
             await page.waitForSelector('#economicCalendarData, table.genTbl', { timeout: 20000 });
+            await sleep(500);
 
-            // 9) Desplazar para que aparezca toda la tabla (altura grande)
-            await page.evaluate(() => window.scrollTo(0, 0));
-            await page.waitForTimeout(1000);
+            const table =
+              (await page.$('#economicCalendarData')) ||
+              (await page.$('table.genTbl'));
 
-            const table = await page.$('#economicCalendarData') || await page.$('table.genTbl');
             if (!table) {
               console.error('No encontré la tabla del calendario');
               await browser.close();
               process.exit(2);
             }
 
-            // 10) Captura del bloque (png)
+            // Asegura que está en viewport top (evita cabecera fija)
+            await page.evaluate(() => window.scrollTo(0, 0));
+            await sleep(400);
+
             await table.screenshot({ path: 'calendar.png' });
+            console.log('CAPTURA OK: calendar.png');
 
             await browser.close();
-            console.log('CAPTURA OK: calendar.png');
           })().catch(err => { console.error(err); process.exit(1); });
           EOF
 
@@ -154,7 +205,7 @@ jobs:
           BOT_TOKEN: ${{ secrets.INVESTX_TOKEN }}
           CHAT_ID: ${{ secrets.CHAT_ID }}
         run: |
-          CAPTION="📣 Desde <b>InvestX</b> — Calendario económico <b>EE.UU.</b> (2⭐️ y 3⭐️) — semana actual.\n<i>Fuente: Investing, TZ Europe/Madrid</i>"
+          CAPTION="📣 Desde <b>InvestX</b> — Calendario económico <b>EE.UU.</b> (2⭐️ y 3⭐️) — semana actual.\n<i>Fuente: Investing — TZ Europe/Madrid</i>"
           curl -sS "https://api.telegram.org/bot${BOT_TOKEN}/sendPhoto" \
             -F chat_id="${CHAT_ID}" \
             -F parse_mode="HTML" \
