@@ -2,7 +2,7 @@ name: InvestX Economic Calendar
 
 on:
   schedule:
-    - cron: "0 11 * * 1-5"   # Lunes-Viernes 13:00 Madrid (11:00 UTC)
+    - cron: "0 11 * * 1-5"   # L-V 13:00 Madrid (11:00 UTC)
   workflow_dispatch:
 
 jobs:
@@ -12,12 +12,12 @@ jobs:
       - name: Set up job
         run: echo "▶️ Iniciando flujo Econ Calendar"
 
-      - name: Install jq & pup
+      - name: Install jq & pup (para otros usos / compat)
         run: |
           sudo apt-get update
           sudo apt-get install -y jq curl unzip
           curl -sL https://github.com/ericchiang/pup/releases/download/v0.4.0/pup_v0.4.0_linux_amd64.zip -o pup.zip
-          unzip pup.zip
+          unzip -o pup.zip
           sudo mv pup /usr/local/bin/
 
       - name: Setup Node
@@ -28,11 +28,29 @@ jobs:
       - name: Install Puppeteer
         run: npm install puppeteer
 
-      - name: Build grab script
+      - name: Build grab script (con filtros USA + 2/3⭐ + Esta semana + TZ Madrid)
         run: |
           cat > grab.js <<'EOF'
           const puppeteer = require('puppeteer');
           const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+          // Helpers por texto (ES/EN) sin $x
+          async function clickByText(page, selector, texts, timeoutMs = 8000) {
+            const deadline = Date.now() + timeoutMs;
+            const wants = texts.map(t => t.toLowerCase());
+            while (Date.now() < deadline) {
+              const ok = await page.evaluate(({selector, wants}) => {
+                for (const el of document.querySelectorAll(selector)) {
+                  const txt = (el.innerText || el.textContent || '').toLowerCase().trim();
+                  if (wants.some(w => txt.includes(w))) { el.click(); return true; }
+                }
+                return false;
+              }, {selector, wants});
+              if (ok) return true;
+              await sleep(250);
+            }
+            return false;
+          }
 
           (async () => {
             const browser = await puppeteer.launch({
@@ -41,29 +59,81 @@ jobs:
             });
             const page = await browser.newPage();
             await page.setUserAgent('Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36');
-            await page.setViewport({ width: 1440, height: 2200, deviceScaleFactor: 2 });
+            await page.setViewport({ width: 1440, height: 2400, deviceScaleFactor: 2 });
 
+            // 1) Ir al calendario ES
             await page.goto('https://es.investing.com/economic-calendar/', { waitUntil: 'domcontentloaded', timeout: 60000 });
 
-            // Si hay banner de cookies
+            // 2) Aceptar cookies si aparece
             await page.evaluate(() => {
-              const btn = [...document.querySelectorAll("button, a")].find(b =>
-                /aceptar|accept/i.test(b.innerText)
+              const btn = [...document.querySelectorAll('button, a')].find(b =>
+                /aceptar|accept|consent/i.test((b.innerText||'').toLowerCase())
               );
-              if (btn) btn.click();
+              btn?.click();
             });
+            await sleep(800);
 
-            await sleep(2000);
+            // 3) Seleccionar "Esta semana"
+            await clickByText(page, 'a,button', ['esta semana', 'this week'], 8000);
+            await sleep(600);
 
-            const tableHandle =
-              (await page.$('#economicCalendarData')) ||
-              (await page.$('table.genTbl'));
+            // 4) Abrir filtros (si existen)
+            const opened = await clickByText(page, 'button,a', ['filtros', 'filter'], 8000);
+            if (opened) {
+              // 4a) Zona horaria: Madrid (valor 55 suele ser CET/CEST Europe/Madrid)
+              try {
+                await page.select('select[name="timeZone"]', '55');
+              } catch {}
 
-            if (!tableHandle) {
-              console.error('⚠️ No encontré la tabla, capturo toda la página como fallback');
-              await page.screenshot({ path: 'calendar.png', fullPage: true });
+              // 4b) Importancia: desmarcar todo, marcar 2 y 3
+              try {
+                await page.evaluate(() => {
+                  document.querySelectorAll('[data-test^="importance-"] input[type="checkbox"]')
+                    .forEach(cb => { if (cb.checked) cb.click(); });
+                  document.querySelector('[data-test="importance-2"] input[type="checkbox"]')?.click();
+                  document.querySelector('[data-test="importance-3"] input[type="checkbox"]')?.click();
+                });
+              } catch {}
+
+              // 4c) País: limpiar y seleccionar Estados Unidos
+              try {
+                document.querySelector('button[data-test="clear-countries"]')?.click();
+              } catch {}
+              try {
+                const hadInput = await page.$('input[data-test="country-search"]');
+                if (hadInput) {
+                  await page.click('input[data-test="country-search"]').catch(()=>{});
+                  await page.keyboard.down('Control'); await page.keyboard.press('A'); await page.keyboard.up('Control');
+                  await page.type('input[data-test="country-search"]', 'Estados Unidos', { delay: 15 });
+                  await sleep(600);
+                  // primera opción que contenga "Estados Unidos" o "United States"
+                  await page.evaluate(() => {
+                    const li = [...document.querySelectorAll('li[role="option"]')]
+                      .find(e => /estados unidos|united states/i.test((e.innerText||'')));
+                    li?.click();
+                  });
+                } else {
+                  // Fallback: si listan países como chips
+                  await clickByText(page, '*', ['estados unidos', 'united states'], 2000);
+                }
+              } catch {}
+
+              // 4d) Aplicar filtros
+              await clickByText(page, 'button,a', ['aplicar', 'apply'], 8000);
+              await sleep(1200);
+            }
+
+            // 5) Esperar y capturar la tabla (ajustada); si no existe, full page
+            await page.waitForSelector('#economicCalendarData, table.genTbl', { timeout: 20000 }).catch(()=>{});
+            const table = await page.$('#economicCalendarData') || await page.$('table.genTbl');
+
+            await page.evaluate(() => window.scrollTo(0, 0));
+            await sleep(300);
+
+            if (table) {
+              await table.screenshot({ path: 'calendar.png' });
             } else {
-              await tableHandle.screenshot({ path: 'calendar.png' });
+              await page.screenshot({ path: 'calendar.png', fullPage: true });
             }
 
             console.log('✅ Captura generada: calendar.png');
@@ -74,38 +144,33 @@ jobs:
       - name: Run grabber
         run: node grab.js
 
-      - name: Send to Telegram (robusto)
+      - name: Check screenshot exists
+        run: |
+          ls -lh
+          test -s calendar.png
+
+      - name: Send to Telegram (Python)
         env:
           BOT_TOKEN: ${{ secrets.INVESTX_TOKEN }}
           CHAT_ID: ${{ secrets.CHAT_ID }}
         run: |
-          set -euo pipefail
-          ls -lh
-          PHOTO="$(pwd)/calendar.png"
-          [ -s "$PHOTO" ] || { echo "No existe calendar.png"; exit 1; }
-          API="https://api.telegram.org/bot${BOT_TOKEN}"
-          CAPTION="🗓️ Calendario Económico (⭐2 y ⭐3) — semana actual. Fuente: Investing (TZ Europe/Madrid)"
+          python3 - <<'PY'
+          import os, requests, sys
+          bot = os.environ['BOT_TOKEN']
+          chat = os.environ['CHAT_ID']
+          photo_path = "calendar.png"
+          if not os.path.exists(photo_path) or os.path.getsize(photo_path) == 0:
+            print("calendar.png no existe o está vacío", file=sys.stderr)
+            sys.exit(1)
+          url = f"https://api.telegram.org/bot{bot}/sendPhoto"
+          caption = "🗓️ Calendario Económico (USA, ⭐⭐ y ⭐⭐⭐) — Semana actual · TZ Europe/Madrid · Fuente: Investing"
+          with open(photo_path, "rb") as f:
+            files = {"photo": ("calendar.png", f, "image/png")}
+            data = {"chat_id": chat, "caption": caption, "parse_mode": "HTML"}
+            r = requests.post(url, data=data, files=files, timeout=60)
+            print(r.status_code, r.text)
+            r.raise_for_status()
+          PY
 
-          echo "→ Intento 1: sendPhoto leyendo por STDIN"
-          if curl -v -sS "${API}/sendPhoto" \
-              --form "chat_id=${CHAT_ID}" \
-              --form "photo=@-;filename=calendar.png;type=image/png" \
-              --form-string "caption=${CAPTION}" \
-              < "$PHOTO"; then
-            echo "✅ Enviado con sendPhoto"
-            exit 0
-          fi
-
-          echo "→ Intento 2: sendDocument leyendo por STDIN"
-          if curl -v -sS "${API}/sendDocument" \
-              --form "chat_id=${CHAT_ID}" \
-              --form "document=@-;filename=calendar.png;type=image/png" \
-              --form-string "caption=${CAPTION}" \
-              < "$PHOTO"; then
-            echo "✅ Enviado con sendDocument"
-            exit 0
-          fi
-
-          echo "❌ No se pudo enviar a Telegram"
-          exit 1
-
+      - name: Done
+        run: echo "✅ Flujo completado"
