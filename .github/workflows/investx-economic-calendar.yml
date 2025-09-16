@@ -91,29 +91,21 @@ jobs:
           if [ ! -s rows.json ]; then echo "[]" > rows.json; fi
           echo "Fallback rows count: $(jq 'length' rows.json)"
 
-                 # ----- 4) Filtrar USA + 2-3 estrellas y formatear (soporta YYYY/MM/DD HH:MM:SS) -----
+               # ----- 4) Filtrar USA + 2-3 estrellas y formatear (sin strptime) -----
       - name: Filter & format events
         run: |
           set -euo pipefail
 
           if [ ! -s rows.json ]; then
-            echo "rows.json no existe; se crea vacío"
             echo "[]" > rows.json
           fi
 
-          TZ=Europe/Madrid jq -c '
+          jq -c '
             [ .[] 
-              | select(.attrs["data-country"] == "5")                # Solo USA
-              | select(.attrs["data-importance"] == "2" or .attrs["data-importance"] == "3")  # Solo 2 o 3 estrellas
+              | select(.attrs["data-country"] == "5")
+              | select(.attrs["data-importance"] == "2" or .attrs["data-importance"] == "3")
               | {
-                  epoch: (
-                    if .attrs["data-event-datetime"] then
-                      # Convierte "2025/09/16 14:30:00" a timestamp
-                      (.attrs["data-event-datetime"] 
-                        | strptime("%Y/%m/%d %H:%M:%S") 
-                        | mktime)
-                    else null end
-                  ),
+                  rawdt: .attrs["data-event-datetime"],
                   imp: (if .attrs["data-importance"]=="2" then "2⭐️" else "3⭐️" end),
                   title: (
                     ( [ .children[] | select(.tag=="td" and (.attrs.class//""|test("event"))) ][0] ) as $td
@@ -121,19 +113,20 @@ jobs:
                     | gsub("\\s+";" ") | sub("^\\s+";"") | sub("\\s+$";"")
                   )
                 }
-              | select(.epoch != null and .title != "")
+              | select(.rawdt != null and .title != "")
               | {
-                  date: (.epoch | strflocaltime("%Y-%m-%d")),
-                  time: (.epoch | strflocaltime("%H:%M")),
+                  date: (.rawdt | sub(" .*";"") | gsub("/";"-")),   # "2025/09/16" -> "2025-09-16"
+                  time: (.rawdt | capture(" (?<hh>\\d{2}):(?<mm>\\d{2})") | "\(.hh):\(.mm)"),
                   title: .title,
                   imp: .imp
                 }
             ]
             | sort_by(.date, .time)
-          ' rows.json > events.json || echo "[]" > events.json
+          ' rows.json > events.json
 
           echo "Final events count: $(jq 'length' events.json)"
           jq '.[0:8]' events.json || true
+
 
       # ----- 5) Construcción y envío del mensaje (sin cambios salvo conteo) -----
       - name: Build & Send (only if there are events)
