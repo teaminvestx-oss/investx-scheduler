@@ -31,8 +31,51 @@ jobs:
       - name: Build grab script
         run: |
           cat > grab.js <<'EOF'
-          // --- aquí va todo el código JS que te pasé antes ---
+          const puppeteer = require('puppeteer');
+          const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+          (async () => {
+            const browser = await puppeteer.launch({
+              headless: 'new',
+              args: ['--no-sandbox','--disable-setuid-sandbox']
+            });
+            const page = await browser.newPage();
+            await page.setViewport({ width: 1440, height: 2400, deviceScaleFactor: 2 });
+            await page.goto('https://es.investing.com/economic-calendar/', { waitUntil: 'domcontentloaded', timeout: 60000 });
+
+            // Aceptar cookies
+            await page.evaluate(() => {
+              const btn = [...document.querySelectorAll("button,a")].find(b =>
+                /aceptar|accept|consent/i.test((b.innerText||'').toLowerCase())
+              ); btn?.click();
+            });
+            await sleep(1000);
+
+            // Filtro duro sobre el DOM: solo USA y 2/3 estrellas
+            await page.waitForSelector('table', { timeout: 20000 }).catch(()=>{});
+            await page.evaluate(() => {
+              const keepCountry = 'USD';
+              for (const tr of document.querySelectorAll('tr')) {
+                const text = tr.innerText || '';
+                const hasUSA = text.includes('USD');
+                const stars = (tr.querySelectorAll('td.sentiment i')||[]).length;
+                if (!(hasUSA && stars >= 2)) tr.style.display = 'none';
+              }
+            });
+
+            // Screenshot del bloque tabla
+            const table = await page.$('#economicCalendarData') || await page.$('table');
+            if (table) {
+              await table.screenshot({ path: 'calendar.png' });
+            } else {
+              await page.screenshot({ path: 'calendar.png', fullPage: true });
+            }
+
+            console.log("✅ Captura generada");
+            await browser.close();
+          })().catch(err => { console.error(err); process.exit(1); });
           EOF
+
 
       - name: Run grabber
         run: node grab.js
