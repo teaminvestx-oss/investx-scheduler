@@ -30,27 +30,43 @@ jobs:
         run: npm install puppeteer
 
       # ---------- Script principal ----------
-      - name: Build grab script (USA estricto por data-* + 2/3⭐ y captura ajustada)
+          - name: Build grab script (carga + filtro híbrido USA + 2/3⭐)
         run: |
           cat > grab.js <<'EOF'
           const puppeteer = require('puppeteer');
           const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
           async function clickByText(page, selector, labels, timeoutMs = 8000) {
-            const deadline = Date.now() + timeoutMs;
+            const until = Date.now() + timeoutMs;
             const wants = labels.map(t => t.toLowerCase());
-            while (Date.now() < deadline) {
-              const ok = await page.evaluate(({selector, wants}) => {
+            while (Date.now() < until) {
+              const clicked = await page.evaluate(({selector, wants}) => {
                 for (const el of document.querySelectorAll(selector)) {
                   const txt = (el.innerText || el.textContent || '').toLowerCase().trim();
                   if (wants.some(w => txt.includes(w))) { el.click(); return true; }
                 }
                 return false;
               }, {selector, wants});
-              if (ok) return true;
+              if (clicked) return true;
               await sleep(250);
             }
             return false;
+          }
+
+          async function forceLoadRows(page) {
+            // Espera a que aparezcan filas y fuerza lazy loading con scrolls.
+            for (let i=0;i<20;i++) {
+              const rows = await page.$$eval('tr[id^="eventRowId_"], tr.js-event-item', els => els.length);
+              if (rows > 10) break;
+              await sleep(300);
+            }
+            // 2 scrolls suaves para disparar carga diferida
+            for (let s=0; s<2; s++) {
+              await page.evaluate(() => window.scrollBy(0, window.innerHeight*2));
+              await sleep(700);
+            }
+            await page.evaluate(() => window.scrollTo(0, 0));
+            await sleep(500);
           }
 
           (async () => {
@@ -62,10 +78,9 @@ jobs:
             await page.setUserAgent('Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36');
             await page.setViewport({ width: 1440, height: 2400, deviceScaleFactor: 2 });
 
-            // 1) Cargar calendario
             await page.goto('https://es.investing.com/economic-calendar/', { waitUntil: 'domcontentloaded', timeout: 60000 });
 
-            // 2) Cookies
+            // Cookies
             await page.evaluate(() => {
               const btn = [...document.querySelectorAll("button,a")].find(b =>
                 /aceptar|accept|consent/i.test((b.innerText||'').toLowerCase())
@@ -73,35 +88,58 @@ jobs:
             });
             await sleep(800);
 
-            // 3) Esta semana (si existe)
-            await clickByText(page, 'a,button', ['esta semana', 'this week'], 8000).catch(()=>{});
+            // Esta semana si existe
+            await clickByText(page, 'a,button', ['esta semana', 'this week'], 7000).catch(()=>{});
             await sleep(600);
 
-            // 4) Esperar filas de eventos
-            await page.waitForSelector('tr[id^="eventRowId_"], table.genTbl', { timeout: 25000 }).catch(()=>{});
+            // Esperar estructura base y forzar carga
+            await page.waitForSelector('table.genTbl, #economicCalendarData', { timeout: 25000 }).catch(()=>{});
+            await forceLoadRows(page);
 
-            // 5) FILTRO ESTRICTO: SOLO filas con data-country="5" y data-importance 2/3
+            // FILTRO HÍBRIDO: usar data-* si están; si no, inferir por bandera/moneda y estrellas.
             await page.evaluate(() => {
-              // limpiar estorbos
+              const isUSRow = (tr) => {
+                const c = tr.getAttribute('data-country') || tr.dataset?.country || '';
+                if (c === '5') return true; // Atributo fiable
+
+                // Inferencias:
+                const flagSpan = tr.querySelector('td.flagCur span');
+                const flagClass = (flagSpan?.className || '').toLowerCase();
+                const flagTitle = (flagSpan?.getAttribute('title') || '').toLowerCase();
+                if (/usa|united\s*states/.test(flagClass) || /estados unidos|united states/.test(flagTitle)) return true;
+
+                // columna divisa/moneda
+                const curCell = tr.querySelector('td.cur') || tr.querySelector('td:nth-child(2)');
+                const curTxt = (curCell?.innerText || '').trim().toUpperCase();
+                if (curTxt === 'USD') return true;
+
+                return false;
+              };
+
+              const has2or3Stars = (tr) => {
+                const imp = tr.getAttribute('data-importance') || tr.dataset?.importance || '';
+                if (imp === '2' || imp === '3') return true; // Atributo fiable
+                // Contar estrellas renderizadas (i) dentro de td.sentiment
+                const senti = tr.querySelector('td.sentiment');
+                if (!senti) return false;
+                // Algunas versiones dibujan vacías y llenas. Contamos cualquier <i> como punto.
+                const count = senti.querySelectorAll('i').length;
+                return count >= 2;
+              };
+
+              // Limpiar estorbos
               for (const sel of [
                 '#topBarAndAds', '.midHeader', '#banner', '.stickyFooter', '.js-consent-banner',
                 'iframe', '.adsbygoogle', '.advertisement'
               ]) document.querySelectorAll(sel).forEach(e => e.remove());
 
-              const isVisibleEvent = (el) =>
-                el.matches('tr[id^="eventRowId_"], tr.js-event-item') && el.style.display !== 'none';
-
-              // 5a) Ocultar cualquier evento que no cumpla
+              // Ocultar lo que no cumpla (USA && 2/3⭐)
               const rows = document.querySelectorAll('tr[id^="eventRowId_"], tr.js-event-item');
-              rows.forEach(tr => {
-                const country = tr.getAttribute('data-country') || tr.dataset?.country || '';
-                const imp     = tr.getAttribute('data-importance') || tr.dataset?.importance || '';
-                const keep = (country === '5') && (imp === '2' || imp === '3');
-                if (!keep) tr.style.display = 'none';
-              });
+              rows.forEach(tr => { if (!(isUSRow(tr) && has2or3Stars(tr))) tr.style.display = 'none'; });
 
-              // 5b) Mantener cabeceras de día solo si debajo queda algún evento visible
+              // Cabeceras de día solo si queda algo debajo
               const dayHeaders = Array.from(document.querySelectorAll('tr.theDay, tr.newDay, tr.dayHeader'));
+              const isVisibleEvent = (el) => el.matches('tr[id^="eventRowId_"], tr.js-event-item') && el.style.display !== 'none';
               for (const hdr of dayHeaders) {
                 let has = false;
                 for (let sib = hdr.nextElementSibling; sib; sib = sib.nextElementSibling) {
@@ -112,10 +150,10 @@ jobs:
               }
             });
 
-            // 6) Captura AJUSTADA de la tabla (cabeceras incluidas)
+            // Captura ajustada del contenedor de tabla
             const table = await page.$('#economicCalendarData') || await page.$('table.genTbl');
             await page.evaluate(() => window.scrollTo(0, 0));
-            await sleep(300);
+            await sleep(400);
 
             if (table) {
               await table.screenshot({ path: 'calendar.png' });
