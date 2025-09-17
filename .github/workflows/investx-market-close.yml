@@ -19,7 +19,7 @@ jobs:
             jq curl unzip python3 python3-pip \
             libatk1.0-0 libatk-bridge2.0-0 libnss3 libx11-6 libx11-xcb1 \
             libxcomposite1 libxdamage1 libxext6 libxfixes3 libxrandr2 \
-            libgbm1 libasound2 fonts-liberation
+            libgbm1 libasound2 fonts-liberation ca-certificates
 
       # ---------- Node / Puppeteer ----------
       - name: Setup Node
@@ -60,7 +60,7 @@ jobs:
             });
             const page = await browser.newPage();
             await page.setViewport({ width: 1600, height: 1200, deviceScaleFactor: 2 });
-            await page.setUserAgent('Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36');
+            await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36');
 
             const url = 'https://finviz.com/map.ashx?t=sec&st=d1';
             let ready=false, tries=0;
@@ -108,23 +108,41 @@ jobs:
           const puppeteer = require('puppeteer');
           const fs = require('fs');
 
-          async function grabChange(page, ticker){
-            const url=`https://finviz.com/quote.ashx?t=${ticker}`;
-            await page.goto(url, {waitUntil:'domcontentloaded', timeout:60000}).catch(()=>{});
-            const text = await page.evaluate(() => document.body.innerText).catch(()=> '');
-            const m = text.match(/-?\d+(?:\.\d+)?%/);
-            return m ? parseFloat(m[0].replace('%','')) : null;
+          const UA='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36';
+
+          const sleep = (ms)=>new Promise(r=>setTimeout(r,ms));
+          async function retry(n, fn){
+            let last; for(let i=0;i<n;i++){ try{ return await fn(); } catch(e){ last=e; await sleep(700);} }
+            throw last||new Error('retry failed');
+          }
+
+          // ---------- Índices robustos (Stooq) ----------
+          async function stooqPct(symbol){
+            const urlDaily=`https://stooq.com/q/d/l/?s=${symbol}&i=d`;
+            const res = await fetch(urlDaily);
+            if(!res.ok) throw new Error('stooq fail');
+            const txt = await res.text();
+            const lines = txt.trim().split('\n');
+            if(lines.length<3) throw new Error('not enough rows');
+            const last2 = lines.slice(-2).map(l=>parseFloat(l.split(',')[4]));
+            const [prev, close]=last2;
+            if(!prev || !close) throw new Error('parse');
+            return ((close-prev)/prev)*100;
           }
 
           async function grabSectors(page){
             const url='https://finviz.com/groups.ashx?g=sector&v=210';
-            await page.goto(url, {waitUntil:'domcontentloaded', timeout:60000}).catch(()=>{});
+            await page.goto(url, {waitUntil:'domcontentloaded', timeout:60000});
+            await page.waitForSelector('table.table-light', {timeout:15000});
             return await page.evaluate(() => {
               const rows = [...document.querySelectorAll('table.table-light tr')].slice(1);
               const data = rows.map(r=>{
                 const tds=[...r.querySelectorAll('td')].map(td=>td.innerText.trim());
-                return {name: tds[1], pct: parseFloat((tds[2]||'0').replace('%',''))};
-              }).filter(x=>x.name);
+                // Esperado: Rank | Name | Perf Today | Perf W | ...
+                const name = tds[1];
+                const pct = parseFloat((tds[2]||'0').replace('%','').replace(',','.'));
+                return name ? {name, pct: isNaN(pct)?0:pct} : null;
+              }).filter(Boolean);
               const top = [...data].sort((a,b)=>b.pct-a.pct).slice(0,2);
               const worst = [...data].sort((a,b)=>a.pct-b.pct).slice(0,2);
               return {top, worst};
@@ -134,53 +152,65 @@ jobs:
           async function grabMovers(page, order){
             const o = order==='desc' ? '-change' : 'change';
             const url = `https://finviz.com/screener.ashx?v=111&f=idx_sp500&o=${o}`;
-            await page.goto(url, {waitUntil:'domcontentloaded', timeout:60000}).catch(()=>{});
+            await page.goto(url, {waitUntil:'domcontentloaded', timeout:60000});
+            await page.waitForSelector('table.table-light', {timeout:15000});
             return await page.evaluate(() => {
               const rows = [...document.querySelectorAll('table.table-light tr')].slice(1,6);
-              return rows.map(r=>{
+              const out = [];
+              for(const r of rows){
                 const tds=[...r.querySelectorAll('td')].map(td=>td.innerText.trim());
-                return {t: tds[1], ch: tds[8]};
-              }).slice(0,3);
+                const ticker = tds[1] || '';
+                // en v=111, cambio porcentual suele ir en la col "Change" cerca del final
+                const ch = (tds.find(x=>x.endsWith('%'))||'').replace(/\s+/g,'');
+                if(ticker) out.push({t:ticker, ch});
+                if(out.length===3) break;
+              }
+              return out;
             });
           }
 
-          async function grabNews(page){
+          async function grabHeadline(page){
             const url = 'https://finviz.com/news.ashx';
-            await page.goto(url, {waitUntil:'domcontentloaded', timeout:60000}).catch(()=>{});
+            await page.goto(url, {waitUntil:'domcontentloaded', timeout:60000});
+            const ok = await page.$('.news-item-row');
+            if(!ok) return '';
             return await page.evaluate(() => {
               const row = document.querySelector('.news-item-row');
-              if(!row) return null;
-              const a = row.querySelector('a');
-              const src = row.querySelector('.news-source')?.innerText || '';
-              return a ? `${a.innerText} — ${src}` : null;
+              const a = row?.querySelector('a');
+              const src = row?.querySelector('.news-source')?.innerText || '';
+              return a ? `${a.innerText} — ${src}` : '';
             });
           }
 
           (async () => {
             const browser = await puppeteer.launch({ headless:'new', args:['--no-sandbox','--disable-setuid-sandbox'] });
             const page = await browser.newPage();
+            await page.setUserAgent(UA);
 
+            // Índices (SPY/QQQ/DIA aproximan al índice; usamos Stooq por fiabilidad)
             const [sp,nq,dj] = await Promise.all([
-              grabChange(page,'SPY'),
-              grabChange(page,'QQQ'),
-              grabChange(page,'DIA')
-            ]);
-            const sectors = await grabSectors(page).catch(()=>null);
-            const winners = await grabMovers(page,'desc').catch(()=>[]);
-            const losers  = await grabMovers(page,'asc').catch(()=>[]);
-            const headline = await grabNews(page).catch(()=>null);
+              retry(3, ()=>stooqPct('spy.us')),
+              retry(3, ()=>stooqPct('qqq.us')),
+              retry(3, ()=>stooqPct('dia.us'))
+            ]).catch(()=>[null,null,null]);
+
+            let sectors=null, winners=[], losers=[], headline='';
+            try { sectors = await retry(3, ()=>grabSectors(page)); } catch(e) { sectors=null; }
+            try { winners = await retry(3, ()=>grabMovers(page,'desc')); } catch(e) { winners=[]; }
+            try { losers  = await retry(3, ()=>grabMovers(page,'asc'));  } catch(e) { losers=[]; }
+            try { headline = await retry(2, ()=>grabHeadline(page));     } catch(e) { headline=''; }
 
             await browser.close();
 
+            // Opinión simple
             let opinion = 'Sesión mixta.';
-            if([sp,nq,dj].every(x=>typeof x==='number' && x<0)) opinion='Sesgo risk-off, todos en rojo.';
-            else if(sectors?.worst?.some(s=>/tech/i.test(s.name))) opinion='Debilidad en tecnología, rotación defensiva.';
-            else if((sp??0)>0 && (nq??0)>0) opinion='Impulso alcista liderado por growth.';
+            if([sp,nq,dj].every(x=>typeof x==='number' && x<0)) opinion='Sesgo risk-off, índices en rojo.';
+            else if(sectors?.worst?.some(s=>/tech/i.test(s.name))) opinion='Debilidad en tecnología, cierta rotación defensiva.';
+            else if((sp??0)>0 && (nq??0)>0) opinion='Empuje alcista liderado por growth.';
 
             const d = new Date().toLocaleDateString('es-ES',{timeZone:'Europe/Madrid'});
-
-            const fmt = v => (typeof v === 'number') ? v.toFixed(2) + '%' : 'N/A';
-            const secStr = arr => (arr||[]).map(s=>`${s.name} ${s.pct}%`).join(', ') || '—';
+            const fmt = v => (typeof v === 'number') ? `${v.toFixed(2)}%` : '—';
+            const secStr = arr => (arr||[]).map(s=>`${s.name} ${s.pct.toFixed(2)}%`).join(', ') || '—';
             const movStr = arr => (arr||[]).map(x=>`${x.t} ${x.ch}`).join(', ') || '—';
 
             const payload = {
@@ -200,7 +230,7 @@ jobs:
       - name: Run summary (creates summary.json)
         run: node summary.js
 
-      # ---------- Construir caption fuera de JS (evita errores YAML) ----------
+      # ---------- Construir caption fuera de JS (HTML seguro) ----------
       - name: Build caption.txt
         run: |
           DATE=$(jq -r '.date' summary.json)
@@ -214,17 +244,19 @@ jobs:
           OPINION=$(jq -r '.opinion' summary.json)
           HEADLINE=$(jq -r '.headline' summary.json)
 
+          esc() { sed 's/&/&amp;/g; s/</\&lt;/g; s/>/\&gt;/g'; }
+
           {
-            echo "📊 **Cierre de mercado — ${DATE}**"
-            echo "• S&P500: ${SP} | Nasdaq: ${NQ} | Dow: ${DJ}"
-            echo "• Sectores destacados: ${SEC_BEST}"
-            echo "• Peores sectores: ${SEC_WORST}"
-            echo "• Top ganadores (S&P500): ${WINNERS}"
-            echo "• Top perdedores (S&P500): ${LOSERS}"
-            echo
-            echo "💡 *Opinión*: ${OPINION}"
+            echo "<b>📊 Cierre de mercado — ${DATE}</b>"
+            echo "• S&amp;P500: ${SP} | Nasdaq: ${NQ} | Dow: ${DJ}"
+            echo "• <b>Sectores destacados:</b> $(printf '%s' "${SEC_BEST}" | esc)"
+            echo "• <b>Peores sectores:</b> $(printf '%s' "${SEC_WORST}" | esc)"
+            echo "• <b>Top ganadores (S&amp;P500):</b> $(printf '%s' "${WINNERS}" | esc)"
+            echo "• <b>Top perdedores (S&amp;P500):</b> $(printf '%s' "${LOSERS}" | esc)"
+            echo ""
+            echo "💡 <i>Opinión:</i> $(printf '%s' "${OPINION}" | esc)"
             if [ -n "${HEADLINE}" ] && [ "${HEADLINE}" != "null" ]; then
-              echo "🗞️ Noticia: ${HEADLINE}"
+              echo "🗞️ $(printf '%s' "${HEADLINE}" | esc)"
             fi
           } > caption.txt
 
@@ -238,11 +270,11 @@ jobs:
           import os, requests
           bot = os.environ['BOT_TOKEN']
           chat = os.environ['CHAT_ID']
-          with open("caption.txt","r") as f: caption=f.read()
+          with open("caption.txt","r", encoding="utf-8") as f: caption=f.read()
           with open("heatmap.png","rb") as f:
               r = requests.post(
                   f"https://api.telegram.org/bot{bot}/sendPhoto",
-                  data={"chat_id": chat, "caption": caption, "parse_mode":"Markdown"},
+                  data={"chat_id": chat, "caption": caption, "parse_mode":"HTML"},
                   files={"photo": ("heatmap.png", f, "image/png")},
                   timeout=120
               )
