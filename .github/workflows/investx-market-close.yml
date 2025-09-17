@@ -229,8 +229,8 @@ jobs:
 
             const newsStr = headline ? `🗞️ Noticia: ${headline}` : '';
 
-            const caption =
-`📊 **Cierre de mercado — ${d}**
+            const caption = `
+📊 **Cierre de mercado — ${d}**
 ${idxLine}
 • Sectores destacados: ${secBest}
 • Peores sectores: ${secWorst}
@@ -238,11 +238,11 @@ ${idxLine}
 • Top perdedores (S&P500): ${losStr}
 
 💡 *Opinión*: ${opinion}
-${newsStr}`;
+${newsStr}
+`;
 
-            require('fs').writeFileSync('caption.txt', caption, 'utf8');
-          })().catch(e=>{console.error(e); process.exit(0);});
-          EOF
+            require('fs').writeFileSync('caption.txt', caption.trim(), 'utf8');
+
 
       - name: Run summary
         run: node summary.js
@@ -254,8 +254,18 @@ ${newsStr}`;
           CHAT_ID: ${{ secrets.CHAT_ID }}
         run: |
           CAPTION="$(cat caption.txt)"
-          curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendPhoto" \
-            -F chat_id="${CHAT_ID}" \
-            -F caption="$CAPTION" \
-            -F parse_mode="Markdown" \
-            -F photo="@heatmap.png"
+          python3 - <<'PY'
+          import os, requests
+          bot = os.environ['BOT_TOKEN']
+          chat = os.environ['CHAT_ID']
+          with open("caption.txt","r") as f: caption=f.read()
+          with open("heatmap.png","rb") as f:
+              r = requests.post(
+                  f"https://api.telegram.org/bot{bot}/sendPhoto",
+                  data={"chat_id": chat, "caption": caption, "parse_mode":"Markdown"},
+                  files={"photo": ("heatmap.png", f, "image/png")},
+                  timeout=120
+              )
+              print(r.status_code, r.text)
+              r.raise_for_status()
+          PY
