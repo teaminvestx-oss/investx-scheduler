@@ -1,0 +1,280 @@
+name: InvestX Economic Calendar
+
+on:
+  schedule:
+    - cron: "0 11 * * 1"   # Lunes 13:00 Madrid (11:00 UTC) — semana completa
+    - cron: "0 11 * * 2-5" # Mar–Vie 13:00 Madrid (11:00 UTC) — solo hoy
+  workflow_dispatch:
+
+jobs:
+  econ-calendar:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Set up job
+        run: |
+          set -e
+          sudo apt-get update -y
+          sudo apt-get install -y \
+            jq curl unzip python3 python3-pip \
+            libatk1.0-0 libatk-bridge2.0-0 libnss3 libx11-6 libx11-xcb1 \
+            libxcomposite1 libxdamage1 libxext6 libxfixes3 libxrandr2 \
+            libgbm1 libasound2 fonts-liberation
+
+      # ---------- Dependencias del sistema ----------
+      - name: Set up job
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y \
+            jq curl unzip python3 python3-pip \
+            libatk1.0-0 libatk-bridge2.0-0 libnss3 libx11-6 libx11-xcb1 \
+            libxcomposite1 libxdamage1 libxext6 libxfixes3 libxrandr2 \
+            libgbm1 libasound2 fonts-liberation
+
+      - name: Install pup & Python deps
+        run: |
+          curl -sL https://github.com/ericchiang/pup/releases/download/v0.4.0/pup_v0.4.0_linux_amd64.zip -o pup.zip
+          sudo unzip -o pup.zip -d /usr/local/bin/
+          pip3 install --upgrade pip requests
+
+      # ---------- Node/Puppeteer ----------
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install Puppeteer
+        run: npm install puppeteer
+
+      # ---------- Script principal ----------
+      - name: Build grab script (aplica Filtros UI + fallback DOM)
+        run: |
+          cat > grab.js <<'EOF'
+          const puppeteer = require('puppeteer');
+          const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+          const log = (...a)=>console.log('[grab]', ...a);
+
+          async function clickByText(page, selector, labels, timeoutMs = 8000) {
+            const until = Date.now() + timeoutMs;
+            const wants = labels.map(t => t.toLowerCase());
+            while (Date.now() < until) {
+              const clicked = await page.evaluate(({selector, wants}) => {
+                for (const el of document.querySelectorAll(selector)) {
+                  const txt = ((el.innerText || el.textContent || el.value || '')+'').toLowerCase().trim();
+                  if (wants.some(w => txt.includes(w))) { el.click(); return true; }
+                }
+                return false;
+              }, {selector, wants});
+              if (clicked) return true;
+              await sleep(250);
+            }
+            return false;
+          }
+
+          async function forceLoadRows(page, passes = 3) {
+            for (let i=0;i<30;i++) {
+              const rows = await page.$$eval('tr[id^="eventRowId_"], tr.js-event-item, tr[data-event-datetime]', els => els.length);
+              if (rows >= 10) break;
+              await sleep(300);
+            }
+            for (let s=0; s<passes; s++) {
+              await page.evaluate(() => window.scrollBy(0, window.innerHeight*2));
+              await sleep(800);
+            }
+            await page.evaluate(() => window.scrollTo(0, 0));
+            await sleep(500);
+          }
+
+          async function applyNativeFilters(page) {
+            // Abrir "Filtros"
+            log('Open Filters popup');
+            const opened = await clickByText(page, 'button,a,[role="button"],input[type="button"]', ['filtro','filtros','filters'], 8000);
+            if (!opened) { log('Filters button not found'); return false; }
+
+            await sleep(800);
+
+            // Dentro del popup, desmarcar todos los países y marcar solo EE.UU.
+            const ok = await page.evaluate(() => {
+              const modal = document.querySelector('.filterPopup, .ecFilterPop, .economicCalendarFilterPopup, .ecEconomicFilterPopup, .ecCalFilterPop, [class*="filterPop"]') || document;
+              // Países
+              const allCountries = modal.querySelectorAll('input[type="checkbox"][name*="country"]');
+              allCountries.forEach(cb => { cb.checked = false; cb.dispatchEvent(new Event('change', {bubbles:true})); });
+              // EE.UU. = value "5" casi siempre; si no, por texto
+              let us = Array.from(allCountries).find(cb => cb.value === '5');
+              if (!us) {
+                us = Array.from(allCountries).find(cb => {
+                  const li = cb.closest('label, li, div');
+                  const txt = (li?.innerText || '').toLowerCase();
+                  return /estados unidos|united states|ee\.uu/.test(txt);
+                });
+              }
+              if (us) { us.checked = true; us.dispatchEvent(new Event('change', {bubbles:true})); } else { return false; }
+
+              // Importancia (2 y 3 estrellas)
+              const imp = modal.querySelectorAll('input[type="checkbox"][name*="importance"]');
+              let found = 0;
+              imp.forEach(cb => {
+                if (cb.value === '2' || cb.value === '3') { cb.checked = true; found++; }
+                else { cb.checked = false; }
+                cb.dispatchEvent(new Event('change', {bubbles:true}));
+              });
+
+              // Aplicar / Mostrar
+              const btn = Array.from(modal.querySelectorAll('button,a,input[type="submit"],input[type="button"]'))
+                .find(b => /aplicar|apply|mostrar|show/i.test((b.innerText||b.value||'')+''));
+              btn?.click();
+              return !!us && found >= 2;
+            });
+
+            if (!ok) { log('Could not programmatically set filters'); return false; }
+
+            // Esperar a que la tabla refresque algo
+            await sleep(1500);
+            return true;
+          }
+
+          (async () => {
+            const browser = await puppeteer.launch({
+              headless: 'new',
+              args: [
+                '--no-sandbox','--disable-setuid-sandbox',
+                '--lang=es-ES,es',
+                '--disable-dev-shm-usage'
+              ]
+            });
+            const page = await browser.newPage();
+            await page.setUserAgent('Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36');
+            await page.setExtraHTTPHeaders({ 'Accept-Language': 'es-ES,es;q=0.9' });
+            await page.setViewport({ width: 1440, height: 2400, deviceScaleFactor: 2 });
+            try { await page.emulateTimezone('Europe/Madrid'); } catch(e) {}
+
+            const url = 'https://es.investing.com/economic-calendar/';
+            log('Go to', url);
+            await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
+
+            // Cookies
+            await page.evaluate(() => {
+              const btn = [...document.querySelectorAll("button,a,[role='button']")]
+                .find(b => /aceptar|accept|consent|agree/i.test((b.innerText||'')+''));
+              btn?.click();
+            }).catch(()=>{});
+            await sleep(800);
+
+            // Lunes: "Esta semana"; resto: "Hoy"
+            const dow = new Date().getDay();
+            if (dow === 1) { await clickByText(page, 'a,button', ['esta semana','this week'], 6000); }
+            else { await clickByText(page, 'a,button', ['hoy','today'], 6000); }
+            await sleep(600);
+
+            // Aplicar filtros nativos
+            const nativeOK = await applyNativeFilters(page);
+            await forceLoadRows(page, 4);
+
+            // Fallback de filtrado en el DOM (por si la UI no filtró bien)
+            const rowsSelector = 'tr[id^="eventRowId_"], tr.js-event-item, tr[data-event-datetime]';
+            const visibleCount = await page.evaluate((selector) => {
+              const isUSRow = (tr) => {
+                const c = tr.getAttribute('data-country') || tr.dataset?.country || '';
+                if (c === '5') return true;
+                const flagSpan = tr.querySelector('td.flagCur span, .flagCur span, [class*="flag"] span');
+                const flagClass = (flagSpan?.className || '').toLowerCase();
+                const flagTitle = (flagSpan?.getAttribute('title') || '').toLowerCase();
+                if (/usa|united\s*states/.test(flagClass) || /estados unidos|united states/.test(flagTitle)) return true;
+                const curCell = tr.querySelector('td.cur, td.currency, td:nth-child(2)');
+                const curTxt = (curCell?.innerText || '').trim().toUpperCase();
+                if (curTxt === 'USD') return true;
+                return false;
+              };
+              const has2or3Stars = (tr) => {
+                const imp = tr.getAttribute('data-importance') || tr.dataset?.importance || '';
+                if (imp === '2' || imp === '3') return true;
+                const senti = tr.querySelector('td.sentiment, td.impact, .sentiment');
+                if (!senti) return false;
+                const iTags = senti.querySelectorAll('i, svg').length;
+                return iTags >= 2;
+              };
+
+              for (const sel of [
+                '#topBarAndAds','.midHeader','#banner','.stickyFooter','.js-consent-banner',
+                'iframe','.adsbygoogle','.advertisement'
+              ]) document.querySelectorAll(sel).forEach(e => e.remove());
+
+              const rows = Array.from(document.querySelectorAll(selector));
+              let kept = 0;
+              rows.forEach(tr => {
+                const keep = isUSRow(tr) && has2or3Stars(tr);
+                if (!keep) tr.style.display = 'none'; else kept++;
+              });
+
+              // Cabeceras con hijos visibles
+              const dayHeaders = Array.from(document.querySelectorAll('tr.theDay, tr.newDay, tr.dayHeader'));
+              const isVisibleEvent = (el) => el.matches(selector) && el.style.display !== 'none';
+              for (const hdr of dayHeaders) {
+                let has = false;
+                for (let sib = hdr.nextElementSibling; sib; sib = sib.nextElementSibling) {
+                  if (sib.matches('tr.theDay, tr.newDay, tr.dayHeader')) break;
+                  if (isVisibleEvent(sib)) { has = true; break; }
+                }
+                if (!has) hdr.style.display = 'none';
+              }
+              return kept;
+            }, rowsSelector);
+
+            log('Native filters applied:', nativeOK, '| Visible after fallback:', visibleCount);
+
+            // Captura
+            const table = await page.$('#economicCalendarData') || await page.$('table.genTbl') || await page.$('table');
+            await page.evaluate(() => window.scrollTo(0, 0));
+            await sleep(500);
+            if (table) await table.screenshot({ path: 'calendar.png' });
+            else await page.screenshot({ path: 'calendar.png', fullPage: true });
+
+            if (!visibleCount || visibleCount === 0) {
+              log('No visible events after filtering. Failing to avoid empty post.');
+              await browser.close(); process.exit(2);
+            }
+
+            log('✅ Captura filtrada generada: calendar.png');
+            await browser.close();
+          })().catch(err => { console.error(err); process.exit(1); });
+          EOF
+
+      # ---------- Ejecutar scraper ----------
+      - name: Run grabber
+        run: node grab.js
+
+      # ---------- Construir caption ----------
+      - name: Build caption (ES/Madrid)
+        run: |
+          export TZ=Europe/Madrid
+          DOW=$(date +%u)
+          if [ "$DOW" -eq 1 ]; then
+            A=$(date -d "monday this week" +%Y-%m-%d)
+            B=$(date -d "sunday this week" +%Y-%m-%d)
+            echo "CAPTION=🗓️ Calendario USA (⭐️⭐️/⭐️⭐️⭐️) — Semana ${A}–${B}" >> $GITHUB_ENV
+          else
+            HOY=$(date +%Y-%m-%d)
+            echo "CAPTION=🗓️ Calendario USA (⭐️⭐️/⭐️⭐️⭐️) — Hoy ${HOY}" >> $GITHUB_ENV
+          fi
+
+      # ---------- Enviar a Telegram ----------
+      - name: Send to Telegram (Python)
+        env:
+          BOT_TOKEN: ${{ secrets.INVESTX_TOKEN }}
+          CHAT_ID: ${{ secrets.CHAT_ID }}
+          CAPTION: ${{ env.CAPTION }}
+        run: |
+          python3 - <<'PY'
+          import os, requests
+          bot = os.environ['BOT_TOKEN']; chat = os.environ['CHAT_ID']
+          caption = os.environ.get('CAPTION','Calendario USA')
+          with open("calendar.png","rb") as f:
+              r = requests.post(
+                  f"https://api.telegram.org/bot{bot}/sendPhoto",
+                  data={"chat_id": chat, "caption": caption, "parse_mode":"HTML"},
+                  files={"photo": ("calendar.png", f, "image/png")},
+                  timeout=90
+              )
+              print(r.status_code, r.text)
+              r.raise_for_status()
+          PY
