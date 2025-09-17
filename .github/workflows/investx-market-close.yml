@@ -1,0 +1,86 @@
+name: InvestX Market Close
+
+on:
+  schedule:
+    - cron: "0 21 * * 1-5"   # 23:00 Madrid (21:00 UTC), lunes a viernes
+  workflow_dispatch:
+
+jobs:
+  market-close:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install Puppeteer
+        run: |
+          npm init -y
+          npm i puppeteer@22
+
+      - name: Capture Finviz Heatmap
+        run: |
+          cat > screenshot.js <<'EOF'
+          const puppeteer = require('puppeteer');
+
+          (async () => {
+            const browser = await puppeteer.launch({
+              headless: "new",
+              args: ['--no-sandbox','--disable-setuid-sandbox']
+            });
+            const page = await browser.newPage();
+            // Viewport grande para buena resolución
+            await page.setViewport({ width: 1920, height: 1200, deviceScaleFactor: 1 });
+
+            // Heatmap de 1 día (cierre)
+            const url = 'https://finviz.com/map.ashx?t=sec&st=d1';
+            await page.goto(url, { waitUntil: 'networkidle2', timeout: 120000 });
+
+            // Cerrar posibles banners/cookies si aparecen
+            try {
+              await page.waitForSelector('div[class*="cookie"] button, button#onetrust-accept-btn-handler', { timeout: 4000 });
+              await page.click('div[class*="cookie"] button, button#onetrust-accept-btn-handler');
+            } catch(e){}
+
+            // Espera a que pinte el canvas principal
+            await page.waitForSelector('canvas', { timeout: 30000 });
+
+            // A veces Finviz tarda en re-dibujar el mapa; damos un extra
+            await page.waitForTimeout(2500);
+
+            // Tomamos el canvas y recortamos con margen superior para que salga la tira/cabecera
+            const canvas = await page.$('canvas');
+            const box = await canvas.boundingBox();
+
+            // Margen arriba/abajo para incluir cabecera/borde
+            const topMargin = 60;
+            const bottomMargin = 40;
+
+            const clip = {
+              x: Math.max(0, Math.floor(box.x)),
+              y: Math.max(0, Math.floor(box.y - topMargin)),
+              width: Math.floor(box.width),
+              height: Math.floor(box.height + topMargin + bottomMargin),
+            };
+
+            await page.screenshot({ path: 'heatmap.png', clip });
+            await browser.close();
+          })();
+          EOF
+
+          node screenshot.js
+
+      - name: Send to Telegram
+        env:
+          BOT_TOKEN: ${{ secrets.INVESTX_TOKEN }}
+          CHAT_ID: ${{ secrets.CHAT_ID }}
+        run: |
+          CAPTION="📊 Cierre de mercado — Heatmap (1D)\nFuente: Finviz • Enviado por InvestX"
+          curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendPhoto" \
+            -F chat_id="${CHAT_ID}" \
+            -F caption="$CAPTION" \
+            -F photo="@heatmap.png"
+
+
