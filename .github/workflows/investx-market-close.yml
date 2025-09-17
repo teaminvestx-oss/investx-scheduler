@@ -2,85 +2,158 @@ name: InvestX Market Close
 
 on:
   schedule:
-    - cron: "0 21 * * 1-5"   # 23:00 Madrid (21:00 UTC), lunes a viernes
+    - cron: "0 21 * * 1-5"    # 23:00 Madrid (21:00 UTC), lunes a viernes
   workflow_dispatch:
 
 jobs:
   market-close:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
 
     steps:
-      - name: Set up Node
+      # ---------- Dependencias del sistema ----------
+      - name: Set up job
+        run: |
+          set -e
+          sudo apt-get update -y
+          sudo apt-get install -y \
+            jq curl unzip python3 python3-pip \
+            libatk1.0-0 libatk-bridge2.0-0 libnss3 libx11-6 libx11-xcb1 \
+            libxcomposite1 libxdamage1 libxext6 libxfixes3 libxrandr2 \
+            libgbm1 libasound2 fonts-liberation
+
+      # ---------- Node/Puppeteer ----------
+      - name: Setup Node
         uses: actions/setup-node@v4
         with:
           node-version: '20'
 
       - name: Install Puppeteer
-        run: |
-          npm init -y
-          npm i puppeteer@22
+        run: npm i puppeteer@22
 
-      - name: Capture Finviz Heatmap
+      # ---------- Script de captura (con reintentos y clip al heatmap) ----------
+      - name: Build screenshot script
         run: |
           cat > screenshot.js <<'EOF'
           const puppeteer = require('puppeteer');
 
+          const sleep = (ms)=>new Promise(r=>setTimeout(r,ms));
+          async function waitForCanvasReady(page, timeoutMs=60000) {
+            const start = Date.now();
+            while (Date.now() - start < timeoutMs) {
+              const ok = await page.evaluate(() => {
+                // Finviz pinta varios canvas encima; buscamos el más grande
+                const canvases = Array.from(document.querySelectorAll('canvas'));
+                if (!canvases.length) return false;
+                const biggest = canvases
+                  .map(c => ({w:c.width, h:c.height, x:c.getBoundingClientRect().x, y:c.getBoundingClientRect().y}))
+                  .sort((a,b)=>(b.w*b.h)-(a.w*a.h))[0];
+                // Consideramos "listo" si supera un tamaño mínimo
+                return biggest && biggest.w >= 800 && biggest.h >= 500;
+              });
+              if (ok) return true;
+              await sleep(500);
+            }
+            return false;
+          }
+
           (async () => {
             const browser = await puppeteer.launch({
-              headless: "new",
-              args: ['--no-sandbox','--disable-setuid-sandbox']
+              headless: 'new',
+              args: [
+                '--no-sandbox','--disable-setuid-sandbox',
+                '--disable-dev-shm-usage','--lang=es-ES,es'
+              ]
             });
             const page = await browser.newPage();
-            // Viewport grande para buena resolución
-            await page.setViewport({ width: 1920, height: 1200, deviceScaleFactor: 1 });
+            await page.setViewport({ width: 1600, height: 1200, deviceScaleFactor: 2 });
+            await page.setUserAgent('Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36');
 
-            // Heatmap de 1 día (cierre)
             const url = 'https://finviz.com/map.ashx?t=sec&st=d1';
-            await page.goto(url, { waitUntil: 'networkidle2', timeout: 120000 });
+            // Reintentos por si hay CDN / carga lenta
+            let ok = false, tries = 0, lastErr = null;
+            while (!ok && tries < 3) {
+              tries++;
+              try {
+                await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
 
-            // Cerrar posibles banners/cookies si aparecen
-            try {
-              await page.waitForSelector('div[class*="cookie"] button, button#onetrust-accept-btn-handler', { timeout: 4000 });
-              await page.click('div[class*="cookie"] button, button#onetrust-accept-btn-handler');
-            } catch(e){}
+                // Aceptar cookies si aparece
+                try {
+                  await page.evaluate(() => {
+                    const btn = [...document.querySelectorAll('button,a')].find(b =>
+                      /accept|agree|consent|aceptar/i.test((b.innerText||'')+''));
+                    btn?.click();
+                  });
+                } catch {}
 
-            // Espera a que pinte el canvas principal
-            await page.waitForSelector('canvas', { timeout: 30000 });
+                // Espera activa a que el canvas esté realmente pintado
+                ok = await waitForCanvasReady(page, 70000);
+                if (!ok) throw new Error('Canvas not ready');
+              } catch (e) {
+                lastErr = e;
+                await sleep(2000);
+              }
+            }
+            if (!ok) {
+              console.error('Timeout esperando canvas:', lastErr?.message || '');
+              // Fallback para no fallar el job
+              await page.screenshot({ path: 'heatmap.png', fullPage: true });
+              await browser.close();
+              process.exit(0);
+            }
 
-            // A veces Finviz tarda en re-dibujar el mapa; damos un extra
-            await page.waitForTimeout(2500);
+            // Calcula bounding box que cubra el/los canvas principales (unión)
+            const clip = await page.evaluate(() => {
+              const canvases = Array.from(document.querySelectorAll('canvas'));
+              const boxes = canvases.map(c => {
+                const r = c.getBoundingClientRect();
+                return { x: Math.max(0, r.x), y: Math.max(0, r.y), w: r.width, h: r.height };
+              }).filter(b => b.w*b.h > 100000); // filtra mini-canvas
+              if (!boxes.length) return null;
+              const x0 = Math.floor(Math.min(...boxes.map(b=>b.x)));
+              const y0 = Math.floor(Math.min(...boxes.map(b=>b.y)))-60; // margen superior para cabecera
+              const x1 = Math.ceil(Math.max(...boxes.map(b=>b.x + b.w)));
+              const y1 = Math.ceil(Math.max(...boxes.map(b=>b.y + b.h)))+40; // margen inferior
+              return { x: Math.max(0,x0), y: Math.max(0,y0), width: x1 - x0, height: y1 - y0 };
+            });
 
-            // Tomamos el canvas y recortamos con margen superior para que salga la tira/cabecera
-            const canvas = await page.$('canvas');
-            const box = await canvas.boundingBox();
-
-            // Margen arriba/abajo para incluir cabecera/borde
-            const topMargin = 60;
-            const bottomMargin = 40;
-
-            const clip = {
-              x: Math.max(0, Math.floor(box.x)),
-              y: Math.max(0, Math.floor(box.y - topMargin)),
-              width: Math.floor(box.width),
-              height: Math.floor(box.height + topMargin + bottomMargin),
-            };
-
-            await page.screenshot({ path: 'heatmap.png', clip });
+            if (clip && clip.width>0 && clip.height>0) {
+              await page.screenshot({ path: 'heatmap.png', clip });
+            } else {
+              await page.screenshot({ path: 'heatmap.png', fullPage: true });
+            }
             await browser.close();
-          })();
+          })().catch(err => { console.error(err); process.exit(0); });
           EOF
 
-          node screenshot.js
+      - name: Run screenshot
+        run: node screenshot.js
 
-      - name: Send to Telegram
+      # ---------- Caption ----------
+      - name: Build caption (ES/Madrid)
+        run: |
+          export TZ=Europe/Madrid
+          FECHA=$(date +'%Y-%m-%d')
+          echo "CAPTION=📊 Cierre de mercado — Heatmap (1D)\n${FECHA} • Fuente: Finviz • InvestX" >> $GITHUB_ENV
+
+      # ---------- Enviar a Telegram ----------
+      - name: Send to Telegram (Python)
         env:
           BOT_TOKEN: ${{ secrets.INVESTX_TOKEN }}
           CHAT_ID: ${{ secrets.CHAT_ID }}
+          CAPTION: ${{ env.CAPTION }}
         run: |
-          CAPTION="📊 Cierre de mercado — Heatmap (1D)\nFuente: Finviz • Enviado por InvestX"
-          curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendPhoto" \
-            -F chat_id="${CHAT_ID}" \
-            -F caption="$CAPTION" \
-            -F photo="@heatmap.png"
-
+          python3 - <<'PY'
+          import os, requests
+          bot = os.environ['BOT_TOKEN']; chat = os.environ['CHAT_ID']
+          caption = os.environ.get('CAPTION','Cierre de mercado — Heatmap (1D)')
+          with open("heatmap.png","rb") as f:
+              r = requests.post(
+                  f"https://api.telegram.org/bot{bot}/sendPhoto",
+                  data={"chat_id": chat, "caption": caption, "parse_mode":"HTML"},
+                  files={"photo": ("heatmap.png", f, "image/png")},
+                  timeout=120
+              )
+              print(r.status_code, r.text)
+              r.raise_for_status()
+          PY
 
