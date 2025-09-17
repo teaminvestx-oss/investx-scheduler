@@ -109,11 +109,16 @@ jobs:
           const fs = require('fs');
 
           const UA='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36';
-
+          const REF='https://finviz.com/';
           const sleep = (ms)=>new Promise(r=>setTimeout(r,ms));
-          async function retry(n, fn){
-            let last; for(let i=0;i<n;i++){ try{ return await fn(); } catch(e){ last=e; await sleep(700);} }
-            throw last||new Error('retry failed');
+          async function retry(n, fn){ let last; for(let i=0;i<n;i++){ try{ return await fn(); } catch(e){ last=e; await sleep(700);} } throw last||new Error('retry failed'); }
+          async function acceptConsent(page){
+            try{
+              await page.evaluate(()=>{
+                const btn=[...document.querySelectorAll('button,a')].find(x=>/accept|agree|consent|aceptar/i.test((x?.innerText||'')));
+                btn?.click();
+              });
+            }catch(_){}
           }
 
           // ---------- Índices robustos (Stooq) ----------
@@ -124,54 +129,57 @@ jobs:
             const txt = await res.text();
             const lines = txt.trim().split('\n');
             if(lines.length<3) throw new Error('not enough rows');
-            const last2 = lines.slice(-2).map(l=>parseFloat(l.split(',')[4]));
-            const [prev, close]=last2;
+            const [prev, close] = lines.slice(-2).map(l=>parseFloat(l.split(',')[4]));
             if(!prev || !close) throw new Error('parse');
             return ((close-prev)/prev)*100;
           }
 
+          // ---------- SECTORES (Groups) ----------
           async function grabSectors(page){
             const url='https://finviz.com/groups.ashx?g=sector&v=210';
             await page.goto(url, {waitUntil:'domcontentloaded', timeout:60000});
-            await page.waitForSelector('table.table-light', {timeout:15000});
-            return await page.evaluate(() => {
-              const rows = [...document.querySelectorAll('table.table-light tr')].slice(1);
-              const data = rows.map(r=>{
+            await acceptConsent(page);
+            await page.waitForSelector('table.table-light', {timeout:20000});
+            return await page.$$eval('table.table-light tr', rows => {
+              const out=[];
+              for(const r of rows.slice(1)){
                 const tds=[...r.querySelectorAll('td')].map(td=>td.innerText.trim());
-                // Esperado: Rank | Name | Perf Today | Perf W | ...
                 const name = tds[1];
-                const pct = parseFloat((tds[2]||'0').replace('%','').replace(',','.'));
-                return name ? {name, pct: isNaN(pct)?0:pct} : null;
-              }).filter(Boolean);
-              const top = [...data].sort((a,b)=>b.pct-a.pct).slice(0,2);
-              const worst = [...data].sort((a,b)=>a.pct-b.pct).slice(0,2);
+                const today = (tds[2]||'').replace(',','.');
+                const pct = parseFloat(today.replace('%',''));
+                if(name) out.push({name, pct: isNaN(pct)?0:pct});
+              }
+              const top = [...out].sort((a,b)=>b.pct-a.pct).slice(0,2);
+              const worst = [...out].sort((a,b)=>a.pct-b.pct).slice(0,2);
               return {top, worst};
             });
           }
 
+          // ---------- MOVERS SP500 (Screener) ----------
           async function grabMovers(page, order){
             const o = order==='desc' ? '-change' : 'change';
             const url = `https://finviz.com/screener.ashx?v=111&f=idx_sp500&o=${o}`;
             await page.goto(url, {waitUntil:'domcontentloaded', timeout:60000});
-            await page.waitForSelector('table.table-light', {timeout:15000});
-            return await page.evaluate(() => {
-              const rows = [...document.querySelectorAll('table.table-light tr')].slice(1,6);
-              const out = [];
-              for(const r of rows){
+            await acceptConsent(page);
+            await page.waitForSelector('table.table-light', {timeout:20000});
+            return await page.$$eval('table.table-light tr', rows => {
+              const out=[];
+              for(const r of rows.slice(1)){
+                const ticker = r.querySelector('a.screener-link-primary')?.innerText?.trim() || '';
                 const tds=[...r.querySelectorAll('td')].map(td=>td.innerText.trim());
-                const ticker = tds[1] || '';
-                // en v=111, cambio porcentual suele ir en la col "Change" cerca del final
-                const ch = (tds.find(x=>x.endsWith('%'))||'').replace(/\s+/g,'');
-                if(ticker) out.push({t:ticker, ch});
+                const perc = (tds.reverse().find(x=>/%$/.test(x)) || '').replace(/\s+/g,'');
+                if(ticker && perc) out.push({t:ticker, ch:perc});
                 if(out.length===3) break;
               }
               return out;
             });
           }
 
+          // ---------- Titular (opcional) ----------
           async function grabHeadline(page){
             const url = 'https://finviz.com/news.ashx';
             await page.goto(url, {waitUntil:'domcontentloaded', timeout:60000});
+            await acceptConsent(page);
             const ok = await page.$('.news-item-row');
             if(!ok) return '';
             return await page.evaluate(() => {
@@ -186,8 +194,10 @@ jobs:
             const browser = await puppeteer.launch({ headless:'new', args:['--no-sandbox','--disable-setuid-sandbox'] });
             const page = await browser.newPage();
             await page.setUserAgent(UA);
+            await page.setExtraHTTPHeaders({ 'Referer': REF, 'Accept-Language': 'es-ES,es;q=0.9,en;q=0.8' });
+            await page.setViewport({ width: 1366, height: 900, deviceScaleFactor: 1 });
 
-            // Índices (SPY/QQQ/DIA aproximan al índice; usamos Stooq por fiabilidad)
+            // Índices (ETFs) desde Stooq
             const [sp,nq,dj] = await Promise.all([
               retry(3, ()=>stooqPct('spy.us')),
               retry(3, ()=>stooqPct('qqq.us')),
@@ -202,12 +212,38 @@ jobs:
 
             await browser.close();
 
-            // Opinión simple
-            let opinion = 'Sesión mixta.';
-            if([sp,nq,dj].every(x=>typeof x==='number' && x<0)) opinion='Sesgo risk-off, índices en rojo.';
-            else if(sectors?.worst?.some(s=>/tech/i.test(s.name))) opinion='Debilidad en tecnología, cierta rotación defensiva.';
-            else if((sp??0)>0 && (nq??0)>0) opinion='Empuje alcista liderado por growth.';
+            // ---------- Opinión enriquecida (siempre no vacía) ----------
+            function val(x){ return (typeof x === 'number') ? x : 0; }
+            function avg(...xs){ return xs.map(val).reduce((a,b)=>a+b,0)/xs.length; }
+            const m = { up: 0.35, down: -0.35 };
+            const spv = val(sp), nqv = val(nq), djv = val(dj);
+            const meanIdx = avg(spv, nqv, djv);
 
+            const topNames   = (sectors?.top   || []).map(s=>s.name);
+            const worstNames = (sectors?.worst || []).map(s=>s.name);
+
+            const growthHit  = worstNames.some(n=>/Technology|Communication Services/i.test(n));
+            const growthLead = topNames.some(n=>/Technology|Communication Services|Consumer Cyclical/i.test(n));
+            const defensives = topNames.some(n=>/Utilities|Consumer Defensive|Healthcare/i.test(n));
+
+            let opinion = '';
+            if (meanIdx <= m.down && growthHit) {
+              opinion = 'Sesgo <b>risk-off</b>: presión en growth (Tech/Comms) y rotación a defensivas.';
+            } else if (meanIdx >= m.up && growthLead) {
+              opinion = 'Tono <b>risk-on</b>: rebote liderado por growth (Tech/Discrecional).';
+            } else if (defensives && meanIdx < 0.15) {
+              opinion = 'Defensivas toman el relevo; cautela con momentum de corto plazo.';
+            } else if (Math.abs(meanIdx) < 0.15) {
+              opinion = 'Sesión mixta, sin dirección clara; foco en catalizadores puntuales.';
+            } else {
+              opinion = meanIdx > 0 ? 'Cierre positivo con amplitud moderada.' : 'Cierre en rojo, pero sin capitulación.';
+            }
+            const add=[];
+            if (sectors?.top?.length)   add.push(`mejor: ${sectors.top[0].name}`);
+            if (sectors?.worst?.length) add.push(`peor: ${sectors.worst[0].name}`);
+            if (add.length) opinion += ` (${add.join(' · ')})`;
+
+            // ---------- Payload ----------
             const d = new Date().toLocaleDateString('es-ES',{timeZone:'Europe/Madrid'});
             const fmt = v => (typeof v === 'number') ? `${v.toFixed(2)}%` : '—';
             const secStr = arr => (arr||[]).map(s=>`${s.name} ${s.pct.toFixed(2)}%`).join(', ') || '—';
@@ -221,7 +257,7 @@ jobs:
               winners: movStr(winners),
               losers: movStr(losers),
               headline: headline || '',
-              opinion
+              opinion: opinion || 'Sesión mixta.'
             };
             fs.writeFileSync('summary.json', JSON.stringify(payload), 'utf8');
           })();
@@ -230,7 +266,7 @@ jobs:
       - name: Run summary (creates summary.json)
         run: node summary.js
 
-      # ---------- Construir caption fuera de JS (HTML seguro) ----------
+      # ---------- Construir caption (HTML seguro) ----------
       - name: Build caption.txt
         run: |
           DATE=$(jq -r '.date' summary.json)
