@@ -8,9 +8,19 @@ on:
 
 jobs:
   econ-calendar:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
 
     steps:
+      - name: Set up job
+        run: |
+          set -e
+          sudo apt-get update -y
+          sudo apt-get install -y \
+            jq curl unzip python3 python3-pip \
+            libatk1.0-0 libatk-bridge2.0-0 libnss3 libx11-6 libx11-xcb1 \
+            libxcomposite1 libxdamage1 libxext6 libxfixes3 libxrandr2 \
+            libgbm1 libasound2 fonts-liberation
+
       # ---------- Dependencias del sistema ----------
       - name: Set up job
         run: |
