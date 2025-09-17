@@ -10,7 +10,8 @@ jobs:
     runs-on: ubuntu-22.04
 
     steps:
-      - name: System deps
+      # ---------- Dependencias del sistema ----------
+      - name: Install system deps
         run: |
           set -e
           sudo apt-get update -y
@@ -20,6 +21,7 @@ jobs:
             libxcomposite1 libxdamage1 libxext6 libxfixes3 libxrandr2 \
             libgbm1 libasound2 fonts-liberation
 
+      # ---------- Node / Puppeteer ----------
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
@@ -28,7 +30,7 @@ jobs:
       - name: Install Puppeteer
         run: npm i puppeteer@22
 
-      # ---------- Screenshot Heatmap ----------
+      # ---------- Captura del heatmap ----------
       - name: Build screenshot script
         run: |
           cat > screenshot.js <<'EOF'
@@ -99,161 +101,109 @@ jobs:
       - name: Run screenshot
         run: node screenshot.js
 
-      # ---------- Summary + Opinion ----------
+      # ---------- Resumen + Opinión ----------
       - name: Build summary script
         run: |
           cat > summary.js <<'EOF'
           const puppeteer = require('puppeteer');
-          const sleep = ms => new Promise(r=>setTimeout(r,ms));
+          const fs = require('fs');
 
-          const fmtPct = s => {
-            const m = /(-?\d+(?:\.\d+)?)%/.exec(s || '');
-            return m ? parseFloat(m[1]) : null;
-          };
-
-          async function grabChange(page, ticker){ // SPY/QQQ/DIA como proxy índices
+          async function grabChange(page, ticker){
             const url=`https://finviz.com/quote.ashx?t=${ticker}`;
             await page.goto(url, {waitUntil:'domcontentloaded', timeout:60000}).catch(()=>{});
-            await page.waitForSelector('.snapshot-table2,.table-dark-row', {timeout:10000}).catch(()=>{});
-            // cambio % suele estar cerca del precio en cabecera
-            const text = await page.evaluate(() => {
-              const h = document.querySelector('#quote-top') || document.querySelector('.quote-header_ticker-wrapper') || document.body;
-              return h.innerText;
-            }).catch(()=> '');
-            let pct = null;
-            // fallback: buscar en toda la página el primer "%".
-            if(text) {
-              const m = text.match(/-?\d+(?:\.\d+)?%/g);
-              if(m && m.length) pct = parseFloat(m[0].replace('%',''));
-            }
-            return pct;
+            const text = await page.evaluate(() => document.body.innerText).catch(()=> '');
+            const m = text.match(/-?\d+(?:\.\d+)?%/);
+            return m ? parseFloat(m[0].replace('%','')) : null;
           }
 
           async function grabSectors(page){
-            const url='https://finviz.com/groups.ashx?g=sector&v=210'; // 1-Day Perf
+            const url='https://finviz.com/groups.ashx?g=sector&v=210';
             await page.goto(url, {waitUntil:'domcontentloaded', timeout:60000}).catch(()=>{});
-            await page.waitForSelector('table.table-light', {timeout:15000}).catch(()=>{});
             return await page.evaluate(() => {
               const rows = [...document.querySelectorAll('table.table-light tr')].slice(1);
               const data = rows.map(r=>{
                 const tds=[...r.querySelectorAll('td')].map(td=>td.innerText.trim());
-                // [Sector, Perf Day, ...]
-                return {name: tds[1]||tds[0], day: tds[2]||tds[1]};
-              }).filter(x=>x.name && x.day && x.day.includes('%'));
-              const by = data.map(d=>({name:d.name, pct: parseFloat(d.day.replace('%',''))}));
-              const top = [...by].sort((a,b)=>b.pct-a.pct).slice(0,2);
-              const worst = [...by].sort((a,b)=>a.pct-b.pct).slice(0,2);
+                return {name: tds[1], pct: parseFloat((tds[2]||'0').replace('%',''))};
+              }).filter(x=>x.name);
+              const top = [...data].sort((a,b)=>b.pct-a.pct).slice(0,2);
+              const worst = [...data].sort((a,b)=>a.pct-b.pct).slice(0,2);
               return {top, worst};
             });
           }
 
-          async function grabMovers(page, order){ // order: 'desc' (winners) | 'asc' (losers)
-            // Screener S&P500 orden por cambio día
+          async function grabMovers(page, order){
             const o = order==='desc' ? '-change' : 'change';
             const url = `https://finviz.com/screener.ashx?v=111&f=idx_sp500&o=${o}`;
             await page.goto(url, {waitUntil:'domcontentloaded', timeout:60000}).catch(()=>{});
-            await page.waitForSelector('table.table-light', {timeout:15000}).catch(()=>{});
             return await page.evaluate(() => {
               const rows = [...document.querySelectorAll('table.table-light tr')].slice(1,6);
               return rows.map(r=>{
                 const tds=[...r.querySelectorAll('td')].map(td=>td.innerText.trim());
-                // columnas tip: [No, Ticker, Company, Sector, Industry, Country, Market Cap, Price, Change, Volume]
-                return {t: tds[1], c: tds[2], ch: tds[8]};
-              }).filter(Boolean).slice(0,3);
+                return {t: tds[1], ch: tds[8]};
+              }).slice(0,3);
             });
           }
 
           async function grabNews(page){
             const url = 'https://finviz.com/news.ashx';
             await page.goto(url, {waitUntil:'domcontentloaded', timeout:60000}).catch(()=>{});
-            // tomamos el primer titular del feed principal
-            const item = await page.evaluate(() => {
-              const row = document.querySelector('.nn-tab .news-item-row, .news-item-row, table#news-table tr'); 
+            return await page.evaluate(() => {
+              const row = document.querySelector('.news-item-row');
               if(!row) return null;
               const a = row.querySelector('a');
               const src = row.querySelector('.news-source')?.innerText || '';
-              const title = (a?.innerText || '').trim();
-              return title ? `${title}${src ? ' — '+src : ''}` : null;
+              return a ? `${a.innerText} — ${src}` : null;
             });
-            return item;
           }
 
           (async () => {
-            const browser = await puppeteer.launch({
-              headless:'new',
-              args:['--no-sandbox','--disable-setuid-sandbox','--disable-dev-shm-usage','--lang=es-ES,es']
-            });
+            const browser = await puppeteer.launch({ headless:'new', args:['--no-sandbox','--disable-setuid-sandbox'] });
             const page = await browser.newPage();
-            await page.setViewport({ width: 1400, height: 1000, deviceScaleFactor: 2 });
-            await page.setUserAgent('Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36');
 
-            // Índices (proxies)
-            const [sp, nq, dj] = await Promise.all([
-              grabChange(page, 'SPY'),
-              grabChange(page, 'QQQ'),
-              grabChange(page, 'DIA'),
+            const [sp,nq,dj] = await Promise.all([
+              grabChange(page,'SPY'),
+              grabChange(page,'QQQ'),
+              grabChange(page,'DIA')
             ]);
 
-            // Sectores
             const sectors = await grabSectors(page).catch(()=>null);
-
-            // Movers
-            const winners = await grabMovers(page, 'desc').catch(()=>[]);
-            const losers  = await grabMovers(page, 'asc').catch(()=>[]);
-
-            // Noticia del día
+            const winners = await grabMovers(page,'desc').catch(()=>[]);
+            const losers  = await grabMovers(page,'asc').catch(()=>[]);
             const headline = await grabNews(page).catch(()=>null);
 
             await browser.close();
 
-            // Opinión automática simple
-            const riskOff = [sp,nq,dj].every(v => typeof v === 'number' && v < 0);
-            const techWeak = sectors?.worst?.some(s=>/technology/i.test(s.name)) ? true : false;
-            const defensivesUp = sectors?.top?.some(s=>/(utilities|consumer defensive|healthcare)/i.test(s.name)) ? true : false;
-
             let opinion = 'Sesión mixta.';
-            if (riskOff) opinion = 'Sesgo risk-off, cierres en rojo en los tres índices.';
-            else if (techWeak && defensivesUp) opinion = 'Rotación defensiva: presión en tecnología mientras defensivos lideran.';
-            else if ((sp??0)>0 && (nq??0)>0) opinion = 'Apuesta por riesgo: tecnología y growth tiran del mercado.';
-            else if ((sp??0)<0 && (nq??0)<0) opinion = 'Venta en renta variable con debilidad en crecimiento.';
-
-            const d = new Date().toLocaleDateString('es-ES', { timeZone: 'Europe/Madrid' });
-
-            const idxLine = `• S&P500: ${sp?.toFixed(2) ?? 'N/A'}% | Nasdaq: ${nq?.toFixed(2) ?? 'N/A'}% | Dow: ${dj?.toFixed(2) ?? 'N/A'}%`;
-
-            const secBest = sectors?.top?.map(s=>`${s.name} ${s.pct.toFixed(2)}%`).join(', ') || '—';
-            const secWorst = sectors?.worst?.map(s=>`${s.name} ${s.pct.toFixed(2)}%`).join(', ') || '—';
-
-            const winStr = winners.map(x=>`${x.t} ${x.ch}`).join(', ') || '—';
-            const losStr = losers.map(x=>`${x.t} ${x.ch}`).join(', ') || '—';
-
-            const newsStr = headline ? `🗞️ Noticia: ${headline}` : '';
+            if([sp,nq,dj].every(x=>x<0)) opinion='Sesgo risk-off, todos en rojo.';
+            else if(sectors?.worst?.some(s=>/tech/i.test(s.name))) opinion='Debilidad en tecnología, rotación defensiva.';
+            else if((sp??0)>0 && (nq??0)>0) opinion='Impulso alcista liderado por growth.';
+            
+            const d = new Date().toLocaleDateString('es-ES',{timeZone:'Europe/Madrid'});
 
             const caption = `
 📊 **Cierre de mercado — ${d}**
 ${idxLine}
-• Sectores destacados: ${secBest}
-• Peores sectores: ${secWorst}
-• Top ganadores (S&P500): ${winStr}
-• Top perdedores (S&P500): ${losStr}
+• Sectores destacados: ${sectors?.top?.map(s=>s.name+' '+s.pct+'%').join(', ') || '—'}
+• Peores sectores: ${sectors?.worst?.map(s=>s.name+' '+s.pct+'%').join(', ') || '—'}
+• Top ganadores (S&P500): ${winners.map(x=>x.t+' '+x.ch).join(', ') || '—'}
+• Top perdedores (S&P500): ${losers.map(x=>x.t+' '+x.ch).join(', ') || '—'}
 
 💡 *Opinión*: ${opinion}
-${newsStr}
-`;
+${headline ? '🗞️ Noticia: '+headline : ''}
+`.trim();
 
-            require('fs').writeFileSync('caption.txt', caption.trim(), 'utf8');
+            require('fs').writeFileSync('caption.txt', caption, 'utf8');
 
 
       - name: Run summary
         run: node summary.js
 
-      # ---------- Envío a Telegram ----------
+      # ---------- Enviar a Telegram ----------
       - name: Send to Telegram
         env:
           BOT_TOKEN: ${{ secrets.INVESTX_TOKEN }}
           CHAT_ID: ${{ secrets.CHAT_ID }}
         run: |
-          CAPTION="$(cat caption.txt)"
           python3 - <<'PY'
           import os, requests
           bot = os.environ['BOT_TOKEN']
