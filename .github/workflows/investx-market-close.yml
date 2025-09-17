@@ -10,7 +10,6 @@ jobs:
     runs-on: ubuntu-22.04
 
     steps:
-      # ---------- Dependencias del sistema ----------
       - name: Install system deps
         run: |
           set -e
@@ -21,7 +20,6 @@ jobs:
             libxcomposite1 libxdamage1 libxext6 libxfixes3 libxrandr2 \
             libgbm1 libasound2 fonts-liberation
 
-      # ---------- Node / Puppeteer ----------
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
@@ -30,7 +28,7 @@ jobs:
       - name: Install Puppeteer
         run: npm i puppeteer@22
 
-      # ---------- Captura del heatmap ----------
+      # --------- screenshot.js ---------
       - name: Build screenshot script
         run: |
           cat > screenshot.js <<'EOF'
@@ -101,7 +99,7 @@ jobs:
       - name: Run screenshot
         run: node screenshot.js
 
-      # ---------- Resumen + Opinión ----------
+      # --------- summary.js ---------
       - name: Build summary script
         run: |
           cat > summary.js <<'EOF'
@@ -177,28 +175,28 @@ jobs:
             if([sp,nq,dj].every(x=>x<0)) opinion='Sesgo risk-off, todos en rojo.';
             else if(sectors?.worst?.some(s=>/tech/i.test(s.name))) opinion='Debilidad en tecnología, rotación defensiva.';
             else if((sp??0)>0 && (nq??0)>0) opinion='Impulso alcista liderado por growth.';
-            
+
             const d = new Date().toLocaleDateString('es-ES',{timeZone:'Europe/Madrid'});
 
             const caption = `
 📊 **Cierre de mercado — ${d}**
-${idxLine}
-• Sectores destacados: ${sectors?.top?.map(s=>s.name+' '+s.pct+'%').join(', ') || '—'}
-• Peores sectores: ${sectors?.worst?.map(s=>s.name+' '+s.pct+'%').join(', ') || '—'}
-• Top ganadores (S&P500): ${winners.map(x=>x.t+' '+x.ch).join(', ') || '—'}
-• Top perdedores (S&P500): ${losers.map(x=>x.t+' '+x.ch).join(', ') || '—'}
+• S&P500: ${sp?.toFixed(2) ?? 'N/A'}% | Nasdaq: ${nq?.toFixed(2) ?? 'N/A'}% | Dow: ${dj?.toFixed(2) ?? 'N/A'}%
+• Sectores destacados: ${ (sectors?.top || []).map(s => `${s.name} ${s.pct}%`).join(', ') || '—' }
+• Peores sectores: ${ (sectors?.worst || []).map(s => `${s.name} ${s.pct}%`).join(', ') || '—' }
+• Top ganadores (S&P500): ${ winners.map(x => `${x.t} ${x.ch}`).join(', ') || '—' }
+• Top perdedores (S&P500): ${ losers.map(x => `${x.t} ${x.ch}`).join(', ') || '—' }
 
 💡 *Opinión*: ${opinion}
-${headline ? '🗞️ Noticia: '+headline : ''}
+${ headline ? `🗞️ Noticia: ${headline}` : '' }
 `.trim();
 
-            require('fs').writeFileSync('caption.txt', caption, 'utf8');
-
+            fs.writeFileSync('caption.txt', caption, 'utf8');
+          })();
+          EOF
 
       - name: Run summary
         run: node summary.js
 
-      # ---------- Enviar a Telegram ----------
       - name: Send to Telegram
         env:
           BOT_TOKEN: ${{ secrets.INVESTX_TOKEN }}
