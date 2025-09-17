@@ -2,7 +2,7 @@ name: InvestX Market Close
 
 on:
   schedule:
-    - cron: "0 21 * * 1-5"    # 23:00 Madrid (21:00 UTC), lunes a viernes
+    - cron: "0 21 * * 1-5"   # 23:00 Madrid (21:00 UTC), L–V
   workflow_dispatch:
 
 jobs:
@@ -10,8 +10,7 @@ jobs:
     runs-on: ubuntu-22.04
 
     steps:
-      # ---------- Dependencias del sistema ----------
-      - name: Set up job
+      - name: System deps
         run: |
           set -e
           sudo apt-get update -y
@@ -21,7 +20,6 @@ jobs:
             libxcomposite1 libxdamage1 libxext6 libxfixes3 libxrandr2 \
             libgbm1 libasound2 fonts-liberation
 
-      # ---------- Node/Puppeteer ----------
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
@@ -30,25 +28,22 @@ jobs:
       - name: Install Puppeteer
         run: npm i puppeteer@22
 
-      # ---------- Script de captura (con reintentos y clip al heatmap) ----------
+      # ---------- Screenshot Heatmap ----------
       - name: Build screenshot script
         run: |
           cat > screenshot.js <<'EOF'
           const puppeteer = require('puppeteer');
+          const sleep = ms => new Promise(r=>setTimeout(r,ms));
 
-          const sleep = (ms)=>new Promise(r=>setTimeout(r,ms));
-          async function waitForCanvasReady(page, timeoutMs=60000) {
-            const start = Date.now();
-            while (Date.now() - start < timeoutMs) {
+          async function waitForCanvasReady(page, timeoutMs=70000) {
+            const t0 = Date.now();
+            while (Date.now()-t0 < timeoutMs) {
               const ok = await page.evaluate(() => {
-                // Finviz pinta varios canvas encima; buscamos el más grande
-                const canvases = Array.from(document.querySelectorAll('canvas'));
-                if (!canvases.length) return false;
-                const biggest = canvases
-                  .map(c => ({w:c.width, h:c.height, x:c.getBoundingClientRect().x, y:c.getBoundingClientRect().y}))
-                  .sort((a,b)=>(b.w*b.h)-(a.w*a.h))[0];
-                // Consideramos "listo" si supera un tamaño mínimo
-                return biggest && biggest.w >= 800 && biggest.h >= 500;
+                const cs = Array.from(document.querySelectorAll('canvas'));
+                if (!cs.length) return false;
+                const big = cs.map(c=>({w:c.width,h:c.height,bb:c.getBoundingClientRect()}))
+                              .sort((a,b)=>b.w*b.h-a.w*a.h)[0];
+                return big && big.w>=800 && big.h>=500;
               });
               if (ok) return true;
               await sleep(500);
@@ -59,101 +54,208 @@ jobs:
           (async () => {
             const browser = await puppeteer.launch({
               headless: 'new',
-              args: [
-                '--no-sandbox','--disable-setuid-sandbox',
-                '--disable-dev-shm-usage','--lang=es-ES,es'
-              ]
+              args: ['--no-sandbox','--disable-setuid-sandbox','--disable-dev-shm-usage','--lang=es-ES,es']
             });
             const page = await browser.newPage();
             await page.setViewport({ width: 1600, height: 1200, deviceScaleFactor: 2 });
             await page.setUserAgent('Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36');
 
             const url = 'https://finviz.com/map.ashx?t=sec&st=d1';
-            // Reintentos por si hay CDN / carga lenta
-            let ok = false, tries = 0, lastErr = null;
-            while (!ok && tries < 3) {
+            let ready=false, tries=0;
+            while(!ready && tries<3){
               tries++;
-              try {
-                await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
-
-                // Aceptar cookies si aparece
-                try {
-                  await page.evaluate(() => {
-                    const btn = [...document.querySelectorAll('button,a')].find(b =>
-                      /accept|agree|consent|aceptar/i.test((b.innerText||'')+''));
-                    btn?.click();
-                  });
-                } catch {}
-
-                // Espera activa a que el canvas esté realmente pintado
-                ok = await waitForCanvasReady(page, 70000);
-                if (!ok) throw new Error('Canvas not ready');
-              } catch (e) {
-                lastErr = e;
-                await sleep(2000);
-              }
-            }
-            if (!ok) {
-              console.error('Timeout esperando canvas:', lastErr?.message || '');
-              // Fallback para no fallar el job
-              await page.screenshot({ path: 'heatmap.png', fullPage: true });
-              await browser.close();
-              process.exit(0);
+              await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 }).catch(()=>{});
+              await page.evaluate(()=>{
+                const b=[...document.querySelectorAll('button,a')].find(x=>/accept|agree|consent|aceptar/i.test((x.innerText||'')+''));
+                b?.click();
+              }).catch(()=>{});
+              ready = await waitForCanvasReady(page, 70000);
+              if(!ready) await sleep(2000);
             }
 
-            // Calcula bounding box que cubra el/los canvas principales (unión)
             const clip = await page.evaluate(() => {
-              const canvases = Array.from(document.querySelectorAll('canvas'));
-              const boxes = canvases.map(c => {
-                const r = c.getBoundingClientRect();
-                return { x: Math.max(0, r.x), y: Math.max(0, r.y), w: r.width, h: r.height };
-              }).filter(b => b.w*b.h > 100000); // filtra mini-canvas
-              if (!boxes.length) return null;
-              const x0 = Math.floor(Math.min(...boxes.map(b=>b.x)));
-              const y0 = Math.floor(Math.min(...boxes.map(b=>b.y)))-60; // margen superior para cabecera
-              const x1 = Math.ceil(Math.max(...boxes.map(b=>b.x + b.w)));
-              const y1 = Math.ceil(Math.max(...boxes.map(b=>b.y + b.h)))+40; // margen inferior
-              return { x: Math.max(0,x0), y: Math.max(0,y0), width: x1 - x0, height: y1 - y0 };
+              const cs = Array.from(document.querySelectorAll('canvas'));
+              const big = cs.map(c=>{
+                const r=c.getBoundingClientRect();
+                return {x:Math.max(0,r.x),y:Math.max(0,r.y),w:r.width,h:r.height,area:r.width*r.height};
+              }).filter(b=>b.area>120000);
+              if(!big.length) return null;
+              const x0=Math.floor(Math.min(...big.map(b=>b.x)));
+              const y0=Math.floor(Math.min(...big.map(b=>b.y)))-60;
+              const x1=Math.ceil(Math.max(...big.map(b=>b.x+b.w)));
+              const y1=Math.ceil(Math.max(...big.map(b=>b.y+b.h)))+40;
+              return {x:Math.max(0,x0), y:Math.max(0,y0), width:x1-x0, height:y1-y0};
             });
 
-            if (clip && clip.width>0 && clip.height>0) {
+            if(clip && clip.width>0 && clip.height>0) {
               await page.screenshot({ path: 'heatmap.png', clip });
             } else {
               await page.screenshot({ path: 'heatmap.png', fullPage: true });
             }
             await browser.close();
-          })().catch(err => { console.error(err); process.exit(0); });
+          })().catch(e=>{console.error(e); process.exit(0);});
           EOF
 
       - name: Run screenshot
         run: node screenshot.js
 
-      # ---------- Caption ----------
-      - name: Build caption (ES/Madrid)
+      # ---------- Summary + Opinion ----------
+      - name: Build summary script
         run: |
-          export TZ=Europe/Madrid
-          FECHA=$(date +'%Y-%m-%d')
-          echo "CAPTION=📊 Cierre de mercado — Heatmap (1D)\n${FECHA} • Fuente: Finviz • InvestX" >> $GITHUB_ENV
+          cat > summary.js <<'EOF'
+          const puppeteer = require('puppeteer');
+          const sleep = ms => new Promise(r=>setTimeout(r,ms));
 
-      # ---------- Enviar a Telegram ----------
-      - name: Send to Telegram (Python)
+          const fmtPct = s => {
+            const m = /(-?\d+(?:\.\d+)?)%/.exec(s || '');
+            return m ? parseFloat(m[1]) : null;
+          };
+
+          async function grabChange(page, ticker){ // SPY/QQQ/DIA como proxy índices
+            const url=`https://finviz.com/quote.ashx?t=${ticker}`;
+            await page.goto(url, {waitUntil:'domcontentloaded', timeout:60000}).catch(()=>{});
+            await page.waitForSelector('.snapshot-table2,.table-dark-row', {timeout:10000}).catch(()=>{});
+            // cambio % suele estar cerca del precio en cabecera
+            const text = await page.evaluate(() => {
+              const h = document.querySelector('#quote-top') || document.querySelector('.quote-header_ticker-wrapper') || document.body;
+              return h.innerText;
+            }).catch(()=> '');
+            let pct = null;
+            // fallback: buscar en toda la página el primer "%".
+            if(text) {
+              const m = text.match(/-?\d+(?:\.\d+)?%/g);
+              if(m && m.length) pct = parseFloat(m[0].replace('%',''));
+            }
+            return pct;
+          }
+
+          async function grabSectors(page){
+            const url='https://finviz.com/groups.ashx?g=sector&v=210'; // 1-Day Perf
+            await page.goto(url, {waitUntil:'domcontentloaded', timeout:60000}).catch(()=>{});
+            await page.waitForSelector('table.table-light', {timeout:15000}).catch(()=>{});
+            return await page.evaluate(() => {
+              const rows = [...document.querySelectorAll('table.table-light tr')].slice(1);
+              const data = rows.map(r=>{
+                const tds=[...r.querySelectorAll('td')].map(td=>td.innerText.trim());
+                // [Sector, Perf Day, ...]
+                return {name: tds[1]||tds[0], day: tds[2]||tds[1]};
+              }).filter(x=>x.name && x.day && x.day.includes('%'));
+              const by = data.map(d=>({name:d.name, pct: parseFloat(d.day.replace('%',''))}));
+              const top = [...by].sort((a,b)=>b.pct-a.pct).slice(0,2);
+              const worst = [...by].sort((a,b)=>a.pct-b.pct).slice(0,2);
+              return {top, worst};
+            });
+          }
+
+          async function grabMovers(page, order){ // order: 'desc' (winners) | 'asc' (losers)
+            // Screener S&P500 orden por cambio día
+            const o = order==='desc' ? '-change' : 'change';
+            const url = `https://finviz.com/screener.ashx?v=111&f=idx_sp500&o=${o}`;
+            await page.goto(url, {waitUntil:'domcontentloaded', timeout:60000}).catch(()=>{});
+            await page.waitForSelector('table.table-light', {timeout:15000}).catch(()=>{});
+            return await page.evaluate(() => {
+              const rows = [...document.querySelectorAll('table.table-light tr')].slice(1,6);
+              return rows.map(r=>{
+                const tds=[...r.querySelectorAll('td')].map(td=>td.innerText.trim());
+                // columnas tip: [No, Ticker, Company, Sector, Industry, Country, Market Cap, Price, Change, Volume]
+                return {t: tds[1], c: tds[2], ch: tds[8]};
+              }).filter(Boolean).slice(0,3);
+            });
+          }
+
+          async function grabNews(page){
+            const url = 'https://finviz.com/news.ashx';
+            await page.goto(url, {waitUntil:'domcontentloaded', timeout:60000}).catch(()=>{});
+            // tomamos el primer titular del feed principal
+            const item = await page.evaluate(() => {
+              const row = document.querySelector('.nn-tab .news-item-row, .news-item-row, table#news-table tr'); 
+              if(!row) return null;
+              const a = row.querySelector('a');
+              const src = row.querySelector('.news-source')?.innerText || '';
+              const title = (a?.innerText || '').trim();
+              return title ? `${title}${src ? ' — '+src : ''}` : null;
+            });
+            return item;
+          }
+
+          (async () => {
+            const browser = await puppeteer.launch({
+              headless:'new',
+              args:['--no-sandbox','--disable-setuid-sandbox','--disable-dev-shm-usage','--lang=es-ES,es']
+            });
+            const page = await browser.newPage();
+            await page.setViewport({ width: 1400, height: 1000, deviceScaleFactor: 2 });
+            await page.setUserAgent('Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36');
+
+            // Índices (proxies)
+            const [sp, nq, dj] = await Promise.all([
+              grabChange(page, 'SPY'),
+              grabChange(page, 'QQQ'),
+              grabChange(page, 'DIA'),
+            ]);
+
+            // Sectores
+            const sectors = await grabSectors(page).catch(()=>null);
+
+            // Movers
+            const winners = await grabMovers(page, 'desc').catch(()=>[]);
+            const losers  = await grabMovers(page, 'asc').catch(()=>[]);
+
+            // Noticia del día
+            const headline = await grabNews(page).catch(()=>null);
+
+            await browser.close();
+
+            // Opinión automática simple
+            const riskOff = [sp,nq,dj].every(v => typeof v === 'number' && v < 0);
+            const techWeak = sectors?.worst?.some(s=>/technology/i.test(s.name)) ? true : false;
+            const defensivesUp = sectors?.top?.some(s=>/(utilities|consumer defensive|healthcare)/i.test(s.name)) ? true : false;
+
+            let opinion = 'Sesión mixta.';
+            if (riskOff) opinion = 'Sesgo risk-off, cierres en rojo en los tres índices.';
+            else if (techWeak && defensivesUp) opinion = 'Rotación defensiva: presión en tecnología mientras defensivos lideran.';
+            else if ((sp??0)>0 && (nq??0)>0) opinion = 'Apuesta por riesgo: tecnología y growth tiran del mercado.';
+            else if ((sp??0)<0 && (nq??0)<0) opinion = 'Venta en renta variable con debilidad en crecimiento.';
+
+            const d = new Date().toLocaleDateString('es-ES', { timeZone: 'Europe/Madrid' });
+
+            const idxLine = `• S&P500: ${sp?.toFixed(2) ?? 'N/A'}% | Nasdaq: ${nq?.toFixed(2) ?? 'N/A'}% | Dow: ${dj?.toFixed(2) ?? 'N/A'}%`;
+
+            const secBest = sectors?.top?.map(s=>`${s.name} ${s.pct.toFixed(2)}%`).join(', ') || '—';
+            const secWorst = sectors?.worst?.map(s=>`${s.name} ${s.pct.toFixed(2)}%`).join(', ') || '—';
+
+            const winStr = winners.map(x=>`${x.t} ${x.ch}`).join(', ') || '—';
+            const losStr = losers.map(x=>`${x.t} ${x.ch}`).join(', ') || '—';
+
+            const newsStr = headline ? `🗞️ Noticia: ${headline}` : '';
+
+            const caption =
+`📊 **Cierre de mercado — ${d}**
+${idxLine}
+• Sectores destacados: ${secBest}
+• Peores sectores: ${secWorst}
+• Top ganadores (S&P500): ${winStr}
+• Top perdedores (S&P500): ${losStr}
+
+💡 *Opinión*: ${opinion}
+${newsStr}`;
+
+            require('fs').writeFileSync('caption.txt', caption, 'utf8');
+          })().catch(e=>{console.error(e); process.exit(0);});
+          EOF
+
+      - name: Run summary
+        run: node summary.js
+
+      # ---------- Envío a Telegram ----------
+      - name: Send to Telegram
         env:
           BOT_TOKEN: ${{ secrets.INVESTX_TOKEN }}
           CHAT_ID: ${{ secrets.CHAT_ID }}
-          CAPTION: ${{ env.CAPTION }}
         run: |
-          python3 - <<'PY'
-          import os, requests
-          bot = os.environ['BOT_TOKEN']; chat = os.environ['CHAT_ID']
-          caption = os.environ.get('CAPTION','Cierre de mercado — Heatmap (1D)')
-          with open("heatmap.png","rb") as f:
-              r = requests.post(
-                  f"https://api.telegram.org/bot{bot}/sendPhoto",
-                  data={"chat_id": chat, "caption": caption, "parse_mode":"HTML"},
-                  files={"photo": ("heatmap.png", f, "image/png")},
-                  timeout=120
-              )
-              print(r.status_code, r.text)
-              r.raise_for_status()
-          PY
-
+          CAPTION="$(cat caption.txt)"
+          curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendPhoto" \
+            -F chat_id="${CHAT_ID}" \
+            -F caption="$CAPTION" \
+            -F parse_mode="Markdown" \
+            -F photo="@heatmap.png"
