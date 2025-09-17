@@ -251,10 +251,10 @@ jobs:
           if [ "$DOW" -eq 1 ]; then
             A=$(date -d "monday this week" +%Y-%m-%d)
             B=$(date -d "sunday this week" +%Y-%m-%d)
-            echo "CAPTION=🗓️ Calendario USA (⭐️⭐️/⭐️⭐️⭐️) — Semana ${A}–${B} · TZ Europe/Madrid · Fuente: Investing" >> $GITHUB_ENV
+            echo "CAPTION=🗓️ Calendario USA (⭐️⭐️/⭐️⭐️⭐️) — Semana ${A}–${B}" >> $GITHUB_ENV
           else
             HOY=$(date +%Y-%m-%d)
-            echo "CAPTION=🗓️ Calendario USA (⭐️⭐️/⭐️⭐️⭐️) — Hoy ${HOY} · TZ Europe/Madrid · Fuente: Investing" >> $GITHUB_ENV
+            echo "CAPTION=🗓️ Calendario USA (⭐️⭐️/⭐️⭐️⭐️) — Hoy ${HOY}" >> $GITHUB_ENV
           fi
 
       # ---------- Enviar a Telegram ----------
