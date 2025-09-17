@@ -1,17 +1,17 @@
-name: InvestX Economic Calendar
+name: InvestX Market Close
 
 on:
   schedule:
-    - cron: "0 11 * * 1"   # Lunes 13:00 Madrid (11:00 UTC) — semana completa
-    - cron: "0 11 * * 2-5" # Mar–Vie 13:00 Madrid (11:00 UTC) — solo hoy
+    - cron: "0 21 * * 1-5"   # 23:00 Madrid (21:00 UTC), L–V
   workflow_dispatch:
 
 jobs:
-  econ-calendar:
+  market-close:
     runs-on: ubuntu-22.04
 
     steps:
-      - name: Set up job
+      # ---------- Dependencias del sistema ----------
+      - name: Install system deps
         run: |
           set -e
           sudo apt-get update -y
@@ -19,261 +19,264 @@ jobs:
             jq curl unzip python3 python3-pip \
             libatk1.0-0 libatk-bridge2.0-0 libnss3 libx11-6 libx11-xcb1 \
             libxcomposite1 libxdamage1 libxext6 libxfixes3 libxrandr2 \
-            libgbm1 libasound2 fonts-liberation
+            libgbm1 libasound2 fonts-liberation ca-certificates
 
-      # ---------- Dependencias del sistema ----------
-      - name: Set up job
-        run: |
-          sudo apt-get update -y
-          sudo apt-get install -y \
-            jq curl unzip python3 python3-pip \
-            libatk1.0-0 libatk-bridge2.0-0 libnss3 libx11-6 libx11-xcb1 \
-            libxcomposite1 libxdamage1 libxext6 libxfixes3 libxrandr2 \
-            libgbm1 libasound2 fonts-liberation
-
-      - name: Install pup & Python deps
-        run: |
-          curl -sL https://github.com/ericchiang/pup/releases/download/v0.4.0/pup_v0.4.0_linux_amd64.zip -o pup.zip
-          sudo unzip -o pup.zip -d /usr/local/bin/
-          pip3 install --upgrade pip requests
-
-      # ---------- Node/Puppeteer ----------
+      # ---------- Node / Puppeteer ----------
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
           node-version: '20'
 
       - name: Install Puppeteer
-        run: npm install puppeteer
+        run: npm i puppeteer@22
 
-      # ---------- Script principal ----------
-      - name: Build grab script (aplica Filtros UI + fallback DOM)
+      # ---------- Captura del heatmap ----------
+      - name: Build screenshot script
         run: |
-          cat > grab.js <<'EOF'
+          cat > screenshot.js <<'EOF'
           const puppeteer = require('puppeteer');
-          const sleep = (ms) => new Promise(r => setTimeout(r, ms));
-          const log = (...a)=>console.log('[grab]', ...a);
+          const sleep = ms => new Promise(r=>setTimeout(r,ms));
 
-          async function clickByText(page, selector, labels, timeoutMs = 8000) {
-            const until = Date.now() + timeoutMs;
-            const wants = labels.map(t => t.toLowerCase());
-            while (Date.now() < until) {
-              const clicked = await page.evaluate(({selector, wants}) => {
-                for (const el of document.querySelectorAll(selector)) {
-                  const txt = ((el.innerText || el.textContent || el.value || '')+'').toLowerCase().trim();
-                  if (wants.some(w => txt.includes(w))) { el.click(); return true; }
-                }
-                return false;
-              }, {selector, wants});
-              if (clicked) return true;
-              await sleep(250);
+          async function waitForCanvasReady(page, timeoutMs=70000) {
+            const t0 = Date.now();
+            while (Date.now()-t0 < timeoutMs) {
+              const ok = await page.evaluate(() => {
+                const cs = Array.from(document.querySelectorAll('canvas'));
+                if (!cs.length) return false;
+                const big = cs.map(c=>({w:c.width,h:c.height,bb:c.getBoundingClientRect()}))
+                              .sort((a,b)=>b.w*b.h-a.w*a.h)[0];
+                return big && big.w>=800 && big.h>=500;
+              });
+              if (ok) return true;
+              await sleep(500);
             }
             return false;
-          }
-
-          async function forceLoadRows(page, passes = 3) {
-            for (let i=0;i<30;i++) {
-              const rows = await page.$$eval('tr[id^="eventRowId_"], tr.js-event-item, tr[data-event-datetime]', els => els.length);
-              if (rows >= 10) break;
-              await sleep(300);
-            }
-            for (let s=0; s<passes; s++) {
-              await page.evaluate(() => window.scrollBy(0, window.innerHeight*2));
-              await sleep(800);
-            }
-            await page.evaluate(() => window.scrollTo(0, 0));
-            await sleep(500);
-          }
-
-          async function applyNativeFilters(page) {
-            // Abrir "Filtros"
-            log('Open Filters popup');
-            const opened = await clickByText(page, 'button,a,[role="button"],input[type="button"]', ['filtro','filtros','filters'], 8000);
-            if (!opened) { log('Filters button not found'); return false; }
-
-            await sleep(800);
-
-            // Dentro del popup, desmarcar todos los países y marcar solo EE.UU.
-            const ok = await page.evaluate(() => {
-              const modal = document.querySelector('.filterPopup, .ecFilterPop, .economicCalendarFilterPopup, .ecEconomicFilterPopup, .ecCalFilterPop, [class*="filterPop"]') || document;
-              // Países
-              const allCountries = modal.querySelectorAll('input[type="checkbox"][name*="country"]');
-              allCountries.forEach(cb => { cb.checked = false; cb.dispatchEvent(new Event('change', {bubbles:true})); });
-              // EE.UU. = value "5" casi siempre; si no, por texto
-              let us = Array.from(allCountries).find(cb => cb.value === '5');
-              if (!us) {
-                us = Array.from(allCountries).find(cb => {
-                  const li = cb.closest('label, li, div');
-                  const txt = (li?.innerText || '').toLowerCase();
-                  return /estados unidos|united states|ee\.uu/.test(txt);
-                });
-              }
-              if (us) { us.checked = true; us.dispatchEvent(new Event('change', {bubbles:true})); } else { return false; }
-
-              // Importancia (2 y 3 estrellas)
-              const imp = modal.querySelectorAll('input[type="checkbox"][name*="importance"]');
-              let found = 0;
-              imp.forEach(cb => {
-                if (cb.value === '2' || cb.value === '3') { cb.checked = true; found++; }
-                else { cb.checked = false; }
-                cb.dispatchEvent(new Event('change', {bubbles:true}));
-              });
-
-              // Aplicar / Mostrar
-              const btn = Array.from(modal.querySelectorAll('button,a,input[type="submit"],input[type="button"]'))
-                .find(b => /aplicar|apply|mostrar|show/i.test((b.innerText||b.value||'')+''));
-              btn?.click();
-              return !!us && found >= 2;
-            });
-
-            if (!ok) { log('Could not programmatically set filters'); return false; }
-
-            // Esperar a que la tabla refresque algo
-            await sleep(1500);
-            return true;
           }
 
           (async () => {
             const browser = await puppeteer.launch({
               headless: 'new',
-              args: [
-                '--no-sandbox','--disable-setuid-sandbox',
-                '--lang=es-ES,es',
-                '--disable-dev-shm-usage'
-              ]
+              args: ['--no-sandbox','--disable-setuid-sandbox','--disable-dev-shm-usage','--lang=es-ES,es']
             });
             const page = await browser.newPage();
-            await page.setUserAgent('Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36');
-            await page.setExtraHTTPHeaders({ 'Accept-Language': 'es-ES,es;q=0.9' });
-            await page.setViewport({ width: 1440, height: 2400, deviceScaleFactor: 2 });
-            try { await page.emulateTimezone('Europe/Madrid'); } catch(e) {}
+            await page.setViewport({ width: 1600, height: 1200, deviceScaleFactor: 2 });
+            await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36');
 
-            const url = 'https://es.investing.com/economic-calendar/';
-            log('Go to', url);
-            await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
-
-            // Cookies
-            await page.evaluate(() => {
-              const btn = [...document.querySelectorAll("button,a,[role='button']")]
-                .find(b => /aceptar|accept|consent|agree/i.test((b.innerText||'')+''));
-              btn?.click();
-            }).catch(()=>{});
-            await sleep(800);
-
-            // Lunes: "Esta semana"; resto: "Hoy"
-            const dow = new Date().getDay();
-            if (dow === 1) { await clickByText(page, 'a,button', ['esta semana','this week'], 6000); }
-            else { await clickByText(page, 'a,button', ['hoy','today'], 6000); }
-            await sleep(600);
-
-            // Aplicar filtros nativos
-            const nativeOK = await applyNativeFilters(page);
-            await forceLoadRows(page, 4);
-
-            // Fallback de filtrado en el DOM (por si la UI no filtró bien)
-            const rowsSelector = 'tr[id^="eventRowId_"], tr.js-event-item, tr[data-event-datetime]';
-            const visibleCount = await page.evaluate((selector) => {
-              const isUSRow = (tr) => {
-                const c = tr.getAttribute('data-country') || tr.dataset?.country || '';
-                if (c === '5') return true;
-                const flagSpan = tr.querySelector('td.flagCur span, .flagCur span, [class*="flag"] span');
-                const flagClass = (flagSpan?.className || '').toLowerCase();
-                const flagTitle = (flagSpan?.getAttribute('title') || '').toLowerCase();
-                if (/usa|united\s*states/.test(flagClass) || /estados unidos|united states/.test(flagTitle)) return true;
-                const curCell = tr.querySelector('td.cur, td.currency, td:nth-child(2)');
-                const curTxt = (curCell?.innerText || '').trim().toUpperCase();
-                if (curTxt === 'USD') return true;
-                return false;
-              };
-              const has2or3Stars = (tr) => {
-                const imp = tr.getAttribute('data-importance') || tr.dataset?.importance || '';
-                if (imp === '2' || imp === '3') return true;
-                const senti = tr.querySelector('td.sentiment, td.impact, .sentiment');
-                if (!senti) return false;
-                const iTags = senti.querySelectorAll('i, svg').length;
-                return iTags >= 2;
-              };
-
-              for (const sel of [
-                '#topBarAndAds','.midHeader','#banner','.stickyFooter','.js-consent-banner',
-                'iframe','.adsbygoogle','.advertisement'
-              ]) document.querySelectorAll(sel).forEach(e => e.remove());
-
-              const rows = Array.from(document.querySelectorAll(selector));
-              let kept = 0;
-              rows.forEach(tr => {
-                const keep = isUSRow(tr) && has2or3Stars(tr);
-                if (!keep) tr.style.display = 'none'; else kept++;
-              });
-
-              // Cabeceras con hijos visibles
-              const dayHeaders = Array.from(document.querySelectorAll('tr.theDay, tr.newDay, tr.dayHeader'));
-              const isVisibleEvent = (el) => el.matches(selector) && el.style.display !== 'none';
-              for (const hdr of dayHeaders) {
-                let has = false;
-                for (let sib = hdr.nextElementSibling; sib; sib = sib.nextElementSibling) {
-                  if (sib.matches('tr.theDay, tr.newDay, tr.dayHeader')) break;
-                  if (isVisibleEvent(sib)) { has = true; break; }
-                }
-                if (!has) hdr.style.display = 'none';
-              }
-              return kept;
-            }, rowsSelector);
-
-            log('Native filters applied:', nativeOK, '| Visible after fallback:', visibleCount);
-
-            // Captura
-            const table = await page.$('#economicCalendarData') || await page.$('table.genTbl') || await page.$('table');
-            await page.evaluate(() => window.scrollTo(0, 0));
-            await sleep(500);
-            if (table) await table.screenshot({ path: 'calendar.png' });
-            else await page.screenshot({ path: 'calendar.png', fullPage: true });
-
-            if (!visibleCount || visibleCount === 0) {
-              log('No visible events after filtering. Failing to avoid empty post.');
-              await browser.close(); process.exit(2);
+            const url = 'https://finviz.com/map.ashx?t=sec&st=d1';
+            let ready=false, tries=0;
+            while(!ready && tries<3){
+              tries++;
+              await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 }).catch(()=>{});
+              await page.evaluate(()=>{
+                const b=[...document.querySelectorAll('button,a')].find(x=>/accept|agree|consent|aceptar/i.test((x.innerText||'')+''));
+                b?.click();
+              }).catch(()=>{});
+              ready = await waitForCanvasReady(page, 70000);
+              if(!ready) await sleep(2000);
             }
 
-            log('✅ Captura filtrada generada: calendar.png');
+            const clip = await page.evaluate(() => {
+              const cs = Array.from(document.querySelectorAll('canvas'));
+              const big = cs.map(c=>{
+                const r=c.getBoundingClientRect();
+                return {x:Math.max(0,r.x),y:Math.max(0,r.y),w:r.width,h:r.height,area:r.width*r.height};
+              }).filter(b=>b.area>120000);
+              if(!big.length) return null;
+              const x0=Math.floor(Math.min(...big.map(b=>b.x)));
+              const y0=Math.floor(Math.min(...big.map(b=>b.y)))-60;
+              const x1=Math.ceil(Math.max(...big.map(b=>b.x+b.w)));
+              const y1=Math.ceil(Math.max(...big.map(b=>b.y+b.h)))+40;
+              return {x:Math.max(0,x0), y:Math.max(0,y0), width:x1-x0, height:y1-y0};
+            });
+
+            if(clip && clip.width>0 && clip.height>0) {
+              await page.screenshot({ path: 'heatmap.png', clip });
+            } else {
+              await page.screenshot({ path: 'heatmap.png', fullPage: true });
+            }
             await browser.close();
-          })().catch(err => { console.error(err); process.exit(1); });
+          })().catch(e=>{console.error(e); process.exit(0);});
           EOF
 
-      # ---------- Ejecutar scraper ----------
-      - name: Run grabber
-        run: node grab.js
+      - name: Run screenshot
+        run: node screenshot.js
 
-      # ---------- Construir caption ----------
-      - name: Build caption (ES/Madrid)
+      # ---------- Resumen + Opinión → summary.json ----------
+      - name: Build summary script (JSON output)
         run: |
-          export TZ=Europe/Madrid
-          DOW=$(date +%u)
-          if [ "$DOW" -eq 1 ]; then
-            A=$(date -d "monday this week" +%Y-%m-%d)
-            B=$(date -d "sunday this week" +%Y-%m-%d)
-            echo "CAPTION=🗓️ Calendario USA (⭐️⭐️/⭐️⭐️⭐️) — Semana ${A}–${B}" >> $GITHUB_ENV
-          else
-            HOY=$(date +%Y-%m-%d)
-            echo "CAPTION=🗓️ Calendario USA (⭐️⭐️/⭐️⭐️⭐️) — Hoy ${HOY}" >> $GITHUB_ENV
-          fi
+          cat > summary.js <<'EOF'
+          const puppeteer = require('puppeteer');
+          const fs = require('fs');
+
+          const UA='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36';
+
+          const sleep = (ms)=>new Promise(r=>setTimeout(r,ms));
+          async function retry(n, fn){
+            let last; for(let i=0;i<n;i++){ try{ return await fn(); } catch(e){ last=e; await sleep(700);} }
+            throw last||new Error('retry failed');
+          }
+
+          // ---------- Índices robustos (Stooq) ----------
+          async function stooqPct(symbol){
+            const urlDaily=`https://stooq.com/q/d/l/?s=${symbol}&i=d`;
+            const res = await fetch(urlDaily);
+            if(!res.ok) throw new Error('stooq fail');
+            const txt = await res.text();
+            const lines = txt.trim().split('\n');
+            if(lines.length<3) throw new Error('not enough rows');
+            const last2 = lines.slice(-2).map(l=>parseFloat(l.split(',')[4]));
+            const [prev, close]=last2;
+            if(!prev || !close) throw new Error('parse');
+            return ((close-prev)/prev)*100;
+          }
+
+          async function grabSectors(page){
+            const url='https://finviz.com/groups.ashx?g=sector&v=210';
+            await page.goto(url, {waitUntil:'domcontentloaded', timeout:60000});
+            await page.waitForSelector('table.table-light', {timeout:15000});
+            return await page.evaluate(() => {
+              const rows = [...document.querySelectorAll('table.table-light tr')].slice(1);
+              const data = rows.map(r=>{
+                const tds=[...r.querySelectorAll('td')].map(td=>td.innerText.trim());
+                // Esperado: Rank | Name | Perf Today | Perf W | ...
+                const name = tds[1];
+                const pct = parseFloat((tds[2]||'0').replace('%','').replace(',','.'));
+                return name ? {name, pct: isNaN(pct)?0:pct} : null;
+              }).filter(Boolean);
+              const top = [...data].sort((a,b)=>b.pct-a.pct).slice(0,2);
+              const worst = [...data].sort((a,b)=>a.pct-b.pct).slice(0,2);
+              return {top, worst};
+            });
+          }
+
+          async function grabMovers(page, order){
+            const o = order==='desc' ? '-change' : 'change';
+            const url = `https://finviz.com/screener.ashx?v=111&f=idx_sp500&o=${o}`;
+            await page.goto(url, {waitUntil:'domcontentloaded', timeout:60000});
+            await page.waitForSelector('table.table-light', {timeout:15000});
+            return await page.evaluate(() => {
+              const rows = [...document.querySelectorAll('table.table-light tr')].slice(1,6);
+              const out = [];
+              for(const r of rows){
+                const tds=[...r.querySelectorAll('td')].map(td=>td.innerText.trim());
+                const ticker = tds[1] || '';
+                // en v=111, cambio porcentual suele ir en la col "Change" cerca del final
+                const ch = (tds.find(x=>x.endsWith('%'))||'').replace(/\s+/g,'');
+                if(ticker) out.push({t:ticker, ch});
+                if(out.length===3) break;
+              }
+              return out;
+            });
+          }
+
+          async function grabHeadline(page){
+            const url = 'https://finviz.com/news.ashx';
+            await page.goto(url, {waitUntil:'domcontentloaded', timeout:60000});
+            const ok = await page.$('.news-item-row');
+            if(!ok) return '';
+            return await page.evaluate(() => {
+              const row = document.querySelector('.news-item-row');
+              const a = row?.querySelector('a');
+              const src = row?.querySelector('.news-source')?.innerText || '';
+              return a ? `${a.innerText} — ${src}` : '';
+            });
+          }
+
+          (async () => {
+            const browser = await puppeteer.launch({ headless:'new', args:['--no-sandbox','--disable-setuid-sandbox'] });
+            const page = await browser.newPage();
+            await page.setUserAgent(UA);
+
+            // Índices (SPY/QQQ/DIA aproximan al índice; usamos Stooq por fiabilidad)
+            const [sp,nq,dj] = await Promise.all([
+              retry(3, ()=>stooqPct('spy.us')),
+              retry(3, ()=>stooqPct('qqq.us')),
+              retry(3, ()=>stooqPct('dia.us'))
+            ]).catch(()=>[null,null,null]);
+
+            let sectors=null, winners=[], losers=[], headline='';
+            try { sectors = await retry(3, ()=>grabSectors(page)); } catch(e) { sectors=null; }
+            try { winners = await retry(3, ()=>grabMovers(page,'desc')); } catch(e) { winners=[]; }
+            try { losers  = await retry(3, ()=>grabMovers(page,'asc'));  } catch(e) { losers=[]; }
+            try { headline = await retry(2, ()=>grabHeadline(page));     } catch(e) { headline=''; }
+
+            await browser.close();
+
+            // Opinión simple
+            let opinion = 'Sesión mixta.';
+            if([sp,nq,dj].every(x=>typeof x==='number' && x<0)) opinion='Sesgo risk-off, índices en rojo.';
+            else if(sectors?.worst?.some(s=>/tech/i.test(s.name))) opinion='Debilidad en tecnología, cierta rotación defensiva.';
+            else if((sp??0)>0 && (nq??0)>0) opinion='Empuje alcista liderado por growth.';
+
+            const d = new Date().toLocaleDateString('es-ES',{timeZone:'Europe/Madrid'});
+            const fmt = v => (typeof v === 'number') ? `${v.toFixed(2)}%` : '—';
+            const secStr = arr => (arr||[]).map(s=>`${s.name} ${s.pct.toFixed(2)}%`).join(', ') || '—';
+            const movStr = arr => (arr||[]).map(x=>`${x.t} ${x.ch}`).join(', ') || '—';
+
+            const payload = {
+              date: d,
+              sp: fmt(sp), nq: fmt(nq), dj: fmt(dj),
+              secBest: secStr(sectors?.top),
+              secWorst: secStr(sectors?.worst),
+              winners: movStr(winners),
+              losers: movStr(losers),
+              headline: headline || '',
+              opinion
+            };
+            fs.writeFileSync('summary.json', JSON.stringify(payload), 'utf8');
+          })();
+          EOF
+
+      - name: Run summary (creates summary.json)
+        run: node summary.js
+
+      # ---------- Construir caption fuera de JS (HTML seguro) ----------
+      - name: Build caption.txt
+        run: |
+          DATE=$(jq -r '.date' summary.json)
+          SP=$(jq -r '.sp' summary.json)
+          NQ=$(jq -r '.nq' summary.json)
+          DJ=$(jq -r '.dj' summary.json)
+          SEC_BEST=$(jq -r '.secBest' summary.json)
+          SEC_WORST=$(jq -r '.secWorst' summary.json)
+          WINNERS=$(jq -r '.winners' summary.json)
+          LOSERS=$(jq -r '.losers' summary.json)
+          OPINION=$(jq -r '.opinion' summary.json)
+          HEADLINE=$(jq -r '.headline' summary.json)
+
+          esc() { sed 's/&/&amp;/g; s/</\&lt;/g; s/>/\&gt;/g'; }
+
+          {
+            echo "<b>📊 Cierre de mercado — ${DATE}</b>"
+            echo "• S&amp;P500: ${SP} | Nasdaq: ${NQ} | Dow: ${DJ}"
+            echo "• <b>Sectores destacados:</b> $(printf '%s' "${SEC_BEST}" | esc)"
+            echo "• <b>Peores sectores:</b> $(printf '%s' "${SEC_WORST}" | esc)"
+            echo "• <b>Top ganadores (S&amp;P500):</b> $(printf '%s' "${WINNERS}" | esc)"
+            echo "• <b>Top perdedores (S&amp;P500):</b> $(printf '%s' "${LOSERS}" | esc)"
+            echo ""
+            echo "💡 <i>Opinión:</i> $(printf '%s' "${OPINION}" | esc)"
+            if [ -n "${HEADLINE}" ] && [ "${HEADLINE}" != "null" ]; then
+              echo "🗞️ $(printf '%s' "${HEADLINE}" | esc)"
+            fi
+          } > caption.txt
 
       # ---------- Enviar a Telegram ----------
-      - name: Send to Telegram (Python)
+      - name: Send to Telegram
         env:
           BOT_TOKEN: ${{ secrets.INVESTX_TOKEN }}
           CHAT_ID: ${{ secrets.CHAT_ID }}
-          CAPTION: ${{ env.CAPTION }}
         run: |
           python3 - <<'PY'
           import os, requests
-          bot = os.environ['BOT_TOKEN']; chat = os.environ['CHAT_ID']
-          caption = os.environ.get('CAPTION','Calendario USA')
-          with open("calendar.png","rb") as f:
+          bot = os.environ['BOT_TOKEN']
+          chat = os.environ['CHAT_ID']
+          with open("caption.txt","r", encoding="utf-8") as f: caption=f.read()
+          with open("heatmap.png","rb") as f:
               r = requests.post(
                   f"https://api.telegram.org/bot{bot}/sendPhoto",
                   data={"chat_id": chat, "caption": caption, "parse_mode":"HTML"},
-                  files={"photo": ("calendar.png", f, "image/png")},
-                  timeout=90
+                  files={"photo": ("heatmap.png", f, "image/png")},
+                  timeout=120
               )
               print(r.status_code, r.text)
               r.raise_for_status()
