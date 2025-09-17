@@ -10,6 +10,7 @@ jobs:
     runs-on: ubuntu-22.04
 
     steps:
+      # ---------- Dependencias del sistema ----------
       - name: Install system deps
         run: |
           set -e
@@ -20,6 +21,7 @@ jobs:
             libxcomposite1 libxdamage1 libxext6 libxfixes3 libxrandr2 \
             libgbm1 libasound2 fonts-liberation
 
+      # ---------- Node / Puppeteer ----------
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
@@ -28,7 +30,7 @@ jobs:
       - name: Install Puppeteer
         run: npm i puppeteer@22
 
-      # --------- screenshot.js ---------
+      # ---------- Captura del heatmap ----------
       - name: Build screenshot script
         run: |
           cat > screenshot.js <<'EOF'
@@ -99,8 +101,8 @@ jobs:
       - name: Run screenshot
         run: node screenshot.js
 
-      # --------- summary.js ---------
-      - name: Build summary script
+      # ---------- Resumen + Opinión → summary.json ----------
+      - name: Build summary script (JSON output)
         run: |
           cat > summary.js <<'EOF'
           const puppeteer = require('puppeteer');
@@ -163,7 +165,6 @@ jobs:
               grabChange(page,'QQQ'),
               grabChange(page,'DIA')
             ]);
-
             const sectors = await grabSectors(page).catch(()=>null);
             const winners = await grabMovers(page,'desc').catch(()=>[]);
             const losers  = await grabMovers(page,'asc').catch(()=>[]);
@@ -172,31 +173,62 @@ jobs:
             await browser.close();
 
             let opinion = 'Sesión mixta.';
-            if([sp,nq,dj].every(x=>x<0)) opinion='Sesgo risk-off, todos en rojo.';
+            if([sp,nq,dj].every(x=>typeof x==='number' && x<0)) opinion='Sesgo risk-off, todos en rojo.';
             else if(sectors?.worst?.some(s=>/tech/i.test(s.name))) opinion='Debilidad en tecnología, rotación defensiva.';
             else if((sp??0)>0 && (nq??0)>0) opinion='Impulso alcista liderado por growth.';
 
             const d = new Date().toLocaleDateString('es-ES',{timeZone:'Europe/Madrid'});
 
-            const caption = `
-📊 **Cierre de mercado — ${d}**
-• S&P500: ${sp?.toFixed(2) ?? 'N/A'}% | Nasdaq: ${nq?.toFixed(2) ?? 'N/A'}% | Dow: ${dj?.toFixed(2) ?? 'N/A'}%
-• Sectores destacados: ${ (sectors?.top || []).map(s => `${s.name} ${s.pct}%`).join(', ') || '—' }
-• Peores sectores: ${ (sectors?.worst || []).map(s => `${s.name} ${s.pct}%`).join(', ') || '—' }
-• Top ganadores (S&P500): ${ winners.map(x => `${x.t} ${x.ch}`).join(', ') || '—' }
-• Top perdedores (S&P500): ${ losers.map(x => `${x.t} ${x.ch}`).join(', ') || '—' }
+            const fmt = v => (typeof v === 'number') ? v.toFixed(2) + '%' : 'N/A';
+            const secStr = arr => (arr||[]).map(s=>`${s.name} ${s.pct}%`).join(', ') || '—';
+            const movStr = arr => (arr||[]).map(x=>`${x.t} ${x.ch}`).join(', ') || '—';
 
-💡 *Opinión*: ${opinion}
-${ headline ? `🗞️ Noticia: ${headline}` : '' }
-`.trim();
-
-            fs.writeFileSync('caption.txt', caption, 'utf8');
+            const payload = {
+              date: d,
+              sp: fmt(sp), nq: fmt(nq), dj: fmt(dj),
+              secBest: secStr(sectors?.top),
+              secWorst: secStr(sectors?.worst),
+              winners: movStr(winners),
+              losers: movStr(losers),
+              headline: headline || '',
+              opinion
+            };
+            fs.writeFileSync('summary.json', JSON.stringify(payload), 'utf8');
           })();
           EOF
 
-      - name: Run summary
+      - name: Run summary (creates summary.json)
         run: node summary.js
 
+      # ---------- Construir caption fuera de JS (evita errores YAML) ----------
+      - name: Build caption.txt
+        run: |
+          DATE=$(jq -r '.date' summary.json)
+          SP=$(jq -r '.sp' summary.json)
+          NQ=$(jq -r '.nq' summary.json)
+          DJ=$(jq -r '.dj' summary.json)
+          SEC_BEST=$(jq -r '.secBest' summary.json)
+          SEC_WORST=$(jq -r '.secWorst' summary.json)
+          WINNERS=$(jq -r '.winners' summary.json)
+          LOSERS=$(jq -r '.losers' summary.json)
+          OPINION=$(jq -r '.opinion' summary.json)
+          HEADLINE=$(jq -r '.headline' summary.json)
+
+          {
+            echo "📊 **Cierre de mercado — ${DATE}**"
+            echo "• S&P500: ${SP} | Nasdaq: ${NQ} | Dow: ${DJ}"
+            echo "• Sectores destacados: ${SEC_BEST}"
+            echo "• Peores sectores: ${SEC_WORST}"
+            echo "• Top ganadores (S&P500): ${WINNERS}"
+            echo "• Top perdedores (S&P500): ${LOSERS}"
+            echo
+            echo "💡 *Opinión*: ${OPINION}"
+            if [ -n "${HEADLINE}" ] && [ "${HEADLINE}" != "null" ]; then
+              echo "🗞️ Noticia: ${HEADLINE}"
+            fi
+          } > caption.txt
+
+      # ---------- Enviar a Telegram ----------
       - name: Send to Telegram
         env:
           BOT_TOKEN: ${{ secrets.INVESTX_TOKEN }}
