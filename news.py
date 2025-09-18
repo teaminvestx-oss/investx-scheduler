@@ -240,7 +240,7 @@ def main():
     items = fetch_items()
     now_local = datetime.now(LOCAL_TZ)
     header = f"🗞️ <b>Noticias clave — {fecha_es(now_local)}</b>\n"
-    header += "⭐ Leyenda impacto: ⭐⭐⭐ Alta · ⭐⭐ Media · ⭐ Baja\n\n"
+   
 
     if not items:
         send_message(header + "• No hay titulares destacados en la ventana seleccionada.")
@@ -256,8 +256,7 @@ def main():
         stars    = rating_stars(i, total)
         lines.append(build_bullet(stars, title_es, ts_local, link, fuente, desc_es))
 
-    # Cierre visual
-    footer = "\n\n— <b>InvestX</b> | Selección automática por relevancia y recencia"
+   
 
     # Control de tamaño
     text = header + "\n".join(lines) + footer
