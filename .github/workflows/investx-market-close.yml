@@ -71,7 +71,7 @@ jobs:
               tries++;
               await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 }).catch(()=>{});
               await page.evaluate(()=>{
-                const b=[...document.querySelectorAll('button,a')].find(x=>/accept|agree|consent|aceptar/i.test((x.innerText||'')+''));
+                const b=[...document.querySelectorAll('button,a')].find(x=>/accept|agree|consent|aceptar/i.test((x.innerText||'')));
                 b?.click();
               }).catch(()=>{});
               ready = await waitForCanvasReady(page, 70000);
@@ -104,36 +104,26 @@ jobs:
       - name: Run screenshot
         run: node screenshot.js
 
-      # ---------- Resumen + Opinión (Puppeteer + Fallbacks Stooq) ----------
+      # ---------- Resumen + Opinión ----------
       - name: Build summary (summary.json)
         env:
           UA: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
         run: |
           set -e
-
-          # funciones bash
-          retry() { local n=0; local max=$1; shift; until "$@"; do n=$((n+1)); [ $n -ge $max ] && return 1; sleep 2; done; }
-
-          # JS con lógica completa (scrape + fallbacks + opinión)
           cat > summary.js <<'JS'
           const puppeteer = require('puppeteer');
           const fs = require('fs');
-
-          const UA='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36';
-          const REF='https://finviz.com/';
-          const sleep = ms => new Promise(r=>setTimeout(r,ms));
           const fetchTxt = async url => (await fetch(url)).text();
 
-          async function stooqPct(symbol){ // devuelve % día
+          // ---- Utils ----
+          async function stooqPct(symbol){
             const url=`https://stooq.com/q/d/l/?s=${symbol}&i=d`;
             const txt = await fetchTxt(url);
             const lines = txt.trim().split('\n');
             if(lines.length<3) throw new Error('stooq rows');
             const [prev, close] = lines.slice(-2).map(l=>parseFloat(l.split(',')[4]));
-            if(!prev || !close) throw new Error('stooq parse');
             return ((close-prev)/prev)*100;
           }
-
           const sectorETFs = [
             {name:'Technology', sym:'xlk.us'},
             {name:'Communication Services', sym:'xlc.us'},
@@ -147,58 +137,8 @@ jobs:
             {name:'Real Estate', sym:'xlre.us'},
             {name:'Utilities', sym:'xlu.us'},
           ];
-
-          const heavySPX = [
-            'AAPL','MSFT','NVDA','AMZN','GOOGL','META','AVGO','BRK-B','TSLA','XOM',
-            'LLY','JPM','UNH','V','JNJ','GOOG','PG','MA','HD','COST','ABBV','BAC',
-            'WMT','CVX','MRK','PEP','KO','NFLX','ADBE','CRM'
-          ];
-
-          const mapStooq = t => {
-            let s = t.toLowerCase();
-            s = s.replace(/[\s]/g,'');
-            s = s.replace('brk-b','brk-b');
-            return `${s}.us`;
-          };
-
-          async function finvizSectors(page){
-            const url='https://finviz.com/groups.ashx?g=sector&v=210';
-            await page.goto(url,{waitUntil:'domcontentloaded',timeout:60000});
-            await page.evaluate(()=>{
-              const b=[...document.querySelectorAll('button,a')].find(x=>/accept|agree|consent|aceptar/i.test((x.innerText||'')));
-              b?.click();
-            }).catch(()=>{});
-            await page.waitForSelector('table.table-light', {timeout:15000});
-            const data = await page.$$eval('table.table-light tr', rows => {
-              const out=[];
-              for(const r of rows.slice(1)){
-                const tds=[...r.querySelectorAll('td')].map(td=>td.innerText.trim());
-                const name=tds[1]; const today=parseFloat((tds[2]||'0').replace(',','.').replace('%',''));
-                if(name) out.push({name,pct:isNaN(today)?0:today});
-              }
-              const top=[...out].sort((a,b)=>b.pct-a.pct).slice(0,3);
-              const low=[...out].sort((a,b)=>a.pct-b.pct).slice(0,3);
-              return {top, low};
-            });
-            return data;
-          }
-
-          async function finvizMovers(page, order){
-            const o = order==='gainers' ? '-change' : 'change';
-            const url=`https://finviz.com/screener.ashx?v=111&f=idx_sp500&o=${o}`;
-            await page.goto(url,{waitUntil:'domcontentloaded',timeout:60000});
-            await page.waitForSelector('table.table-light', {timeout:15000});
-            const list = await page.$$eval('table.table-light tr', rows => {
-              const out=[];
-              for(const r of rows.slice(1)){
-                const t = r.querySelector('a.screener-link-primary')?.innerText?.trim();
-                const perc = [...r.querySelectorAll('td')].map(td=>td.innerText.trim()).filter(x=>/%$/.test(x)).pop();
-                if(t && perc){ out.push(`${t} ${perc}`); if(out.length===3) break; }
-              }
-              return out;
-            });
-            return list;
-          }
+          const heavySPX = ['AAPL','MSFT','NVDA','AMZN','GOOGL','META','AVGO','BRK-B','TSLA','XOM','LLY','JPM','UNH','V','JNJ','GOOG','PG','MA','HD','COST','ABBV','BAC','WMT','CVX','MRK','PEP','KO','NFLX','ADBE','CRM'];
+          const mapStooq = t => `${t.toLowerCase()}.us`.replace('brk-b','brk-b');
 
           async function fallbackSectors(){
             const vals = await Promise.allSettled(sectorETFs.map(async s=>{
@@ -209,11 +149,9 @@ jobs:
             const low=[...data].sort((a,b)=>a.pct-b.pct).slice(0,3);
             return {top, low};
           }
-
           async function fallbackMovers(){
             const vals = await Promise.allSettled(heavySPX.map(async t=>{
-              const sym = mapStooq(t);
-              const pct = await stooqPct(sym);
+              const pct = await stooqPct(mapStooq(t));
               return {t, pct};
             }));
             const arr = vals.filter(v=>v.status==='fulfilled').map(v=>v.value);
@@ -221,100 +159,68 @@ jobs:
             const loss = [...arr].sort((a,b)=>a.pct-b.pct).slice(0,3).map(x=>`${x.t} ${x.pct.toFixed(2)}%`);
             return {gain, loss};
           }
-
           async function headline(){
             try{
-              const txt = await fetchTxt('https://finviz.com/news.ashx');
-              const m = txt.match(/<a[^>]*>([^<]+)<\/a>[\s\S]*?news-source[^>]*>([^<]+)</i);
-              if(m) return `${m[1]} — ${m[2]}`;
-            }catch(_){}
-            try{
-              const rss = await fetchTxt('https://feeds.reuters.com/reuters/businessNews');
-              const m = rss.match(/<title>([^<]+)<\/title>[\s\S]*?<description>([^<]+)<\/description>/i);
+              const txt = await fetchTxt('https://feeds.reuters.com/reuters/businessNews');
+              const m = txt.match(/<title>([^<]+)<\/title>/i);
               if(m) return `${m[1]} — Reuters`;
             }catch(_){}
             return '';
           }
 
-          (async () => {
-            // Índices (ETFs)
-            let sp=null,nq=null,dj=null;
-            try {
-              [sp,nq,dj] = await Promise.all([
-                stooqPct('spy.us'),
-                stooqPct('qqq.us'),
-                stooqPct('dia.us')
-              ]);
-            } catch(e){ sp=nq=dj=null; }
-
-            // Intento Finviz con Puppeteer
-            let sectors=null, winners=[], losers=[];
-            try{
-              const browser = await puppeteer.launch({headless:'new', args:['--no-sandbox','--disable-setuid-sandbox']});
-              const page = await browser.newPage();
-              await page.setUserAgent(UA);
-              await page.setExtraHTTPHeaders({ 'Referer': REF, 'Accept-Language': 'es-ES,es;q=0.9,en;q=0.8' });
-              await page.setViewport({ width: 1366, height: 900 });
-              try {
-                sectors = await finvizSectors(page);
-              } catch(_){}
-              try {
-                winners = await finvizMovers(page,'gainers');
-              } catch(_){}
-              try {
-                losers = await finvizMovers(page,'losers');
-              } catch(_){}
-              await browser.close();
-            }catch(_){}
-
-            // Fallbacks si hace falta
-            if(!sectors || !sectors.top?.length || !sectors.low?.length){
-              sectors = await fallbackSectors();
-            }
-            if(!winners?.length || !losers?.length){
-              const fb = await fallbackMovers();
-              if(!winners?.length) winners = fb.gain;
-              if(!losers?.length)  losers  = fb.loss;
-            }
-
-            // Opinión curada
-            const val = x => typeof x === 'number' ? x : 0;
-            const mean = (val(sp)+val(nq)+val(dj))/3;
+          function buildOpinion(sp,nq,dj,sectors,head){
+            const v = x => typeof x==='number' ? x : 0;
+            const mean = (v(sp)+v(nq)+v(dj))/3;
             const best = sectors.top?.[0]?.name || '';
             const worst = sectors.low?.[0]?.name || '';
-            let opinion = 'Sesión mixta';
-            if(mean <= -0.35) opinion = 'Sesgo <b>risk-off</b>';
-            else if(mean >= 0.35) opinion = 'Tono <b>risk-on</b>';
-            if(/Technology|Communication/i.test(best)) opinion += ': growth lidera';
-            if(/Technology|Communication/i.test(worst)) opinion += ': presión en tecnología';
-            if(/Utilities|Consumer Defensive|Healthcare/i.test(best)) opinion += ': defensivas al frente';
-            if(best) opinion += ` (mejor: ${best})`;
-            if(worst) opinion += ` · peor: ${worst}`;
-            const head = await headline();
-            if(head) opinion += `. Noticia: ${head}`;
+            const h = (head||'').toLowerCase();
+            let driver = '';
+            if (/cpi|inflation|pce|ipc|inflaci\u00F3n/.test(h)) driver = 'tras datos de inflación';
+            else if (/fed|rate|yield|tipos|powell|hike|cut/.test(h)) driver = 'por expectativas de tipos';
+            else if (/jobs|payrolls|paro|employment/.test(h)) driver = 'por datos de empleo';
+            else if (/earnings|results|guidance/.test(h)) driver = 'impulsado por resultados';
+            else if (/china|tariff|geopol/.test(h)) driver = 'con ruido geopolítico';
+            let tone;
+            if (mean >= 0.6) tone = 'Tono alcista (risk-on)';
+            else if (mean <= -0.6) tone = 'Sesgo bajista (risk-off)';
+            else if (Math.abs(mean) <= 0.15) tone = 'Sesión mixta';
+            else tone = mean > 0 ? 'Cierre positivo' : 'Cierre en rojo';
+            const add = [];
+            if (best)  add.push(`mejor: ${best}`);
+            if (worst) add.push(`peor: ${worst}`);
+            let txt = tone;
+            if (driver) txt += ` ${driver}`;
+            if (add.length) txt += ` (${add.join(' · ')})`;
+            return txt;
+          }
 
+          (async () => {
+            let sp=null,nq=null,dj=null;
+            try { [sp,nq,dj] = await Promise.all([stooqPct('spy.us'), stooqPct('qqq.us'), stooqPct('dia.us')]); } catch(e){}
+            let sectors = await fallbackSectors();
+            let movers = await fallbackMovers();
+            const head = await headline();
+            const opinion = buildOpinion(sp,nq,dj,sectors,head);
             const d = new Date().toLocaleDateString('es-ES',{timeZone:'Europe/Madrid'});
             const fmt = v => (typeof v === 'number') ? `${v.toFixed(2)}%` : '—';
             const secStr = (arr)=> (arr||[]).map(s=>`${s.name} ${s.pct.toFixed(2)}%`).join(', ') || '—';
             const movStr = (arr)=> (arr||[]).join(', ') || '—';
-
             const payload = {
               date:d,
               sp:fmt(sp), nq:fmt(nq), dj:fmt(dj),
               secBest: secStr(sectors.top),
               secWorst: secStr(sectors.low),
-              winners: movStr(winners),
-              losers:  movStr(losers),
+              winners: movStr(movers.gain),
+              losers:  movStr(movers.loss),
               headline: head,
               opinion
             };
             fs.writeFileSync('summary.json', JSON.stringify(payload), 'utf8');
           })();
           JS
-
           node summary.js
 
-      # ---------- Construir caption (HTML seguro) ----------
+      # ---------- Construir caption ----------
       - name: Build caption.txt
         run: |
           DATE=$(jq -r '.date' summary.json)
@@ -326,18 +232,20 @@ jobs:
           WINNERS=$(jq -r '.winners' summary.json)
           LOSERS=$(jq -r '.losers' summary.json)
           OPINION=$(jq -r '.opinion' summary.json)
-
-          esc() { sed 's/&/&amp;/g; s/</\&lt;/g; s/>/\&gt;/g'; }
+          HEADLINE=$(jq -r '.headline' summary.json)
 
           {
             echo "<b>📊 Cierre de mercado — ${DATE}</b>"
             echo "• S&amp;P500: ${SP} | Nasdaq: ${NQ} | Dow: ${DJ}"
-            echo "• <b>Sectores destacados:</b> $(printf '%s' "${SEC_BEST}" | esc)"
-            echo "• <b>Peores sectores:</b> $(printf '%s' "${SEC_WORST}" | esc)"
-            echo "• <b>Top ganadores (S&amp;P500):</b> $(printf '%s' "${WINNERS}" | esc)"
-            echo "• <b>Top perdedores (S&amp;P500):</b> $(printf '%s' "${LOSERS}" | esc)"
+            echo "• <b>Sectores destacados:</b> ${SEC_BEST}"
+            echo "• <b>Peores sectores:</b> ${SEC_WORST}"
+            echo "• <b>Top ganadores (S&amp;P500):</b> ${WINNERS}"
+            echo "• <b>Top perdedores (S&amp;P500):</b> ${LOSERS}"
             echo ""
-            echo "💡 <i>Opinión:</i> $(printf '%s' "${OPINION}" | esc)"
+            echo "💡 <i>Opinión:</i> ${OPINION}"
+            if [ -n "${HEADLINE}" ] && [ "${HEADLINE}" != "null" ]; then
+              echo "🗞️ ${HEADLINE}"
+            fi
           } > caption.txt
 
       # ---------- Enviar a Telegram ----------
