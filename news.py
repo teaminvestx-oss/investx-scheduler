@@ -12,9 +12,8 @@ DEEPL_API_KEY  = (os.getenv("DEEPL_API_KEY") or "").strip()
 DEEPL_PLAN     = (os.getenv("DEEPL_PLAN") or "").strip().lower()  # "free" | "pro" (auto si vacío)
 LOCAL_TZ       = ZoneInfo(os.getenv("LOCAL_TZ", "Europe/Madrid"))
 LOOKBACK_HOURS = int(os.getenv("LOOKBACK_HOURS", "10"))
-# Limite duro: 6
 MAX_ITEMS_ENV  = int(os.getenv("MAX_ITEMS", "6"))
-MAX_ITEMS      = min(6, MAX_ITEMS_ENV)  # no superar 6 por requisito
+MAX_ITEMS      = min(6, MAX_ITEMS_ENV)  # tope 6 noticias
 
 INCLUDE_DESC   = (os.getenv("INCLUDE_DESC", "0").strip() in {"1","true","yes","y"})
 
@@ -27,10 +26,8 @@ WATCHLIST = [s.strip().upper() for s in os.getenv("WATCHLIST",
 ).split(",") if s.strip()]
 
 FEEDS = [
-    # CNBC (prioridad)
-    "https://www.cnbc.com/id/100003114/device/rss/rss.html",  # Top News
-    "https://www.cnbc.com/id/10001147/device/rss/rss.html",   # World Markets
-    # Otros
+    "https://www.cnbc.com/id/100003114/device/rss/rss.html",  # CNBC Top News
+    "https://www.cnbc.com/id/10001147/device/rss/rss.html",   # CNBC World Markets
     "https://feeds.reuters.com/reuters/businessNews",
     "https://feeds.reuters.com/reuters/marketsNews",
     "https://feeds.a.dj.com/rss/RSSMarketsMain.xml",          # WSJ Markets
@@ -76,23 +73,9 @@ def normalize_url(u: str) -> str:
 def build_requests_session() -> requests.Session:
     s = requests.Session()
     s.headers.update({
-        "User-Agent": "InvestX-NewsBot/1.1 (+https://investx.local)",
+        "User-Agent": "InvestX-NewsBot/1.1",
         "Accept": "application/json, text/plain, */*",
-        "Connection": "keep-alive",
     })
-    try:
-        from requests.adapters import HTTPAdapter
-        from urllib3.util.retry import Retry
-        retry = Retry(
-            total=3,
-            backoff_factor=0.5,
-            status_forcelist=(429, 500, 502, 503, 504),
-            allowed_methods=frozenset(["GET","POST"])
-        )
-        s.mount("https://", HTTPAdapter(max_retries=retry))
-        s.mount("http://",  HTTPAdapter(max_retries=retry))
-    except Exception:
-        pass
     return s
 
 SESSION = build_requests_session()
@@ -157,7 +140,7 @@ def fetch_items():
     now_utc = datetime.now(timezone.utc)
     cutoff = now_utc - timedelta(hours=LOOKBACK_HOURS)
 
-    feedparser.USER_AGENT = "InvestX-NewsBot/1.1 (+https://investx.local)"
+    feedparser.USER_AGENT = "InvestX-NewsBot/1.1"
     for url in FEEDS:
         try:
             feed = feedparser.parse(url)
@@ -178,7 +161,6 @@ def fetch_items():
 
     items.sort(key=lambda x: (x[0], x[1]), reverse=True)
 
-    # Dedupe por (título+dominio) y por URL normalizada
     seen_title_dom = set()
     seen_url = set()
     uniq = []
@@ -205,17 +187,8 @@ def send_message(text: str):
     r.raise_for_status()
 
 def rating_stars(index: int, total: int) -> str:
-    """
-    Reparte por orden:
-      - Top ~1/3 → ⭐⭐⭐
-      - Medio ~1/3 → ⭐⭐
-      - Último ~1/3 → ⭐
-    Con 6 elementos: 2/2/2.
-    """
     if total <= 2:
-        # 1 → ⭐⭐⭐, 2 → ⭐⭐
         return "⭐⭐⭐" if index == 0 else "⭐⭐"
-    # cortes proporcionales
     top_cut = max(1, math.ceil(total / 3))
     mid_cut = max(1, math.ceil(2 * total / 3))
     if index < top_cut:
@@ -239,8 +212,7 @@ def build_bullet(stars: str, title_es: str, ts_local: datetime, link: str, fuent
 def main():
     items = fetch_items()
     now_local = datetime.now(LOCAL_TZ)
-    header = f"🗞️ <b>Noticias clave — {fecha_es(now_local)}</b>\n"
-   
+    header = f"🗞️ <b>Noticias clave — {fecha_es(now_local)}</b>\n\n"
 
     if not items:
         send_message(header + "• No hay titulares destacados en la ventana seleccionada.")
@@ -256,19 +228,17 @@ def main():
         stars    = rating_stars(i, total)
         lines.append(build_bullet(stars, title_es, ts_local, link, fuente, desc_es))
 
-   
+    text = header + "\n".join(lines)
 
-    # Control de tamaño
-    text = header + "\n".join(lines) + footer
     MAX_TELEGRAM = 3900
     if len(text) > MAX_TELEGRAM:
         acc = header
         for ln in lines:
-            if len(acc) + len(ln) + 1 > MAX_TELEGRAM - len(footer) - 10:
+            if len(acc) + len(ln) + 1 > MAX_TELEGRAM - 10:
                 acc += "\n…"
                 break
             acc += ("\n" + ln)
-        text = acc + footer
+        text = acc
 
     send_message(text)
 
