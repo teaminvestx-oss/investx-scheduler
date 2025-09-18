@@ -104,26 +104,26 @@ jobs:
       - name: Run screenshot
         run: node screenshot.js
 
-      # ---------- Resumen + Opinión ----------
+      # ---------- Resumen + Opinión analista (6-10 líneas) ----------
       - name: Build summary (summary.json)
-        env:
-          UA: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
         run: |
           set -e
           cat > summary.js <<'JS'
-          const puppeteer = require('puppeteer');
           const fs = require('fs');
           const fetchTxt = async url => (await fetch(url)).text();
 
-          // ---- Utils ----
+          // ===== Utilidades Stooq =====
           async function stooqPct(symbol){
             const url=`https://stooq.com/q/d/l/?s=${symbol}&i=d`;
             const txt = await fetchTxt(url);
             const lines = txt.trim().split('\n');
-            if(lines.length<3) throw new Error('stooq rows');
             const [prev, close] = lines.slice(-2).map(l=>parseFloat(l.split(',')[4]));
+            if(!prev || !close) throw new Error('stooq parse');
             return ((close-prev)/prev)*100;
           }
+          const sign = n => `${n>=0?'+':''}${n.toFixed(2)}%`;
+
+          // Sectores vía ETFs (estable)
           const sectorETFs = [
             {name:'Technology', sym:'xlk.us'},
             {name:'Communication Services', sym:'xlc.us'},
@@ -137,83 +137,111 @@ jobs:
             {name:'Real Estate', sym:'xlre.us'},
             {name:'Utilities', sym:'xlu.us'},
           ];
-          const heavySPX = ['AAPL','MSFT','NVDA','AMZN','GOOGL','META','AVGO','BRK-B','TSLA','XOM','LLY','JPM','UNH','V','JNJ','GOOG','PG','MA','HD','COST','ABBV','BAC','WMT','CVX','MRK','PEP','KO','NFLX','ADBE','CRM'];
-          const mapStooq = t => `${t.toLowerCase()}.us`.replace('brk-b','brk-b');
-
-          async function fallbackSectors(){
+          async function sectorsTodayFull(){
             const vals = await Promise.allSettled(sectorETFs.map(async s=>{
               const pct = await stooqPct(s.sym); return {name:s.name, pct};
             }));
-            const data = vals.filter(v=>v.status==='fulfilled').map(v=>v.value);
-            const top=[...data].sort((a,b)=>b.pct-a.pct).slice(0,3);
-            const low=[...data].sort((a,b)=>a.pct-b.pct).slice(0,3);
-            return {top, low};
+            const all = vals.filter(v=>v.status==='fulfilled').map(v=>v.value);
+            const top=[...all].sort((a,b)=>b.pct-a.pct).slice(0,3);
+            const low=[...all].sort((a,b)=>a.pct-b.pct).slice(0,3);
+            const pos=all.filter(x=>x.pct>=0).length, neg=all.length-pos;
+            return {all, top, low, pos, neg};
           }
-          async function fallbackMovers(){
+
+          // Mega-caps para ganadores/perdedores (si Finviz falla)
+          const heavySPX = ['AAPL','MSFT','NVDA','AMZN','GOOGL','META','AVGO','BRK-B','TSLA','XOM','LLY','JPM','UNH','V','JNJ','GOOG','PG','MA','HD','COST','ABBV','BAC','WMT','CVX','MRK','PEP','KO','NFLX','ADBE','CRM'];
+          const mapStooq = t => `${t.toLowerCase()}.us`.replace('brk-b','brk-b');
+          async function moversToday(){
             const vals = await Promise.allSettled(heavySPX.map(async t=>{
-              const pct = await stooqPct(mapStooq(t));
-              return {t, pct};
+              const pct = await stooqPct(mapStooq(t)); return {t, pct};
             }));
             const arr = vals.filter(v=>v.status==='fulfilled').map(v=>v.value);
-            const gain = [...arr].sort((a,b)=>b.pct-a.pct).slice(0,3).map(x=>`${x.t} ${x.pct.toFixed(2)}%`);
-            const loss = [...arr].sort((a,b)=>a.pct-b.pct).slice(0,3).map(x=>`${x.t} ${x.pct.toFixed(2)}%`);
+            const gain = [...arr].sort((a,b)=>b.pct-a.pct).slice(0,3);
+            const loss = [...arr].sort((a,b)=>a.pct-b.pct).slice(0,3);
             return {gain, loss};
           }
+
+          // Titular (Reuters) para contexto
+          function clean(s){ return (s||'').replace(/&amp;/g,'&').replace(/\s+/g,' ').trim(); }
           async function headline(){
             try{
-              const txt = await fetchTxt('https://feeds.reuters.com/reuters/businessNews');
-              const m = txt.match(/<title>([^<]+)<\/title>/i);
-              if(m) return `${m[1]} — Reuters`;
+              const rss = await fetchTxt('https://feeds.reuters.com/reuters/businessNews');
+              const title = clean((rss.match(/<title>([^<]+)<\/title>/i)||[])[1]);
+              if(title) return `${title} — Reuters`;
             }catch(_){}
             return '';
           }
 
-          function buildOpinion(sp,nq,dj,sectors,head){
+          // Opinión analista (6–10 líneas)
+          function analystOpinion(sp,nq,dj,sectors,head,movers){
             const v = x => typeof x==='number' ? x : 0;
             const mean = (v(sp)+v(nq)+v(dj))/3;
-            const best = sectors.top?.[0]?.name || '';
-            const worst = sectors.low?.[0]?.name || '';
-            const h = (head||'').toLowerCase();
-            let driver = '';
-            if (/cpi|inflation|pce|ipc|inflaci\u00F3n/.test(h)) driver = 'tras datos de inflación';
-            else if (/fed|rate|yield|tipos|powell|hike|cut/.test(h)) driver = 'por expectativas de tipos';
-            else if (/jobs|payrolls|paro|employment/.test(h)) driver = 'por datos de empleo';
-            else if (/earnings|results|guidance/.test(h)) driver = 'impulsado por resultados';
-            else if (/china|tariff|geopol/.test(h)) driver = 'con ruido geopolítico';
-            let tone;
-            if (mean >= 0.6) tone = 'Tono alcista (risk-on)';
-            else if (mean <= -0.6) tone = 'Sesgo bajista (risk-off)';
-            else if (Math.abs(mean) <= 0.15) tone = 'Sesión mixta';
-            else tone = mean > 0 ? 'Cierre positivo' : 'Cierre en rojo';
-            const add = [];
-            if (best)  add.push(`mejor: ${best}`);
-            if (worst) add.push(`peor: ${worst}`);
-            let txt = tone;
-            if (driver) txt += ` ${driver}`;
-            if (add.length) txt += ` (${add.join(' · ')})`;
-            return txt;
+            const dir = mean>0 ? 'al alza' : mean<0 ? 'a la baja' : 'mixto';
+            const best = sectors.top?.[0], worst = sectors.low?.[0];
+            const gain1 = movers.gain?.[0], loss1 = movers.loss?.[0];
+            const lines = [];
+
+            lines.push(`Los índices estadounidenses cerraron ${dir}: S&P500 ${sign(v(sp))}, Nasdaq ${sign(v(nq))} y Dow ${sign(v(dj))}.`);
+            if (best && worst) {
+              lines.push(`Por sectores, destacó ${best.name} (${sign(best.pct)}), mientras ${worst.name} quedó rezagado (${sign(worst.pct)}).`);
+            }
+            lines.push(`La amplitud sectorial quedó en ${sectors.pos}/${sectors.pos+sectors.neg} en positivo, lo que sugiere ${sectors.pos >= 7 ? 'acompañamiento amplio' : sectors.pos <= 4 ? 'avance selectivo' : 'participación moderada'}.`);
+
+            if (gain1 && loss1) {
+              lines.push(`Entre mega-caps, sobresalió ${gain1.t} (${sign(gain1.pct)}), en contraste con ${loss1.t} (${sign(loss1.pct)}).`);
+            }
+
+            // Detecta foco: growth vs defensivas
+            const growthLead = /Technology|Communication Services|Consumer Cyclical/.test(best?.name||'');
+            const defensivesLead = /Utilities|Consumer Defensive|Healthcare/.test(best?.name||'');
+            if (growthLead) lines.push('Se observó sesgo hacia “growth” y beta alta, con mejor comportamiento relativo frente a defensivas.');
+            else if (defensivesLead) lines.push('El flujo favoreció a perfiles defensivos, con mejor comportamiento relativo frente a growth.');
+
+            // Titular contextual
+            if (head) {
+              const h = head.toLowerCase();
+              const cause =
+                /cpi|inflation|pce|ipc/.test(h) ? 'tras referencias de inflación' :
+                /fed|rate|yield|tipos|powell|hike|cut/.test(h) ? 'por expectativas de tipos y rendimientos' :
+                /jobs|payrolls|paro|employment/.test(h) ? 'después de datos laborales' :
+                /earnings|results|guidance|beneficios|ingresos/.test(h) ? 'apoyado por resultados empresariales' :
+                /china|tariff|geopol/.test(h) ? 'con ruido geopolítico en el fondo' :
+                'con flujo de titulares mixto';
+              lines.push(`El movimiento se interpretó ${cause}: ${head}.`);
+            }
+
+            // Pildorita operativa
+            if (mean > 0.3) lines.push('Para mañana, vigilar continuidad del impulso y posibles tomas de beneficio en líderes.');
+            else if (mean < -0.3) lines.push('Para mañana, atentos a rebotes técnicos y a soportes recientes en tecnológicas.');
+            else lines.push('De cara a mañana, clave la rotación y el comportamiento de líderes frente al mercado.');
+
+            return lines.slice(0,10).join('\n');
           }
 
           (async () => {
+            // Índices (ETFs representativos)
             let sp=null,nq=null,dj=null;
-            try { [sp,nq,dj] = await Promise.all([stooqPct('spy.us'), stooqPct('qqq.us'), stooqPct('dia.us')]); } catch(e){}
-            let sectors = await fallbackSectors();
-            let movers = await fallbackMovers();
-            const head = await headline();
-            const opinion = buildOpinion(sp,nq,dj,sectors,head);
+            try { [sp,nq,dj] = await Promise.all([stooqPct('spy.us'), stooqPct('qqq.us'), stooqPct('dia.us')]); } catch(_){}
+
+            const sectors = await sectorsTodayFull();
+            const movers  = await moversToday();
+            const head    = await headline();
+
             const d = new Date().toLocaleDateString('es-ES',{timeZone:'Europe/Madrid'});
-            const fmt = v => (typeof v === 'number') ? `${v.toFixed(2)}%` : '—';
-            const secStr = (arr)=> (arr||[]).map(s=>`${s.name} ${s.pct.toFixed(2)}%`).join(', ') || '—';
-            const movStr = (arr)=> (arr||[]).join(', ') || '—';
+            const secStr = a => (a||[]).map(x=>`${x.name} ${sign(x.pct)}`).join(', ') || '—';
+            const movStr = a => (a||[]).map(x=>`${x.t} ${sign(x.pct)}`).join(', ') || '—';
+
             const payload = {
-              date:d,
-              sp:fmt(sp), nq:fmt(nq), dj:fmt(dj),
+              date: d,
+              sp: typeof sp==='number'?sign(sp):'—',
+              nq: typeof nq==='number'?sign(nq):'—',
+              dj: typeof dj==='number'?sign(dj):'—',
               secBest: secStr(sectors.top),
               secWorst: secStr(sectors.low),
               winners: movStr(movers.gain),
               losers:  movStr(movers.loss),
               headline: head,
-              opinion
+              opinion: analystOpinion(sp,nq,dj,sectors,head,movers)
             };
             fs.writeFileSync('summary.json', JSON.stringify(payload), 'utf8');
           })();
@@ -242,8 +270,11 @@ jobs:
             echo "• <b>Top ganadores (S&amp;P500):</b> ${WINNERS}"
             echo "• <b>Top perdedores (S&amp;P500):</b> ${LOSERS}"
             echo ""
-            echo "💡 <i>Opinión:</i> ${OPINION}"
+            # Opinión multilínea (texto plano)
+            echo "💡 <i>Opinión:</i>"
+            echo "$(printf '%s' "${OPINION}")"
             if [ -n "${HEADLINE}" ] && [ "${HEADLINE}" != "null" ]; then
+              echo ""
               echo "🗞️ ${HEADLINE}"
             fi
           } > caption.txt
