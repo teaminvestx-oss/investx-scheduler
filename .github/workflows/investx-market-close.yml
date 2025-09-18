@@ -104,136 +104,215 @@ jobs:
       - name: Run screenshot
         run: node screenshot.js
 
-      # ---------- Resumen + Opinión (curl+pup+jq) ----------
+      # ---------- Resumen + Opinión (Puppeteer + Fallbacks Stooq) ----------
       - name: Build summary (summary.json)
         env:
           UA: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
         run: |
           set -e
 
-          retry() { # retry <times> <cmd...>
-            local n=0; local max=$1; shift
-            until "$@"; do n=$((n+1)); [ $n -ge $max ] && return 1; sleep 2; done
+          # funciones bash
+          retry() { local n=0; local max=$1; shift; until "$@"; do n=$((n+1)); [ $n -ge $max ] && return 1; sleep 2; done; }
+
+          # JS con lógica completa (scrape + fallbacks + opinión)
+          cat > summary.js <<'JS'
+          const puppeteer = require('puppeteer');
+          const fs = require('fs');
+
+          const UA='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36';
+          const REF='https://finviz.com/';
+          const sleep = ms => new Promise(r=>setTimeout(r,ms));
+          const fetchTxt = async url => (await fetch(url)).text();
+
+          async function stooqPct(symbol){ // devuelve % día
+            const url=`https://stooq.com/q/d/l/?s=${symbol}&i=d`;
+            const txt = await fetchTxt(url);
+            const lines = txt.trim().split('\n');
+            if(lines.length<3) throw new Error('stooq rows');
+            const [prev, close] = lines.slice(-2).map(l=>parseFloat(l.split(',')[4]));
+            if(!prev || !close) throw new Error('stooq parse');
+            return ((close-prev)/prev)*100;
           }
 
-          tz=Europe/Madrid
-          FECHA=$(TZ=$tz date +'%d/%m/%Y')
+          const sectorETFs = [
+            {name:'Technology', sym:'xlk.us'},
+            {name:'Communication Services', sym:'xlc.us'},
+            {name:'Consumer Cyclical', sym:'xly.us'},
+            {name:'Consumer Defensive', sym:'xlp.us'},
+            {name:'Financial', sym:'xlf.us'},
+            {name:'Healthcare', sym:'xlv.us'},
+            {name:'Industrials', sym:'xli.us'},
+            {name:'Energy', sym:'xle.us'},
+            {name:'Materials', sym:'xlb.us'},
+            {name:'Real Estate', sym:'xlre.us'},
+            {name:'Utilities', sym:'xlu.us'},
+          ];
 
-          # ----- Índices (Stooq, robusto) -----
-          pct_stooq () {
-            sym="$1"
-            csv=$(retry 3 curl -fsSL "https://stooq.com/q/d/l/?s=${sym}&i=d")
-            last2=$(printf "%s" "$csv" | tail -n 2 | awk -F, '{print $5}')
-            prev=$(printf "%s" "$last2" | head -n1)
-            close=$(printf "%s" "$last2" | tail -n1)
-            awk -v a="$prev" -v b="$close" 'BEGIN{ if(a>0){printf "%.2f%%", ((b-a)/a)*100}else{print "—"} }'
+          const heavySPX = [
+            'AAPL','MSFT','NVDA','AMZN','GOOGL','META','AVGO','BRK-B','TSLA','XOM',
+            'LLY','JPM','UNH','V','JNJ','GOOG','PG','MA','HD','COST','ABBV','BAC',
+            'WMT','CVX','MRK','PEP','KO','NFLX','ADBE','CRM'
+          ];
+
+          const mapStooq = t => {
+            let s = t.toLowerCase();
+            s = s.replace(/[\s]/g,'');
+            s = s.replace('brk-b','brk-b');
+            return `${s}.us`;
+          };
+
+          async function finvizSectors(page){
+            const url='https://finviz.com/groups.ashx?g=sector&v=210';
+            await page.goto(url,{waitUntil:'domcontentloaded',timeout:60000});
+            await page.evaluate(()=>{
+              const b=[...document.querySelectorAll('button,a')].find(x=>/accept|agree|consent|aceptar/i.test((x.innerText||'')));
+              b?.click();
+            }).catch(()=>{});
+            await page.waitForSelector('table.table-light', {timeout:15000});
+            const data = await page.$$eval('table.table-light tr', rows => {
+              const out=[];
+              for(const r of rows.slice(1)){
+                const tds=[...r.querySelectorAll('td')].map(td=>td.innerText.trim());
+                const name=tds[1]; const today=parseFloat((tds[2]||'0').replace(',','.').replace('%',''));
+                if(name) out.push({name,pct:isNaN(today)?0:today});
+              }
+              const top=[...out].sort((a,b)=>b.pct-a.pct).slice(0,3);
+              const low=[...out].sort((a,b)=>a.pct-b.pct).slice(0,3);
+              return {top, low};
+            });
+            return data;
           }
-          SP=$(pct_stooq spy.us || echo "—")
-          NQ=$(pct_stooq qqq.us || echo "—")
-          DJ=$(pct_stooq dia.us || echo "—")
 
-          # ----- Sectores (Finviz Groups) -----
-          HTML_G=$(retry 3 curl -fsSL -H "User-Agent: $UA" -H "Referer: https://finviz.com/" "https://finviz.com/groups.ashx?g=sector&v=210" || true)
-          SEC_TOP="—"; SEC_LOW="—"
-          if [ -n "$HTML_G" ]; then
-            # Obtener pares Sector | Perf Today
-            echo "$HTML_G" | pup 'table.table-light tr json{}' \
-              | jq -r '
-                  .[].children
-                  | select(. != null)
-                  | [.[1].text, (.[2].text | gsub(",";"."))]
-                  | @tsv
-                ' \
-              | awk -F'\t' 'NF==2 && $1!="" {gsub("%","",$2); printf "%s\t%0.2f\n",$1,$2}' \
-              | sort -k2,2nr | head -n3 > /tmp/top.txt || true
-
-            echo "$HTML_G" | pup 'table.table-light tr json{}' \
-              | jq -r '
-                  .[].children
-                  | select(. != null)
-                  | [.[1].text, (.[2].text | gsub(",";"."))]
-                  | @tsv
-                ' \
-              | awk -F'\t' 'NF==2 && $1!="" {gsub("%","",$2); printf "%s\t%0.2f\n",$1,$2}' \
-              | sort -k2,2n | head -n3 > /tmp/low.txt || true
-
-            [ -s /tmp/top.txt ] && SEC_TOP=$(awk -F'\t' '{printf "%s %.2f%%", $1,$2; if(NR<3) printf ", "}' /tmp/top.txt)
-            [ -s /tmp/low.txt ] && SEC_LOW=$(awk -F'\t' '{printf "%s %.2f%%", $1,$2; if(NR<3) printf ", "}' /tmp/low.txt)
-          fi
-
-          # ----- S&P500 Movers (Finviz Screener) -----
-          Movers () {
-            ord="$1" # -change (gainers) / change (losers)
-            html=$(retry 3 curl -fsSL -H "User-Agent: $UA" -H "Referer: https://finviz.com/" "https://finviz.com/screener.ashx?v=111&f=idx_sp500&o=${ord}" || true)
-            if [ -z "$html" ]; then echo "—"; return; fi
-            printf "%s" "$html" \
-              | pup 'table.table-light tr' \
-              | awk -F'[<>]' '
-                  /screener-link-primary/ {ticker=$5}
-                  /%/ && $0 ~ /<td/ { # capturar ultimo % de la fila
-                    gsub(/^[ \t\r\n]+|[ \t\r\n]+$/,"",$0);
-                    perc=$0
-                  }
-                  /<\/tr>/ {
-                    if (ticker && perc ~ /%/) { printf "%s %s\n", ticker, perc; c++ }
-                    ticker=""; perc="";
-                    if (c==3) exit
-                  }
-                ' | head -n3 | paste -sd', ' - | sed 's/[ ]\+/ /g'
+          async function finvizMovers(page, order){
+            const o = order==='gainers' ? '-change' : 'change';
+            const url=`https://finviz.com/screener.ashx?v=111&f=idx_sp500&o=${o}`;
+            await page.goto(url,{waitUntil:'domcontentloaded',timeout:60000});
+            await page.waitForSelector('table.table-light', {timeout:15000});
+            const list = await page.$$eval('table.table-light tr', rows => {
+              const out=[];
+              for(const r of rows.slice(1)){
+                const t = r.querySelector('a.screener-link-primary')?.innerText?.trim();
+                const perc = [...r.querySelectorAll('td')].map(td=>td.innerText.trim()).filter(x=>/%$/.test(x)).pop();
+                if(t && perc){ out.push(`${t} ${perc}`); if(out.length===3) break; }
+              }
+              return out;
+            });
+            return list;
           }
-          TOP_G=$(Movers -change)
-          [ -z "$TOP_G" ] && TOP_G="—"
-          TOP_L=$(Movers change)
-          [ -z "$TOP_L" ] && TOP_L="—"
 
-          # ----- Titular corto (Finviz News) -----
-          HEAD=$(retry 3 curl -fsSL -H "User-Agent: $UA" "https://finviz.com/news.ashx" \
-            | pup '.news-item-row a:first-of-type text{}, .news-item-row .news-source text{}' \
-            | paste - - | head -n1 | awk -F'\t' '{if(NF>=2) printf "%s — %s",$1,$2; else print ""}' || true)
+          async function fallbackSectors(){
+            const vals = await Promise.allSettled(sectorETFs.map(async s=>{
+              const pct = await stooqPct(s.sym); return {name:s.name, pct};
+            }));
+            const data = vals.filter(v=>v.status==='fulfilled').map(v=>v.value);
+            const top=[...data].sort((a,b)=>b.pct-a.pct).slice(0,3);
+            const low=[...data].sort((a,b)=>a.pct-b.pct).slice(0,3);
+            return {top, low};
+          }
 
-          # ----- Opinión curada -----
-          spv=$(echo "$SP" | tr -d '%' | tr ',' '.') ; [ -z "$spv" ] && spv=0
-          nqv=$(echo "$NQ" | tr -d '%' | tr ',' '.') ; [ -z "$nqv" ] && nqv=0
-          djv=$(echo "$DJ" | tr -d '%' | tr ',' '.') ; [ -z "$djv" ] && djv=0
-          mean=$(awk -v a="$spv" -v b="$nqv" -v c="$djv" 'BEGIN{printf "%.2f", (a+b+c)/3}')
+          async function fallbackMovers(){
+            const vals = await Promise.allSettled(heavySPX.map(async t=>{
+              const sym = mapStooq(t);
+              const pct = await stooqPct(sym);
+              return {t, pct};
+            }));
+            const arr = vals.filter(v=>v.status==='fulfilled').map(v=>v.value);
+            const gain = [...arr].sort((a,b)=>b.pct-a.pct).slice(0,3).map(x=>`${x.t} ${x.pct.toFixed(2)}%`);
+            const loss = [...arr].sort((a,b)=>a.pct-b.pct).slice(0,3).map(x=>`${x.t} ${x.pct.toFixed(2)}%`);
+            return {gain, loss};
+          }
 
-          best1=$(echo "$SEC_TOP" | cut -d',' -f1)
-          worst1=$(echo "$SEC_LOW" | cut -d',' -f1)
+          async function headline(){
+            try{
+              const txt = await fetchTxt('https://finviz.com/news.ashx');
+              const m = txt.match(/<a[^>]*>([^<]+)<\/a>[\s\S]*?news-source[^>]*>([^<]+)</i);
+              if(m) return `${m[1]} — ${m[2]}`;
+            }catch(_){}
+            try{
+              const rss = await fetchTxt('https://feeds.reuters.com/reuters/businessNews');
+              const m = rss.match(/<title>([^<]+)<\/title>[\s\S]*?<description>([^<]+)<\/description>/i);
+              if(m) return `${m[1]} — Reuters`;
+            }catch(_){}
+            return '';
+          }
 
-          OP="Sesión mixta."
-          if awk "BEGIN{exit !($mean<=-0.35)}"; then
-            OP="Sesgo <b>risk-off</b>"
-          elif awk "BEGIN{exit !($mean>=0.35)}"; then
-            OP="Tono <b>risk-on</b>"
-          else
-            OP="Sesión mixta"
-          fi
+          (async () => {
+            // Índices (ETFs)
+            let sp=null,nq=null,dj=null;
+            try {
+              [sp,nq,dj] = await Promise.all([
+                stooqPct('spy.us'),
+                stooqPct('qqq.us'),
+                stooqPct('dia.us')
+              ]);
+            } catch(e){ sp=nq=dj=null; }
 
-          if echo "$best1" | grep -qiE 'Technology|Communication'; then
-            OP="$OP: growth lidera"
-          elif echo "$worst1" | grep -qiE 'Technology|Communication'; then
-            OP="$OP: presión en tecnología"
-          elif echo "$best1" | grep -qiE 'Utilities|Consumer Defensive|Healthcare'; then
-            OP="$OP: defensivas al frente"
-          fi
+            // Intento Finviz con Puppeteer
+            let sectors=null, winners=[], losers=[];
+            try{
+              const browser = await puppeteer.launch({headless:'new', args:['--no-sandbox','--disable-setuid-sandbox']});
+              const page = await browser.newPage();
+              await page.setUserAgent(UA);
+              await page.setExtraHTTPHeaders({ 'Referer': REF, 'Accept-Language': 'es-ES,es;q=0.9,en;q=0.8' });
+              await page.setViewport({ width: 1366, height: 900 });
+              try {
+                sectors = await finvizSectors(page);
+              } catch(_){}
+              try {
+                winners = await finvizMovers(page,'gainers');
+              } catch(_){}
+              try {
+                losers = await finvizMovers(page,'losers');
+              } catch(_){}
+              await browser.close();
+            }catch(_){}
 
-          [ -n "$best1" ] && OP="$OP (mejor: ${best1%% *})"
-          if [ -n "$worst1" ]; then
-            wname="${worst1%% *}"
-            OP="$OP · peor: $wname"
-          fi
-          if [ -n "$HEAD" ]; then
-            OP="$OP. Noticia: $HEAD"
-          fi
+            // Fallbacks si hace falta
+            if(!sectors || !sectors.top?.length || !sectors.low?.length){
+              sectors = await fallbackSectors();
+            }
+            if(!winners?.length || !losers?.length){
+              const fb = await fallbackMovers();
+              if(!winners?.length) winners = fb.gain;
+              if(!losers?.length)  losers  = fb.loss;
+            }
 
-          # ----- summary.json -----
-          jq -n --arg d "$FECHA" \
-                --arg sp "$SP" --arg nq "$NQ" --arg dj "$DJ" \
-                --arg secb "$SEC_TOP" --arg secw "$SEC_LOW" \
-                --arg win "$TOP_G" --arg los "$TOP_L" \
-                --arg head "$HEAD" --arg op "$OP" \
-                '{date:$d, sp:$sp, nq:$nq, dj:$dj, secBest:$secb, secWorst:$secw, winners:$win, losers:$los, headline:$head, opinion:$op}' \
-            > summary.json
+            // Opinión curada
+            const val = x => typeof x === 'number' ? x : 0;
+            const mean = (val(sp)+val(nq)+val(dj))/3;
+            const best = sectors.top?.[0]?.name || '';
+            const worst = sectors.low?.[0]?.name || '';
+            let opinion = 'Sesión mixta';
+            if(mean <= -0.35) opinion = 'Sesgo <b>risk-off</b>';
+            else if(mean >= 0.35) opinion = 'Tono <b>risk-on</b>';
+            if(/Technology|Communication/i.test(best)) opinion += ': growth lidera';
+            if(/Technology|Communication/i.test(worst)) opinion += ': presión en tecnología';
+            if(/Utilities|Consumer Defensive|Healthcare/i.test(best)) opinion += ': defensivas al frente';
+            if(best) opinion += ` (mejor: ${best})`;
+            if(worst) opinion += ` · peor: ${worst}`;
+            const head = await headline();
+            if(head) opinion += `. Noticia: ${head}`;
+
+            const d = new Date().toLocaleDateString('es-ES',{timeZone:'Europe/Madrid'});
+            const fmt = v => (typeof v === 'number') ? `${v.toFixed(2)}%` : '—';
+            const secStr = (arr)=> (arr||[]).map(s=>`${s.name} ${s.pct.toFixed(2)}%`).join(', ') || '—';
+            const movStr = (arr)=> (arr||[]).join(', ') || '—';
+
+            const payload = {
+              date:d,
+              sp:fmt(sp), nq:fmt(nq), dj:fmt(dj),
+              secBest: secStr(sectors.top),
+              secWorst: secStr(sectors.low),
+              winners: movStr(winners),
+              losers:  movStr(losers),
+              headline: head,
+              opinion
+            };
+            fs.writeFileSync('summary.json', JSON.stringify(payload), 'utf8');
+          })();
+          JS
+
+          node summary.js
 
       # ---------- Construir caption (HTML seguro) ----------
       - name: Build caption.txt
@@ -247,7 +326,6 @@ jobs:
           WINNERS=$(jq -r '.winners' summary.json)
           LOSERS=$(jq -r '.losers' summary.json)
           OPINION=$(jq -r '.opinion' summary.json)
-          HEADLINE=$(jq -r '.headline' summary.json)
 
           esc() { sed 's/&/&amp;/g; s/</\&lt;/g; s/>/\&gt;/g'; }
 
