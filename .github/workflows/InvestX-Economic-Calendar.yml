@@ -6,10 +6,6 @@ on:
     - cron: "0 11 * * 2-5" # Mar–Vie 13:00 Madrid (11:00 UTC) — solo hoy
   workflow_dispatch:
 
-concurrency:
-  group: investx-econ-calendar
-  cancel-in-progress: false
-
 jobs:
   econ-calendar:
     runs-on: ubuntu-22.04
@@ -33,11 +29,10 @@ jobs:
           python3 -m pip install --upgrade pip requests
 
       # ---------- Node/Puppeteer ----------
-      - name: Setup Node
+      - name: Setup Node (no cache)
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
-          cache: 'npm'
+          node-version: '20'   # SIN cache: 'npm'  -> no hay warning
 
       - name: Install Puppeteer
         run: npm install puppeteer@22
@@ -47,6 +42,7 @@ jobs:
         run: |
           cat > grab.js <<'EOF'
           const puppeteer = require('puppeteer');
+          const fs = require('fs');
           const sleep = (ms) => new Promise(r => setTimeout(r, ms));
           const log = (...a)=>console.log('[grab]', ...a);
 
@@ -82,11 +78,6 @@ jobs:
 
           async function forceLoadRows(page, passes = 3) {
             try { await page.waitForSelector('#economicCalendarData, table.genTbl, table', {timeout: 12000}); } catch(_) {}
-            for (let i=0;i<40;i++) {
-              const rows = await page.$$eval('tr[id^="eventRowId_"], tr.js-event-item, tr[data-event-datetime]', els => els.length);
-              if (rows >= 8) break;
-              await sleep(300);
-            }
             for (let s=0; s<passes; s++) {
               await page.evaluate(() => window.scrollBy(0, window.innerHeight*2));
               await sleep(900);
@@ -95,22 +86,10 @@ jobs:
             await sleep(700);
           }
 
-          async function expandDaysAndMore(page) {
-            const labels = ['ver más','mostrar más','load more','more events'];
-            await clickByText(page, 'a,button,[role="button"]', labels, 2500).catch(()=>{});
-            await page.evaluate(() => {
-              document.querySelectorAll('tr.theDay, tr.newDay, tr.dayHeader').forEach(h => {
-                if (h && (h.onclick || h.className.match(/collapsed|toggle/i))) (h.click?.());
-              });
-            }).catch(()=>{});
-            await sleep(600);
-          }
-
           async function applyNativeFilters(page) {
             log('Open Filters popup');
             const opened = await openFilters(page);
             if (!opened) { log('Filters button not found'); return false; }
-
             try { await page.waitForSelector('.filterPopup, [class*="filterPop"]', {timeout: 7000}); } catch(e) {}
             await sleep(700);
 
@@ -146,7 +125,11 @@ jobs:
             return true;
           }
 
-          async function runGrab() {
+          (async () => {
+            // Limpieza previa
+            try { fs.existsSync('calendar.png') && fs.unlinkSync('calendar.png'); } catch(_){}
+            try { fs.existsSync('no_events.flag') && fs.unlinkSync('no_events.flag'); } catch(_){}
+
             const browser = await puppeteer.launch({
               headless: 'new',
               args: ['--no-sandbox','--disable-setuid-sandbox','--lang=es-ES,es','--disable-dev-shm-usage']
@@ -154,12 +137,9 @@ jobs:
             const page = await browser.newPage();
             await page.setUserAgent('Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36');
             await page.setExtraHTTPHeaders({ 'Accept-Language': 'es-ES,es;q=0.9' });
-            await page.setViewport({ width: 1440, height: 2400, deviceScaleFactor: 2 });
             try { await page.emulateTimezone('Europe/Madrid'); } catch(e) {}
 
-            const url = 'https://es.investing.com/economic-calendar/';
-            log('Go to', url);
-            await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 90000 });
+            await page.goto('https://es.investing.com/economic-calendar/', { waitUntil: 'domcontentloaded', timeout: 90000 });
             await page.evaluate(() => {
               const btn = [...document.querySelectorAll("button,a,[role='button']")]
                 .find(b => /aceptar|accept|consent|agree/i.test((b.innerText||'')+''));
@@ -172,79 +152,37 @@ jobs:
             else { await clickByText(page, 'a,button', ['hoy','today'], 7000); }
             await sleep(600);
 
-            const nativeOK = await applyNativeFilters(page);
+            await applyNativeFilters(page);
             await forceLoadRows(page, 5);
-            await expandDaysAndMore(page);
-            await forceLoadRows(page, 2);
 
-            const rowsSelector = 'tr[id^="eventRowId_"], tr.js-event-item, tr[data-event-datetime]';
-            let visibleCount = await page.evaluate((selector) => {
-              const isUSRow = (tr) => {
-                const c = tr.getAttribute('data-country') || tr.dataset?.country || '';
-                if (c === '5') return true;
-                const flagSpan = tr.querySelector('td.flagCur span, .flagCur span, [class*="flag"] span');
-                const flagClass = (flagSpan?.className || '').toLowerCase();
-                const flagTitle = (flagSpan?.getAttribute('title') || '').toLowerCase();
-                if (/usa|united\s*states/.test(flagClass) || /estados unidos|united states/.test(flagTitle)) return true;
-                const curCell = tr.querySelector('td.cur, td.currency, td:nth-child(2)');
-                const curTxt = (curCell?.innerText || '').trim().toUpperCase();
-                if (curTxt === 'USD') return true;
-                return false;
-              };
-              const has2or3Stars = (tr) => {
-                const imp = tr.getAttribute('data-importance') || tr.dataset?.importance || '';
-                if (imp === '2' || imp === '3') return true;
-                const senti = tr.querySelector('td.sentiment, td.impact, .sentiment');
-                if (!senti) return false;
-                const iTags = senti.querySelectorAll('i, svg').length;
-                return iTags >= 2;
-              };
-              const rows = Array.from(document.querySelectorAll(selector));
-              let kept = 0;
-              rows.forEach(tr => {
-                const keep = isUSRow(tr) && has2or3Stars(tr);
-                tr.style.display = keep ? '' : 'none';
-                if (keep) kept++;
-              });
-              return kept;
-            }, rowsSelector);
+            // ¿Hay filas visibles (aunque no filtradas por UI)?
+            const visibleRows = await page.$$eval('tr[id^="eventRowId_"], tr.js-event-item, tr[data-event-datetime]', rows =>
+              rows.filter(r => r.style.display !== 'none').length
+            );
 
-            log('Native filters applied:', nativeOK, '| Visible after fallback:', visibleCount);
+            if (visibleRows === 0) {
+              // Marcamos NO EVENTOS y salimos "OK"
+              require('fs').writeFileSync('no_events.flag', '1');
+              console.log('[grab] No events -> flag no_events.flag');
+              await browser.close();
+              process.exit(0);
+            }
 
+            // Captura la tabla
             const table = await page.$('#economicCalendarData') || await page.$('table.genTbl') || await page.$('table');
-            await page.evaluate(() => window.scrollTo(0, 0));
-            await sleep(600);
-
             if (table) await table.screenshot({ path: 'calendar.png' });
             else await page.screenshot({ path: 'calendar.png', fullPage: true });
-
-            if (!visibleCount || visibleCount === 0) {
-              log('No visible events after filtering. Exiting without image.');
-              try { require('fs').existsSync('calendar.png') && require('fs').unlinkSync('calendar.png'); } catch(e){}
-              await browser.close();
-              return 0;
-            }
-
-            log('✅ Captura filtrada generada: calendar.png');
+            console.log('✅ Captura generada');
             await browser.close();
-            return 1;
-          }
-
-          (async () => {
-            let ok = await runGrab();
-            if (!ok) {
-              log('Retrying once more...');
-              await sleep(5000);
-              await runGrab();
-            }
+            process.exit(0);
           })().catch(err => { console.error(err); process.exit(1); });
           EOF
 
       # ---------- Ejecutar scraper ----------
       - name: Run grabber
-        continue-on-error: true
         run: node grab.js
 
+      # ---------- Subir artefacto (para revisar si hay imagen) ----------
       - name: Upload screenshot artifact (if present)
         if: ${{ hashFiles('calendar.png') != '' }}
         uses: actions/upload-artifact@v4
@@ -254,6 +192,7 @@ jobs:
           if-no-files-found: ignore
           retention-days: 2
 
+      # ---------- Caption ----------
       - name: Build caption (ES/Madrid)
         run: |
           export TZ=Europe/Madrid
@@ -262,12 +201,15 @@ jobs:
             A=$(date -d "monday this week" +%Y-%m-%d)
             B=$(date -d "sunday this week" +%Y-%m-%d)
             echo "CAPTION=🗓️ Calendario USA (⭐️⭐️/⭐️⭐️⭐️) — Semana ${A}–${B}" >> $GITHUB_ENV
+            echo "NOEVENTS_TEXT=✅ Esta semana no hay eventos relevantes a destacar en USA" >> $GITHUB_ENV
           else
             HOY=$(date +%Y-%m-%d)
             echo "CAPTION=🗓️ Calendario USA (⭐️⭐️/⭐️⭐️⭐️) — Hoy ${HOY}" >> $GITHUB_ENV
+            echo "NOEVENTS_TEXT=✅ Hoy no hay eventos relevantes a destacar en USA" >> $GITHUB_ENV
           fi
 
-      - name: Send to Telegram (Python)
+      # ---------- Caso 1: hay foto ----------
+      - name: Send to Telegram (Photo)
         if: ${{ hashFiles('calendar.png') != '' }}
         env:
           BOT_TOKEN: ${{ secrets.INVESTX_TOKEN }}
@@ -287,4 +229,25 @@ jobs:
               )
               print(r.status_code, r.text)
               r.raise_for_status()
+          PY
+
+      # ---------- Caso 2: no hay eventos (enviar texto) ----------
+      - name: Send to Telegram (No events text)
+        if: ${{ hashFiles('no_events.flag') != '' && hashFiles('calendar.png') == '' }}
+        env:
+          BOT_TOKEN: ${{ secrets.INVESTX_TOKEN }}
+          CHAT_ID: ${{ secrets.CHAT_ID }}
+          NOEVENTS_TEXT: ${{ env.NOEVENTS_TEXT }}
+        run: |
+          python3 - <<'PY'
+          import os, requests
+          bot = os.environ['BOT_TOKEN']; chat = os.environ['CHAT_ID']
+          text = os.environ.get('NOEVENTS_TEXT', '✅ No hay eventos relevantes a destacar en USA')
+          r = requests.post(
+              f"https://api.telegram.org/bot{bot}/sendMessage",
+              data={"chat_id": chat, "text": text, "parse_mode":"HTML"},
+              timeout=120
+          )
+          print(r.status_code, r.text)
+          r.raise_for_status()
           PY
