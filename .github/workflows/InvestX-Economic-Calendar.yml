@@ -32,7 +32,7 @@ jobs:
       - name: Setup Node (no cache)
         uses: actions/setup-node@v4
         with:
-          node-version: '20'   # SIN cache: 'npm'  -> no hay warning
+          node-version: '20'   # quitamos cache para no dar warning
 
       - name: Install Puppeteer
         run: npm install puppeteer@22
@@ -155,14 +155,13 @@ jobs:
             await applyNativeFilters(page);
             await forceLoadRows(page, 5);
 
-            // ¿Hay filas visibles (aunque no filtradas por UI)?
+            // ¿Hay filas visibles?
             const visibleRows = await page.$$eval('tr[id^="eventRowId_"], tr.js-event-item, tr[data-event-datetime]', rows =>
               rows.filter(r => r.style.display !== 'none').length
             );
 
             if (visibleRows === 0) {
-              // Marcamos NO EVENTOS y salimos "OK"
-              require('fs').writeFileSync('no_events.flag', '1');
+              fs.writeFileSync('no_events.flag', '1');
               console.log('[grab] No events -> flag no_events.flag');
               await browser.close();
               process.exit(0);
@@ -182,7 +181,7 @@ jobs:
       - name: Run grabber
         run: node grab.js
 
-      # ---------- Subir artefacto (para revisar si hay imagen) ----------
+      # ---------- Subir artefacto ----------
       - name: Upload screenshot artifact (if present)
         if: ${{ hashFiles('calendar.png') != '' }}
         uses: actions/upload-artifact@v4
@@ -196,16 +195,22 @@ jobs:
       - name: Build caption (ES/Madrid)
         run: |
           export TZ=Europe/Madrid
-          DOW=$(date +%u)
+          DOW=$(date +%u)   # 1=Lun ... 7=Dom
+          echo "WDAY=$DOW" >> $GITHUB_ENV
+
           if [ "$DOW" -eq 1 ]; then
             A=$(date -d "monday this week" +%Y-%m-%d)
             B=$(date -d "sunday this week" +%Y-%m-%d)
             echo "CAPTION=🗓️ Calendario USA (⭐️⭐️/⭐️⭐️⭐️) — Semana ${A}–${B}" >> $GITHUB_ENV
             echo "NOEVENTS_TEXT=✅ Esta semana no hay eventos relevantes a destacar en USA" >> $GITHUB_ENV
-          else
+          elif [ "$DOW" -ge 2 ] && [ "$DOW" -le 5 ]; then
             HOY=$(date +%Y-%m-%d)
             echo "CAPTION=🗓️ Calendario USA (⭐️⭐️/⭐️⭐️⭐️) — Hoy ${HOY}" >> $GITHUB_ENV
             echo "NOEVENTS_TEXT=✅ Hoy no hay eventos relevantes a destacar en USA" >> $GITHUB_ENV
+          else
+            HOY=$(date +%Y-%m-%d)
+            echo "CAPTION=🗓️ Calendario USA — ${HOY}" >> $GITHUB_ENV
+            echo "NOEVENTS_TEXT=" >> $GITHUB_ENV
           fi
 
       # ---------- Caso 1: hay foto ----------
@@ -231,9 +236,9 @@ jobs:
               r.raise_for_status()
           PY
 
-      # ---------- Caso 2: no hay eventos (enviar texto) ----------
+      # ---------- Caso 2: no hay eventos ----------
       - name: Send to Telegram (No events text)
-        if: ${{ hashFiles('no_events.flag') != '' && hashFiles('calendar.png') == '' }}
+        if: ${{ hashFiles('no_events.flag') != '' && hashFiles('calendar.png') == '' && env.WDAY != '6' && env.WDAY != '7' && env.NOEVENTS_TEXT != '' }}
         env:
           BOT_TOKEN: ${{ secrets.INVESTX_TOKEN }}
           CHAT_ID: ${{ secrets.CHAT_ID }}
@@ -242,7 +247,7 @@ jobs:
           python3 - <<'PY'
           import os, requests
           bot = os.environ['BOT_TOKEN']; chat = os.environ['CHAT_ID']
-          text = os.environ.get('NOEVENTS_TEXT', '✅ No hay eventos relevantes a destacar en USA')
+          text = os.environ['NOEVENTS_TEXT']
           r = requests.post(
               f"https://api.telegram.org/bot{bot}/sendMessage",
               data={"chat_id": chat, "text": text, "parse_mode":"HTML"},
