@@ -25,7 +25,7 @@ jobs:
             libgbm1 libasound2 fonts-liberation
           python3 -m pip install --upgrade pip requests
 
-      - name: Setup Node (sin caché)
+      - name: Setup Node
         uses: actions/setup-node@v4
         with:
           node-version: '20'
@@ -48,61 +48,43 @@ jobs:
               return false},{sel,k});if(ok)return true;await s(250)}return false}
           async function nativeFilters(p){
             if(!await clickTxt(p,'button,a,[role="button"],input[type="button"]',['filtro','filtros','filters'],8e3))return false;await s(800);
-            const ok=await p.evaluate(()=>{
-              const m=document.querySelector('.filterPopup, .ecFilterPop, .economicCalendarFilterPopup, .ecEconomicFilterPopup, .ecCalFilterPop,[class*="filterPop"]')||document;
-              const cs=m.querySelectorAll('input[type="checkbox"][name*="country"]');cs.forEach(cb=>{cb.checked=false;cb.dispatchEvent(new Event('change',{bubbles:true}))});
-              let us=[...cs].find(cb=>cb.value==='5');if(!us){us=[...cs].find(cb=>/estados unidos|united states|ee\.uu/i.test((cb.closest('label,li,div')?.innerText||'')))}if(!us)return false;
-              us.checked=true;us.dispatchEvent(new Event('change',{bubbles:true}));
-              const imp=m.querySelectorAll('input[type="checkbox"][name*="importance"]');let f=0;imp.forEach(cb=>{if(['2','3'].includes(cb.value)){cb.checked=true;f++}else cb.checked=false;cb.dispatchEvent(new Event('change',{bubbles:true}))});
-              const btn=[...m.querySelectorAll('button,a,input[type="submit"],input[type="button"]')].find(b=>/aplicar|apply|mostrar|show/i.test((b.innerText||b.value||'')));btn?.click();return f>=2
-            });await s(1500);return ok}
+            return await p.evaluate(()=>{
+              const m=document.querySelector('.filterPopup,[class*="filterPop"]')||document;
+              const cs=m.querySelectorAll('input[type="checkbox"][name*="country"]');
+              cs.forEach(cb=>{cb.checked=false;cb.dispatchEvent(new Event('change',{bubbles:true}))});
+              let us=[...cs].find(cb=>cb.value==='5');
+              if(!us) us=[...cs].find(cb=>/estados unidos|united states|ee\.uu/i.test((cb.closest('label,li,div')?.innerText||'')));
+              if(!us) return false;us.checked=true;us.dispatchEvent(new Event('change',{bubbles:true}));
+              const imp=m.querySelectorAll('input[type="checkbox"][name*="importance"]');
+              imp.forEach(cb=>{cb.checked=(cb.value==='2'||cb.value==='3');cb.dispatchEvent(new Event('change',{bubbles:true}))});
+              const btn=[...m.querySelectorAll('button,a,input[type="submit"],input[type="button"]')].find(b=>/aplicar|apply|mostrar|show/i.test((b.innerText||b.value||'')));btn?.click();
+              return true;
+            });
+          }
           (async()=>{
-            const b=await puppeteer.launch({headless:'new',args:['--no-sandbox','--disable-setuid-sandbox','--lang=es-ES,es','--disable-dev-shm-usage']});
-            const p=await b.newPage();await p.setUserAgent('Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36');
-            await p.setExtraHTTPHeaders({'Accept-Language':'es-ES,es;q=0.9'});await p.setViewport({width:1440,height:2400,deviceScaleFactor:2});
-            try{await p.emulateTimezone('Europe/Madrid')}catch(e){}
+            const b=await puppeteer.launch({headless:'new',args:['--no-sandbox','--disable-setuid-sandbox','--lang=es-ES,es']});
+            const p=await b.newPage();await p.setUserAgent('Mozilla/5.0');
             await p.goto('https://es.investing.com/economic-calendar/',{waitUntil:'domcontentloaded',timeout:6e4});
-            await p.evaluate(()=>{const b=[...document.querySelectorAll("button,a,[role='button']")].find(x=>/aceptar|accept|consent|agree/i.test((x.innerText||'')));b?.click()}).catch(()=>{});
-            await s(800);
-            const dow=new Date().getDay();await clickTxt(p,'a,button',dow===1?['esta semana','this week']:['hoy','today'],6e3);await s(600);
-            await nativeFilters(p);
-            // Filtro DOM y extracción
+            await p.evaluate(()=>{const btn=[...document.querySelectorAll("button,a,[role='button']")].find(x=>/aceptar|accept|consent/i.test((x.innerText||'')));btn?.click()}).catch(()=>{});
+            await s(800);const dow=new Date().getDay();
+            await clickTxt(p,'a,button',dow===1?['esta semana','this week']:['hoy','today'],6e3);await s(600);
+            await nativeFilters(p);await s(1500);
             const data=await p.evaluate(()=>{
-              const keepUS=tr=>{const c=tr.getAttribute('data-country')||tr.dataset?.country||'';if(c==='5')return true;
-                const f=tr.querySelector('td.flagCur span,[class*="flag"] span');const cl=(f?.className||'').toLowerCase();const tt=(f?.getAttribute('title')||'').toLowerCase();
-                if(/usa|united\s*states/.test(cl)||/estados unidos|united states/.test(tt))return true;
-                const cur=(tr.querySelector('td.cur,td.currency,td:nth-child(2)')?.innerText||'').trim().toUpperCase();return cur==='USD'};
-              const star23=tr=>{const imp=tr.getAttribute('data-importance')||tr.dataset?.importance||'';if(imp==='2'||imp==='3')return true;
-                const s=tr.querySelector('td.sentiment,td.impact,.sentiment');if(!s)return false;return s.querySelectorAll('i,svg').length>=2};
-              document.querySelectorAll('#topBarAndAds,.midHeader,#banner,.stickyFooter,.js-consent-banner,iframe,.adsbygoogle,.advertisement').forEach(e=>e.remove());
               const rows=[...document.querySelectorAll('tr[id^="eventRowId_"],tr.js-event-item,tr[data-event-datetime]')];
-              rows.forEach(tr=>{if(!(keepUS(tr)&&star23(tr)))tr.style.display='none'});
-              // ocultar cabeceras vacías
-              [...document.querySelectorAll('tr.theDay,tr.newDay,tr.dayHeader')].forEach(h=>{
-                let ok=false;for(let n=h.nextElementSibling;n;n=n.nextElementSibling){if(n.matches('tr.theDay,tr.newDay,tr.dayHeader'))break;if(n.matches('tr[id^="eventRowId_"],tr.js-event-item,tr[data-event-datetime]')&&n.style.display!=='none'){ok=true;break}}
-                if(!ok)h.style.display='none'
-              });
               const vis=rows.filter(tr=>tr.style.display!=='none');
-              const evts=vis.map(tr=>{
+              return {events:vis.map(tr=>{
                 const tds=tr.querySelectorAll('td');
                 const title=(tr.querySelector('td.event,td.event a,td.left')?.innerText||tds[2]?.innerText||'').trim();
-                const impAttr=tr.getAttribute('data-importance')||'';let importance=impAttr?parseInt(impAttr,10):0;
-                if(!importance||isNaN(importance)){const s=tr.querySelector('td.sentiment,td.impact,.sentiment');if(s){const c=s.querySelectorAll('i,svg').length;importance=c>=3?3:c>=2?2:1}}
-                const iso=tr.getAttribute('data-event-datetime')||'';return {
-                  iso, time:(tds[0]?.innerText||'').trim(), currency:(tds[1]?.innerText||'').trim(),
-                  title, importance, forecast:(tr.querySelector('td.fore,td.forecast')?.innerText||'').trim(),
-                  previous:(tr.querySelector('td.prev,td.previous')?.innerText||'').trim()
-                }
-              });
-              return {events:evts, visible:evts.length};
+                const imp=tr.getAttribute('data-importance')||'';let importance=imp?parseInt(imp,10):0;
+                if(!importance){const s=tr.querySelector('td.sentiment,.sentiment');if(s){const c=s.querySelectorAll('i,svg').length;importance=c>=3?3:c>=2?2:1}}
+                return {iso:tr.getAttribute('data-event-datetime')||'',time:(tds[0]?.innerText||'').trim(),
+                        title,importance,forecast:(tr.querySelector('td.fore,td.forecast')?.innerText||'').trim(),
+                        previous:(tr.querySelector('td.prev,td.previous')?.innerText||'').trim()}
+              }),visible:vis.length};
             });
-            // captura
-            const tbl=await p.$('#economicCalendarData')||await p.$('table.genTbl')||await p.$('table');
-            await p.evaluate(()=>window.scrollTo(0,0));await s(400);
-            if(tbl)await tbl.screenshot({path:'calendar.png'});else await p.screenshot({path:'calendar.png',fullPage:true});
-            fs.writeFileSync('calendar.json',JSON.stringify(data,null,2));
-            await b.close(); if(!data.visible){process.exit(0)}
-          })().catch(e=>{console.error(e);process.exit(1)});
+            const tbl=await p.$('#economicCalendarData')||await p.$('table.genTbl');if(tbl)await tbl.screenshot({path:'calendar.png'});
+            fs.writeFileSync('calendar.json',JSON.stringify(data,null,2));await b.close();if(!data.visible)process.exit(0);
+          })();
           EOF
           node grab.js
 
@@ -111,14 +93,12 @@ jobs:
         run: |
           export TZ=Europe/Madrid
           if [ "$(date +%u)" -eq 1 ]; then
-            A=$(date -d "monday this week" +%Y-%m-%d)
-            B=$(date -d "sunday this week" +%Y-%m-%d)
-            echo "CAPTION=🗓️ Calendario USA (⭐️⭐️/⭐️⭐️⭐️) — Semana ${A}–${B}" >> $GITHUB_ENV
+            echo "CAPTION=🗓️ Calendario USA (⭐️⭐️/⭐️⭐️⭐️) — Semana $(date -d 'monday this week' +%Y-%m-%d)–$(date -d 'sunday this week' +%Y-%m-%d)" >> $GITHUB_ENV
           else
             echo "CAPTION=🗓️ Calendario USA (⭐️⭐️/⭐️⭐️⭐️) — Hoy $(date +%Y-%m-%d)" >> $GITHUB_ENV
           fi
 
-      - name: Build summary (10–12 líneas)
+      - name: Build summary (3–5 eventos, párrafos)
         if: ${{ hashFiles('calendar.json') != '' }}
         run: |
           python3 - <<'PY'
@@ -126,52 +106,44 @@ jobs:
           from zoneinfo import ZoneInfo
           tz=ZoneInfo("Europe/Madrid"); now=datetime.datetime.now(tz)
           weekly=(now.isoweekday()==1)
-          data=json.load(open('calendar.json','r',encoding='utf-8'))
-          ev=data.get('events',[])
+          ev=json.load(open('calendar.json'))['events']
           def when(e):
-            iso=e.get('iso') or ''
-            if iso:
-              try:
-                return datetime.datetime.fromisoformat(iso.replace('Z','+00:00')).astimezone(tz)
-              except: pass
-            t=(e.get('time') or '00:00')[:5]
-            hh,mm=(t.split(':')+['0'])[:2]
-            return now.replace(hour=int(hh),minute=int(mm),second=0,microsecond=0)
-          def score(e): return (3 if e.get('importance')==3 else 0)*2 + (1 if e.get('importance')==2 else 0)
-          ev=[{**e,'when':when(e),'score':score(e)} for e in ev if score(e)>0]
+            try: return datetime.datetime.fromisoformat(e['iso'].replace('Z','+00:00')).astimezone(tz)
+            except: return now
+          def score(e):
+            key=e['title'].lower()
+            if any(k in key for k in ['fed','fomc','powell']): return 10
+            if any(k in key for k in ['ipc','inflación','cpi','pce']): return 9
+            if any(k in key for k in ['nóminas','empleo','nfp']): return 8
+            if any(k in key for k in ['pib','gdp']): return 7
+            if any(k in key for k in ['pmi','ism']): return 6
+            return e.get('importance',0)
+          for e in ev: e['when']=when(e);e['score']=score(e)
           ev.sort(key=lambda x:(-x['score'],x['when']))
-          take=6 if weekly else 4
-          ev=ev[:take]
-          if not ev: open('summary.txt','w').close(); raise SystemExit(0)
-          def impact(t):
-            t=t.lower()
-            if any(k in t for k in ['ipc','inflación','cpi','ppi']): return "sensibilidad en Tesoros y USD; guía de tipos."
-            if 'pce' in t: return "referencia clave para la Fed y curva."
-            if any(k in t for k in ['fed','fomc','powel']): return "posible reprecio de la senda de tipos."
-            if any(k in t for k in ['nóminas','empleo','nfp','desempleo']): return "lectura de ciclo laboral; mueve bonos y riesgo."
-            if any(k in t for k in ['pmi','ism']): return "termómetro de actividad; cíclicas vs defensivas."
-            if any(k in t for k in ['ventas minoristas','retail sales']): return "pulso del consumo; impacto en growth."
-            if any(k in t for k in ['pib','gdp']): return "actividad agregada; curva y cíclicas."
-            if any(k in t for k in ['inventarios','crudo','eia']): return "afecta energía; WTI/Brent."
-            return "posible movimiento en USD, bonos y equity."
+          sel=ev[:5 if weekly else 3]
+          if not sel: open('summary.txt','w').close(); raise SystemExit
           lines=["📰 <b>Resumen principales noticias</b>"]
-          for e in ev:
-            imp="⭐️⭐️⭐️" if e['score']>=6 else "⭐️⭐️"
+          for e in sel:
             hhmm=e['when'].strftime('%a %H:%M')
-            title=(e.get('title') or '').strip()
-            if len(title)>90: title=title[:87]+"…"
-            meta=[]
-            if e.get('forecast'): meta.append(f"prev {e['forecast']}")
-            if e.get('previous'): meta.append(f"ant {e['previous']}")
-            meta=" — "+", ".join(meta) if meta else ""
-            lines.append(f"• {imp} {hhmm}: {title}{meta}. {impact(title)}")
-            if len(lines)>=12: break
-          text="\n".join(lines)
-          open('summary.txt','w',encoding='utf-8').write(text)
+            t=e['title']
+            if 'ipc' in t.lower() or 'cpi' in t.lower():
+              text=f"📌 <b>IPC USA ({hhmm})</b>\nDato de inflación clave para la Fed. Una lectura superior a lo esperado reforzaría la idea de más presión en tipos y fortalecería al USD, mientras que un dato débil apoyaría a renta variable y growth."
+            elif 'fed' in t.lower() or 'fomc' in t.lower():
+              text=f"📌 <b>Reunión FOMC / Powell ({hhmm})</b>\nEvento central de política monetaria. El foco estará en el comunicado y tono de Powell. Un mensaje restrictivo podría aumentar volatilidad en USD y yields; uno más dovish daría impulso a equities."
+            elif 'nóminas' in t.lower() or 'nfp' in t.lower():
+              text=f"📌 <b>Nóminas no agrícolas ({hhmm})</b>\nReferencia sobre la fortaleza laboral. Un dato fuerte sostendría expectativas de política restrictiva, presionando bonos; una sorpresa negativa favorecería apuestas de recortes y a los índices."
+            elif 'pce' in t.lower():
+              text=f"📌 <b>PCE subyacente ({hhmm})</b>\nIndicador preferido por la Fed para medir inflación. Cualquier desviación respecto al consenso puede mover fuerte USD y curva de tipos."
+            elif 'pib' in t.lower() or 'gdp' in t.lower():
+              text=f"📌 <b>PIB trimestral ({hhmm})</b>\nMide el pulso de la economía USA. Una lectura al alza reforzaría la narrativa de resiliencia, apoyando yields; un dato flojo reavivaría apuestas de recorte de tipos."
+            else:
+              text=f"📌 <b>{t} ({hhmm})</b>\nPosible catalizador para USD, bonos y equity según sorpresa frente al consenso."
+            lines.append(text)
+          open('summary.txt','w',encoding='utf-8').write("\n\n".join(lines))
           PY
 
       - name: Send to Telegram
-        if: ${{ hashFiles('calendar.png') != '' }}
+        if: ${{ hashFiles('calendar.png') != '' && hashFiles('summary.txt') != '' }}
         env:
           BOT_TOKEN: ${{ secrets.INVESTX_TOKEN }}
           CHAT_ID: ${{ secrets.CHAT_ID }}
@@ -179,16 +151,14 @@ jobs:
         run: |
           python3 - <<'PY'
           import os,requests
-          bot=os.environ['BOT_TOKEN']; chat=os.environ['CHAT_ID']
+          bot=os.environ['BOT_TOKEN'];chat=os.environ['CHAT_ID']
           caption=os.environ.get('CAPTION','Calendario USA')
-          summary=""
-          if os.path.exists('summary.txt'):
-            summary=open('summary.txt','r',encoding='utf-8').read().strip()
+          summary=open('summary.txt','r',encoding='utf-8').read().strip()
           if summary: caption=(caption+"\n\n"+summary)[:1024]
           with open("calendar.png","rb") as f:
-            r=requests.post(
-              f"https://api.telegram.org/bot{bot}/sendPhoto",
+            r=requests.post(f"https://api.telegram.org/bot{bot}/sendPhoto",
               data={"chat_id":chat,"caption":caption,"parse_mode":"HTML"},
-              files={"photo":("calendar.png",f,"image/png")}, timeout=90
-            ); print(r.status_code, r.text); r.raise_for_status()
+              files={"photo":("calendar.png",f,"image/png")},timeout=90)
+            print(r.status_code,r.text);r.raise_for_status()
           PY
+
