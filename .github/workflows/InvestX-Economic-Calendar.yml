@@ -36,56 +36,152 @@ jobs:
           test -f package.json || npm init -y
           npm i puppeteer
 
-      - name: Build scraper (PNG + JSON)
+      - name: Build scraper (PNG + JSON)  # PATCH
         run: |
           cat > grab.js <<'EOF'
           const puppeteer=require('puppeteer');const fs=require('fs');
-          const s=ms=>new Promise(r=>setTimeout(r,ms));
-          async function clickTxt(p,sel,keys,ms=8e3){const end=Date.now()+ms,k=keys.map(t=>t.toLowerCase());
-            while(Date.now()<end){const ok=await p.evaluate(({sel,k})=>{
-              for(const el of document.querySelectorAll(sel)){const t=((el.innerText||el.textContent||el.value||'')+'').toLowerCase().trim();
-                if(k.some(w=>t.includes(w))){el.click();return true}}
-              return false},{sel,k});if(ok)return true;await s(250)}return false}
-          async function nativeFilters(p){
-            if(!await clickTxt(p,'button,a,[role="button"],input[type="button"]',['filtro','filtros','filters'],8e3))return false;await s(800);
-            return await p.evaluate(()=>{
-              const m=document.querySelector('.filterPopup,[class*="filterPop"]')||document;
-              const cs=m.querySelectorAll('input[type="checkbox"][name*="country"]');
-              cs.forEach(cb=>{cb.checked=false;cb.dispatchEvent(new Event('change',{bubbles:true}))});
-              let us=[...cs].find(cb=>cb.value==='5');
-              if(!us) us=[...cs].find(cb=>/estados unidos|united states|ee\.uu/i.test((cb.closest('label,li,div')?.innerText||'')));
-              if(!us) return false;us.checked=true;us.dispatchEvent(new Event('change',{bubbles:true}));
-              const imp=m.querySelectorAll('input[type="checkbox"][name*="importance"]');
-              imp.forEach(cb=>{cb.checked=(cb.value==='2'||cb.value==='3');cb.dispatchEvent(new Event('change',{bubbles:true}))});
-              const btn=[...m.querySelectorAll('button,a,input[type="submit"],input[type="button"]')].find(b=>/aplicar|apply|mostrar|show/i.test((b.innerText||b.value||'')));btn?.click();
-              return true;
-            });
+          const wait=ms=>new Promise(r=>setTimeout(r,ms));
+
+          async function clickTxt(p,sel,keys,ms=8000){
+            const end=Date.now()+ms, want=keys.map(x=>x.toLowerCase());
+            while(Date.now()<end){
+              const ok=await p.evaluate(({sel,want})=>{
+                for(const el of document.querySelectorAll(sel)){
+                  const t=((el.innerText||el.textContent||el.value||'')+'').toLowerCase().trim();
+                  if(want.some(w=>t.includes(w))){el.click();return true;}
+                } return false;
+              },{sel,want});
+              if(ok) return true; await wait(250);
+            } return false;
           }
-          (async()=>{
-            const b=await puppeteer.launch({headless:'new',args:['--no-sandbox','--disable-setuid-sandbox','--lang=es-ES,es']});
-            const p=await b.newPage();await p.setUserAgent('Mozilla/5.0');
-            await p.goto('https://es.investing.com/economic-calendar/',{waitUntil:'domcontentloaded',timeout:6e4});
-            await p.evaluate(()=>{const btn=[...document.querySelectorAll("button,a,[role='button']")].find(x=>/aceptar|accept|consent/i.test((x.innerText||'')));btn?.click()}).catch(()=>{});
-            await s(800);const dow=new Date().getDay();
-            await clickTxt(p,'a,button',dow===1?['esta semana','this week']:['hoy','today'],6e3);await s(600);
-            await nativeFilters(p);await s(1500);
-            const data=await p.evaluate(()=>{
-              const rows=[...document.querySelectorAll('tr[id^="eventRowId_"],tr.js-event-item,tr[data-event-datetime]')];
-              const vis=rows.filter(tr=>tr.style.display!=='none');
-              return {events:vis.map(tr=>{
-                const tds=tr.querySelectorAll('td');
-                const title=(tr.querySelector('td.event,td.event a,td.left')?.innerText||tds[2]?.innerText||'').trim();
-                const imp=tr.getAttribute('data-importance')||'';let importance=imp?parseInt(imp,10):0;
-                if(!importance){const s=tr.querySelector('td.sentiment,.sentiment');if(s){const c=s.querySelectorAll('i,svg').length;importance=c>=3?3:c>=2?2:1}}
-                return {iso:tr.getAttribute('data-event-datetime')||'',time:(tds[0]?.innerText||'').trim(),
-                        title,importance,forecast:(tr.querySelector('td.fore,td.forecast')?.innerText||'').trim(),
-                        previous:(tr.querySelector('td.prev,td.previous')?.innerText||'').trim()}
-              }),visible:vis.length};
+
+          async function openAndFilter(p){
+            // abrir filtros
+            await clickTxt(p,'button,a,[role="button"],input[type="button"]',['filtro','filtros','filters'],8000);
+            await wait(600);
+            // marcar USA + 2/3 estrellas
+            await p.evaluate(()=>{
+              const modal=document.querySelector('.filterPopup,[class*="filterPop"]')||document;
+              const cbs=[...modal.querySelectorAll('input[type="checkbox"][name*="country"]')];
+              cbs.forEach(cb=>{cb.checked=false;cb.dispatchEvent(new Event('change',{bubbles:true}))});
+              let us=cbs.find(cb=>cb.value==='5')||
+                     cbs.find(cb=>/estados unidos|united states|ee\.uu/i.test((cb.closest('label,li,div')?.innerText||'')));
+              if(us){us.checked=true;us.dispatchEvent(new Event('change',{bubbles:true}))}
+              const imp=[...modal.querySelectorAll('input[type="checkbox"][name*="importance"]')];
+              imp.forEach(cb=>{cb.checked=(cb.value==='2'||cb.value==='3');cb.dispatchEvent(new Event('change',{bubbles:true}))});
+              const btn=[...modal.querySelectorAll('button,a,input[type="submit"],input[type="button"]')].find(b=>/aplicar|apply|mostrar|show/i.test((b.innerText||b.value||''))); btn?.click();
             });
-            const tbl=await p.$('#economicCalendarData')||await p.$('table.genTbl');if(tbl)await tbl.screenshot({path:'calendar.png'});
-            fs.writeFileSync('calendar.json',JSON.stringify(data,null,2));await b.close();if(!data.visible)process.exit(0);
-          })();
+            await wait(1200);
+          }
+
+          function cleanTitle(tr){
+            const pick = (...xs)=>xs.find(Boolean);
+            const byAttr = tr.getAttribute('data-event-title');
+            const aTitle = tr.querySelector('td.event a[title]')?.getAttribute('title');
+            const aria   = tr.querySelector('td.event [aria-label]')?.getAttribute('aria-label');
+            const txtSel = tr.querySelector('td.event, td.left, td.event a')?.textContent;
+            const raw = (pick(byAttr,aTitle,aria,txtSel)||'').replace(/\s+/g,' ').trim();
+            // descarta textos que son horas o vacíos
+            if (/^\d{1,2}:\d{2}$/.test(raw) || raw.length < 4) return '';
+            return raw;
+          }
+
+          function parseEventRow(tr){
+            const tds=tr.querySelectorAll('td');
+            const time=(tds[0]?.innerText||'').trim();
+            let title=cleanTitle(tr);
+            // fallback: intenta otra celda, pero evita coger la hora
+            if(!title){
+              const alt=(tds[2]?.innerText||'').trim();
+              title = (/^\d{1,2}:\d{2}$/.test(alt)?'':alt);
+            }
+            // importancia
+            let imp = parseInt(tr.getAttribute('data-importance')||'0',10);
+            if(!imp||isNaN(imp)){
+              const s=tr.querySelector('td.sentiment,td.impact,.sentiment');
+              if(s){ const n=s.querySelectorAll('i,svg').length; imp = n>=3?3:(n>=2?2:1); }
+            }
+            // iso: puede venir vacío o ser epoch; guardamos string tal cual
+            const iso = tr.getAttribute('data-event-datetime') || '';
+            const forecast=(tr.querySelector('td.fore,td.forecast')?.innerText||'').trim();
+            const previous=(tr.querySelector('td.prev,td.previous')?.innerText||'').trim();
+            return { time, title, importance: imp||0, iso, forecast, previous };
+          }
+
+          (async()=>{
+            const browser=await puppeteer.launch({headless:'new',args:['--no-sandbox','--disable-setuid-sandbox','--lang=es-ES,es']});
+            const page=await browser.newPage();
+            await page.setUserAgent('Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36');
+            await page.setExtraHTTPHeaders({'Accept-Language':'es-ES,es;q=0.9'});
+            await page.setViewport({width:1440,height:2400,deviceScaleFactor:2});
+            await page.goto('https://es.investing.com/economic-calendar/',{waitUntil:'domcontentloaded',timeout:60000});
+            await page.evaluate(()=>{const b=[...document.querySelectorAll("button,a,[role='button']")].find(x=>/aceptar|accept|consent|agree/i.test((x.innerText||''))); b?.click();}).catch(()=>{});
+            await wait(600);
+            const dow=new Date().getDay();
+            await clickTxt(page,'a,button', dow===1?['esta semana','this week']:['hoy','today'], 6000);
+            await wait(500);
+            await openAndFilter(page);
+            await wait(600);
+
+            // Oculta ruido y recoge filas visibles
+            await page.evaluate(()=>{
+              document.querySelectorAll('#topBarAndAds,.midHeader,#banner,.stickyFooter,.js-consent-banner,iframe,.adsbygoogle,.advertisement').forEach(e=>e.remove());
+              // quita cabeceras sin hijos
+              const isEvent = el => el.matches('tr[id^="eventRowId_"],tr.js-event-item,tr[data-event-datetime]');
+              [...document.querySelectorAll('tr.theDay,tr.newDay,tr.dayHeader')].forEach(h=>{
+                let ok=false; for(let n=h.nextElementSibling;n;n=n.nextElementSibling){ if(n.matches('tr.theDay,tr.newDay,tr.dayHeader')) break; if(isEvent(n) && n.style.display!=='none'){ ok=true; break; } }
+                if(!ok) h.style.display='none';
+              });
+            });
+
+            const rows = await page.$$eval('tr[id^="eventRowId_"],tr.js-event-item,tr[data-event-datetime]', els =>
+              els.filter(tr=>tr.style.display!=='none').map(tr=>{
+                const tds=tr.querySelectorAll('td');
+                // devolvemos lo mínimo; la lógica fina va en parseEventRow del lado Node
+                return tr.outerHTML;
+              })
+            );
+
+            // Re-parse en Node para título robusto
+            const { JSDOM } = await import('jsdom').catch(()=>({JSDOM:null}));
+            let events=[];
+            if(JSDOM){
+              for(const html of rows){
+                const dom=new JSDOM(html); const tr=dom.window.document.querySelector('tr');
+                // reinyecta helpers locales
+                tr.querySelector = tr.querySelector.bind(tr);
+                tr.querySelectorAll = tr.querySelectorAll.bind(tr);
+                const tds=tr.querySelectorAll('td'); // warm-up
+                // replicate parseEventRow here:
+                const pick=(...xs)=>xs.find(Boolean);
+                const time=(tds[0]?.textContent||'').trim();
+                const byAttr=tr.getAttribute('data-event-title');
+                const aTitle=tr.querySelector('td.event a[title]')?.getAttribute('title');
+                const aria  =tr.querySelector('td.event [aria-label]')?.getAttribute('aria-label');
+                const txtSel=tr.querySelector('td.event, td.left, td.event a')?.textContent;
+                let title=(pick(byAttr,aTitle,aria,txtSel)||'').replace(/\s+/g,' ').trim();
+                if(/^\d{1,2}:\d{2}$/.test(title)||title.length<4){ const alt=(tds[2]?.textContent||'').trim(); title = (/^\d{1,2}:\d{2}$/.test(alt)?'':alt); }
+                let imp=parseInt(tr.getAttribute('data-importance')||'0',10); if(!imp||isNaN(imp)){ const s=tr.querySelector('td.sentiment,td.impact,.sentiment'); if(s){const n=s.querySelectorAll('i,svg').length; imp=n>=3?3:(n>=2?2:1);} }
+                const iso=tr.getAttribute('data-event-datetime')||'';
+                const forecast=(tr.querySelector('td.fore,td.forecast')?.textContent||'').trim();
+                const previous=(tr.querySelector('td.prev,td.previous')?.textContent||'').trim();
+                events.push({time,title,importance:imp||0,iso,forecast,previous});
+              }
+            }
+
+            // screenshot
+            const table=await page.$('#economicCalendarData')||await page.$('table.genTbl');
+            if(table) await table.screenshot({path:'calendar.png'});
+
+            fs.writeFileSync('calendar.json', JSON.stringify({events}, null, 2));
+            await browser.close();
+            if(!events.length) process.exit(0);
+          })().catch(e=>{console.error(e);process.exit(1);});
           EOF
+
+          # jsdom para el parse fino del título
+          test -f package.json || npm init -y
+          npm i puppeteer jsdom
           node grab.js
 
       - name: Build caption (ES/Madrid)
@@ -98,49 +194,109 @@ jobs:
             echo "CAPTION=🗓️ Calendario USA (⭐️⭐️/⭐️⭐️⭐️) — Hoy $(date +%Y-%m-%d)" >> $GITHUB_ENV
           fi
 
-      - name: Build summary (3–5 eventos, párrafos)
+      - name: Build summary (3–5 eventos, párrafos)  # PATCH
         if: ${{ hashFiles('calendar.json') != '' }}
         run: |
           python3 - <<'PY'
-          import json,datetime
+          import json, re, unicodedata
+          from datetime import datetime
           from zoneinfo import ZoneInfo
-          tz=ZoneInfo("Europe/Madrid"); now=datetime.datetime.now(tz)
-          weekly=(now.isoweekday()==1)
-          ev=json.load(open('calendar.json'))['events']
-          def when(e):
-            try: return datetime.datetime.fromisoformat(e['iso'].replace('Z','+00:00')).astimezone(tz)
-            except: return now
+          tz = ZoneInfo("Europe/Madrid")
+
+          data = json.load(open('calendar.json', encoding='utf-8'))
+          evts = data.get('events', [])
+
+          def norm(s):
+            s = unicodedata.normalize('NFKD', s or '').encode('ascii','ignore').decode()
+            s = re.sub(r'\s+',' ', s).strip().lower()
+            return s
+
+          # ranking por palabra clave + importancia
           def score(e):
-            key=e['title'].lower()
-            if any(k in key for k in ['fed','fomc','powell']): return 10
-            if any(k in key for k in ['ipc','inflación','cpi','pce']): return 9
-            if any(k in key for k in ['nóminas','empleo','nfp']): return 8
-            if any(k in key for k in ['pib','gdp']): return 7
-            if any(k in key for k in ['pmi','ism']): return 6
-            return e.get('importance',0)
-          for e in ev: e['when']=when(e);e['score']=score(e)
-          ev.sort(key=lambda x:(-x['score'],x['when']))
-          sel=ev[:5 if weekly else 3]
-          if not sel: open('summary.txt','w').close(); raise SystemExit
+            t = norm(e.get('title',''))
+            imp = int(e.get('importance') or 0)
+            kw = [
+              (('fed','fomc','powell'), 100),
+              (('ipc','cpi','inflacion','pce'), 90),
+              (('nominas','empleo','nfp','desempleo'), 80),
+              (('pib','gdp'), 70),
+              (('pmi','ism'), 60),
+              ((), imp) # fallback
+            ]
+            for keys, base in kw:
+              if keys and any(k in t for k in keys): return base + imp
+            return imp
+
+          # limpia eventos sin título
+          evts = [e for e in evts if e.get('title') and len(e['title'])>3]
+
+          # de-dup por título normalizado
+          seen=set(); dedup=[]
+          for e in evts:
+            t = norm(e['title'])
+            if t in seen: continue
+            seen.add(t); dedup.append(e)
+          evts = dedup
+
+          # ordena y recorta
+          evts.sort(key=lambda e: (-score(e), e.get('time','')))
+          take = 5 if datetime.now(tz).isoweekday()==1 else 3
+          sel = evts[:take]
+
+          if not sel:
+            open('summary.txt','w').close(); raise SystemExit(0)
+
+          def pretty_time(e):
+            # si no hay iso fiable, usa la hora tal cual del calendario (más seguro que nuestro parse)
+            hhmm = (e.get('time') or '').strip()
+            if hhmm and re.match(r'^\d{1,2}:\d{2}$', hhmm):
+              # añade día corto si viene en iso (opcional)
+              return hhmm
+            # fallback iso → hora local
+            iso = e.get('iso') or ''
+            try:
+              dt = datetime.fromisoformat(iso.replace('Z','+00:00')).astimezone(tz)
+              return dt.strftime('%a %H:%M')
+            except:
+              return hhmm or '--:--'
+
+          def para(e):
+            t = e['title'].strip()
+            tlow = norm(t)
+            hhmm = pretty_time(e)
+            prev = e.get('previous')
+            fore = e.get('forecast')
+
+            lead = f"📌 <b>{t} ({hhmm})</b>"
+            ctx=""
+            if any(k in tlow for k in ['ipc','cpi']):
+              ctx="Dato de inflación clave para la Fed. Sorpresa al alza endurecería expectativas de tipos y apoyaría al USD/yields; a la baja favorecería a growth y a la compresión de la curva."
+            elif 'pce' in tlow:
+              ctx="PCE subyacente, referencia preferida por la Fed. Desviaciones frente al consenso suelen mover la curva y el dólar de forma notable."
+            elif any(k in tlow for k in ['fed','fomc','powell']):
+              ctx="Comunicación de política monetaria. El foco estará en el comunicado, dot plot y tono de Powell; un mensaje hawkish endurece condiciones financieras, uno dovish apoya a equities."
+            elif any(k in tlow for k in ['nominas','empleo','nfp','desempleo']):
+              ctx="Lectura de mercado laboral. Fortaleza → presión en salarios y yields; debilidad → más probabilidad de recortes y apoyo a la renta variable."
+            elif any(k in tlow for k in ['pib','gdp']):
+              ctx="Pulso de actividad macro. Dato fuerte refuerza resiliencia y puede presionar yields; flojo reaviva apuestas de estímulo/recortes."
+            elif any(k in tlow for k in ['pmi','ism']):
+              ctx="Indicador adelantado de ciclo. Caídas bajo 50 alertan sobre desaceleración; lecturas sólidas sostienen cíclicas y el USD."
+            else:
+              ctx="Catalizador potencial para USD, bonos y equity en función de la sorpresa frente al consenso."
+
+            meta=[]
+            if fore: meta.append(f"consenso {fore}")
+            if prev: meta.append(f"anterior {prev}")
+            extra=(" — "+", ".join(meta)) if meta else ""
+            return f"{lead}\n{ctx}{extra}"
+
           lines=["📰 <b>Resumen principales noticias</b>"]
           for e in sel:
-            hhmm=e['when'].strftime('%a %H:%M')
-            t=e['title']
-            if 'ipc' in t.lower() or 'cpi' in t.lower():
-              text=f"📌 <b>IPC USA ({hhmm})</b>\nDato de inflación clave para la Fed. Una lectura superior a lo esperado reforzaría la idea de más presión en tipos y fortalecería al USD, mientras que un dato débil apoyaría a renta variable y growth."
-            elif 'fed' in t.lower() or 'fomc' in t.lower():
-              text=f"📌 <b>Reunión FOMC / Powell ({hhmm})</b>\nEvento central de política monetaria. El foco estará en el comunicado y tono de Powell. Un mensaje restrictivo podría aumentar volatilidad en USD y yields; uno más dovish daría impulso a equities."
-            elif 'nóminas' in t.lower() or 'nfp' in t.lower():
-              text=f"📌 <b>Nóminas no agrícolas ({hhmm})</b>\nReferencia sobre la fortaleza laboral. Un dato fuerte sostendría expectativas de política restrictiva, presionando bonos; una sorpresa negativa favorecería apuestas de recortes y a los índices."
-            elif 'pce' in t.lower():
-              text=f"📌 <b>PCE subyacente ({hhmm})</b>\nIndicador preferido por la Fed para medir inflación. Cualquier desviación respecto al consenso puede mover fuerte USD y curva de tipos."
-            elif 'pib' in t.lower() or 'gdp' in t.lower():
-              text=f"📌 <b>PIB trimestral ({hhmm})</b>\nMide el pulso de la economía USA. Una lectura al alza reforzaría la narrativa de resiliencia, apoyando yields; un dato flojo reavivaría apuestas de recorte de tipos."
-            else:
-              text=f"📌 <b>{t} ({hhmm})</b>\nPosible catalizador para USD, bonos y equity según sorpresa frente al consenso."
-            lines.append(text)
+            lines.append(para(e))
+          # límite ~12 líneas → deja 3–5 párrafos; no recortamos cada párrafo
           open('summary.txt','w',encoding='utf-8').write("\n\n".join(lines))
           PY
+
 
       - name: Send to Telegram
         if: ${{ hashFiles('calendar.png') != '' && hashFiles('summary.txt') != '' }}
