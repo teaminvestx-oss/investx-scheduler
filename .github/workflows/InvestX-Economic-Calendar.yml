@@ -36,7 +36,7 @@ jobs:
           test -f package.json || npm init -y
           npm i puppeteer
 
-      # ------------ SCRAPER: PNG + JSON (robusto y sin jsdom) ------------
+      # ------------ SCRAPER: PNG + JSON (robusto) ------------
       - name: Build scraper (PNG + JSON)
         run: |
           cat > grab.js <<'EOF'
@@ -94,11 +94,10 @@ jobs:
             await applyFilters(page);
             await wait(600);
 
-            // Limpieza y extracción en el propio DOM
+            // Limpieza y extracción
             const data = await page.evaluate(()=>{
               const rows = [...document.querySelectorAll('tr[id^="eventRowId_"],tr.js-event-item,tr[data-event-datetime]')];
 
-              // helpers dentro del DOM
               const cleanTitle = (tr)=>{
                 const pick = (...xs)=>xs.find(Boolean);
                 const byAttr = tr.getAttribute('data-event-title');
@@ -116,7 +115,7 @@ jobs:
 
               const events = [];
               for(const tr of rows){
-                if (tr.style.display==='none') continue; // respetar filtro UI
+                if (tr.style.display==='none') continue;
                 const tds = tr.querySelectorAll('td');
                 const time = (tds[0]?.innerText||'').trim();
                 const title = cleanTitle(tr);
@@ -146,8 +145,8 @@ jobs:
             // Captura
             const table = await page.$('#economicCalendarData') || await page.$('table.genTbl');
             if (table) { await table.screenshot({path:'calendar.png'}); }
-            fs.writeFileSync('calendar.json', JSON.stringify(data, null, 2));
 
+            require('fs').writeFileSync('calendar.json', JSON.stringify(data, null, 2));
             await browser.close();
             if (!data.events.length) process.exit(0);
           })().catch(e=>{ console.error(e); process.exit(1); });
@@ -165,25 +164,25 @@ jobs:
             echo "CAPTION=🗓️ Calendario USA (⭐️⭐️/⭐️⭐️⭐️) — Hoy $(date +%Y-%m-%d)" >> $GITHUB_ENV
           fi
 
-      # ------------ RESUMEN: 3–5 eventos, párrafos analistas ------------
-      - name: Build summary (3–5 eventos, párrafos)
+      # ------------ RESUMEN estilo analista (3–5 eventos) ------------
+      - name: Build summary (párrafos 3–5 líneas)
         if: ${{ hashFiles('calendar.json') != '' }}
         run: |
           python3 - <<'PY'
           import json, re, unicodedata
           from datetime import datetime
           from zoneinfo import ZoneInfo
-          tz = ZoneInfo("Europe/Madrid")
 
+          tz = ZoneInfo("Europe/Madrid")
           data = json.load(open('calendar.json', encoding='utf-8'))
-          evts = data.get('events', [])
+          ev = data.get('events', [])
 
           def norm(s):
             s = unicodedata.normalize('NFKD', s or '').encode('ascii','ignore').decode()
             s = re.sub(r'\s+',' ', s).strip().lower()
             return s
 
-          # ranking por palabra clave + importancia
+          # Score por tipo + importancia
           def score(e):
             t = norm(e.get('title',''))
             imp = int(e.get('importance') or 0)
@@ -194,53 +193,59 @@ jobs:
             if any(k in t for k in ['pmi','ism']): return 60 + imp
             return imp
 
-          # limpiar sin título y deduplicar por título normalizado
-          dedup, seen = [], set()
-          for e in evts:
+          # Limpiar y deduplicar por título
+          seen, clean = set(), []
+          for e in ev:
             t = (e.get('title') or '').strip()
             if len(t) < 4: continue
-            key = norm(t)
-            if key in seen: continue
-            seen.add(key); dedup.append(e)
-          evts = dedup
+            k = norm(t)
+            if k in seen: continue
+            seen.add(k); clean.append(e)
+          ev = clean
 
-          # ordenar y seleccionar (semana 5, día 3)
-          evts.sort(key=lambda e: (-score(e), e.get('time','')))
-          take = 5 if datetime.now(tz).isoweekday()==1 else 3
-          sel = evts[:take]
-
+          # Orden y selección
+          weekly = datetime.now(tz).isoweekday()==1
+          ev.sort(key=lambda e: (-score(e), e.get('time','')))
+          sel = ev[:5 if weekly else 3]
           if not sel:
             open('summary.txt','w').close(); raise SystemExit(0)
 
+          # Hora “bonita”: usa la del calendario (más fiable que ISO en Investing)
           def pretty_time(e):
             hhmm = (e.get('time') or '').strip()
-            if hhmm and re.match(r'^\d{1,2}:\d{2}$', hhmm): return hhmm
-            iso = e.get('iso') or ''
-            try:
-              dt = datetime.fromisoformat(iso.replace('Z','+00:00')).astimezone(tz)
-              return dt.strftime('%a %H:%M')
-            except: return hhmm or '--:--'
+            return hhmm if re.match(r'^\d{1,2}:\d{2}$', hhmm) else (hhmm or '--:--')
 
-          def para(e):
+          # Plantillas por tipo (como tu ejemplo)
+          def paragraph(e):
             t = (e.get('title') or '').strip()
             tl = norm(t)
             hhmm = pretty_time(e)
             prev, fore = e.get('previous'), e.get('forecast')
             lead = f"📌 <b>{t} ({hhmm})</b>"
+
             if any(k in tl for k in ['ipc','cpi']):
-              ctx = "Dato de inflación clave para la Fed. Una lectura por encima del consenso endurecería las expectativas de tipos y apoyaría al USD/yields; por debajo favorecería a growth y a la compresión de la curva."
+              ctx = ("La referencia clave de inflación mensual. El mercado vigilará subyacente "
+                     "(servicios ‘supercore’ y alquileres). > consenso → suben Tesoros (rendimientos) "
+                     "y USD; < consenso → respira la curva y apoyan índices growth.")
             elif 'pce' in tl:
-              ctx = "PCE subyacente, indicador preferido por la Fed. Desviaciones frente al consenso suelen mover con fuerza el dólar y la curva de tipos."
+              ctx = ("PCE subyacente, indicador preferido por la Fed. Desviaciones frente al consenso "
+                     "mueven dólar y curva de tipos; sorpresa a la baja suele apoyar a renta variable.")
             elif any(k in tl for k in ['fed','fomc','powell']):
-              ctx = "Se evalúa el comunicado, el dot plot y el tono de Powell. Un mensaje hawkish endurece las condiciones financieras; un tono dovish tiende a apoyar a la renta variable."
+              ctx = ("Importa comunicado y tono de Powell. Hawkish → endurece condiciones financieras "
+                     "(USD/yields ↑, bolsa más volátil); dovish → alivio para equities y crédito.")
             elif any(k in tl for k in ['nominas','empleo','nfp','desempleo']):
-              ctx = "Lectura del mercado laboral. Fortaleza → presión en salarios y yields; debilidad → más probabilidad de recortes y apoyo a los índices."
+              ctx = ("Se miran creación de empleo, salarios/hora y participación. Fuerte + salarios altos "
+                     "mantiene presión de precios (yields ↑, USD ↑); débil abre espacio a recortes y apoya índices.")
             elif any(k in tl for k in ['pib','gdp']):
-              ctx = "Pulso de la actividad. Un dato sólido refuerza la resiliencia y puede presionar yields; un dato flojo reaviva apuestas de recortes."
+              ctx = ("Pulso de actividad macro. Lectura sólida refuerza resiliencia y puede presionar yields; "
+                     "dato flojo reaviva apuestas de recortes y favorece duration.")
             elif any(k in tl for k in ['pmi','ism']):
-              ctx = "Indicador adelantado de ciclo. Lecturas por debajo de 50 alertan de desaceleración; por encima sostienen cíclicas y el USD."
+              ctx = ("Termómetro adelantado del ciclo: foco en nuevas órdenes y precios pagados. "
+                     ">50 sostiene cíclicas y USD; <50 avisa de enfriamiento y favorece defensivas.")
             else:
-              ctx = "Catalizador potencial para USD, bonos y equity en función de la sorpresa frente al consenso."
+              ctx = ("Catalizador para USD, bonos y equity según sorpresa frente al consenso; "
+                     "vigilar desviaciones y tono de los componentes.")
+
             meta=[]
             if fore: meta.append(f"consenso {fore}")
             if prev: meta.append(f"anterior {prev}")
@@ -249,8 +254,9 @@ jobs:
 
           lines = ["📰 <b>Resumen principales noticias</b>"]
           for e in sel:
-            lines.append(para(e))
+            lines.append(paragraph(e))
 
+          # Guardar (3–5 párrafos; 10–12 líneas aprox.)
           open('summary.txt','w',encoding='utf-8').write("\n\n".join(lines))
           PY
 
