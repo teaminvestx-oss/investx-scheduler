@@ -16,524 +16,179 @@ jobs:
     timeout-minutes: 20
 
     steps:
-      # ---------- Dependencias del sistema ----------
       - name: System deps
         run: |
-          set -e
           sudo apt-get update -y
-          sudo apt-get install -y \
-            jq curl unzip python3 python3-pip \
+          sudo apt-get install -y jq curl unzip python3 python3-pip \
             libatk1.0-0 libatk-bridge2.0-0 libnss3 libx11-6 libx11-xcb1 \
             libxcomposite1 libxdamage1 libxext6 libxfixes3 libxrandr2 \
             libgbm1 libasound2 fonts-liberation
           python3 -m pip install --upgrade pip requests
 
-      - name: Install pup
-        run: |
-          curl -sL https://github.com/ericchiang/pup/releases/download/v0.4.0/pup_v0.4.0_linux_amd64.zip -o pup.zip
-          sudo unzip -o pup.zip -d /usr/local/bin/
-
-      # ---------- Node/Puppeteer ----------
-      - name: Setup Node
+      - name: Setup Node (sin caché)
         uses: actions/setup-node@v4
         with:
           node-version: '20'
-          cache: 'npm'
+          check-latest: true
 
-      - name: Init & install Puppeteer
+      - name: Install Puppeteer
         run: |
           test -f package.json || npm init -y
-          npm install puppeteer
+          npm i puppeteer
 
-      # ---------- Script principal (scrape + JSON + screenshot) ----------
-      - name: Build grab script
+      - name: Build scraper (PNG + JSON)
         run: |
           cat > grab.js <<'EOF'
-          const puppeteer = require('puppeteer');
-          const fs = require('fs');
-          const sleep = (ms)=>new Promise(r=>setTimeout(r,ms));
-          const log = (...a)=>console.log('[grab]', ...a);
-
-          function safeTxt(el) {
-            return (el?.innerText || el?.textContent || '').trim();
-          }
-
-          async function clickByText(page, selector, labels, timeoutMs = 8000) {
-            const until = Date.now() + timeoutMs;
-            const wants = labels.map(t => t.toLowerCase());
-            while (Date.now() < until) {
-              const clicked = await page.evaluate(({selector, wants}) => {
-                for (const el of document.querySelectorAll(selector)) {
-                  const txt = ((el.innerText || el.textContent || el.value || '')+'').toLowerCase().trim();
-                  if (wants.some(w => txt.includes(w))) { el.click(); return true; }
-                }
-                return false;
-              }, {selector, wants});
-              if (clicked) return true;
-              await sleep(250);
-            }
-            return false;
-          }
-
-          async function forceLoadRows(page, passes = 3) {
-            for (let i=0;i<30;i++) {
-              const rows = await page.$$eval('tr[id^="eventRowId_"], tr.js-event-item, tr[data-event-datetime]', els => els.length);
-              if (rows >= 10) break;
-              await sleep(300);
-            }
-            for (let s=0; s<passes; s++) {
-              await page.evaluate(() => window.scrollBy(0, window.innerHeight*2));
-              await sleep(800);
-            }
-            await page.evaluate(() => window.scrollTo(0, 0));
-            await sleep(500);
-          }
-
-          async function applyNativeFilters(page) {
-            // Abrir "Filtros"
-            const opened = await clickByText(page, 'button,a,[role="button"],input[type="button"]', ['filtro','filtros','filters'], 8000);
-            if (!opened) { log('Filters button not found'); return false; }
-            await sleep(800);
-
-            // Dentro del popup, desmarcar todos los países y marcar solo EE.UU.; importancia 2 y 3
-            const ok = await page.evaluate(() => {
-              const modal = document.querySelector('.filterPopup, .ecFilterPop, .economicCalendarFilterPopup, .ecEconomicFilterPopup, .ecCalFilterPop, [class*="filterPop"]') || document;
-
-              // Países
-              const allCountries = modal.querySelectorAll('input[type="checkbox"][name*="country"]');
-              allCountries.forEach(cb => { cb.checked = false; cb.dispatchEvent(new Event('change', {bubbles:true})); });
-
-              // USA por value=5 o por texto
-              let us = Array.from(allCountries).find(cb => cb.value === '5');
-              if (!us) {
-                us = Array.from(allCountries).find(cb => {
-                  const li = cb.closest('label, li, div');
-                  const txt = (li?.innerText || '').toLowerCase();
-                  return /estados unidos|united states|ee\.uu/.test(txt);
-                });
-              }
-              if (!us) return false;
-              us.checked = true; us.dispatchEvent(new Event('change', {bubbles:true}));
-
-              // Importancia (2 y 3)
-              const imp = modal.querySelectorAll('input[type="checkbox"][name*="importance"]');
-              let found = 0;
-              imp.forEach(cb => {
-                if (cb.value === '2' || cb.value === '3') { cb.checked = true; found++; }
-                else { cb.checked = false; }
-                cb.dispatchEvent(new Event('change', {bubbles:true}));
+          const puppeteer=require('puppeteer');const fs=require('fs');
+          const s=ms=>new Promise(r=>setTimeout(r,ms));
+          async function clickTxt(p,sel,keys,ms=8e3){const end=Date.now()+ms,k=keys.map(t=>t.toLowerCase());
+            while(Date.now()<end){const ok=await p.evaluate(({sel,k})=>{
+              for(const el of document.querySelectorAll(sel)){const t=((el.innerText||el.textContent||el.value||'')+'').toLowerCase().trim();
+                if(k.some(w=>t.includes(w))){el.click();return true}}
+              return false},{sel,k});if(ok)return true;await s(250)}return false}
+          async function nativeFilters(p){
+            if(!await clickTxt(p,'button,a,[role="button"],input[type="button"]',['filtro','filtros','filters'],8e3))return false;await s(800);
+            const ok=await p.evaluate(()=>{
+              const m=document.querySelector('.filterPopup, .ecFilterPop, .economicCalendarFilterPopup, .ecEconomicFilterPopup, .ecCalFilterPop,[class*="filterPop"]')||document;
+              const cs=m.querySelectorAll('input[type="checkbox"][name*="country"]');cs.forEach(cb=>{cb.checked=false;cb.dispatchEvent(new Event('change',{bubbles:true}))});
+              let us=[...cs].find(cb=>cb.value==='5');if(!us){us=[...cs].find(cb=>/estados unidos|united states|ee\.uu/i.test((cb.closest('label,li,div')?.innerText||'')))}if(!us)return false;
+              us.checked=true;us.dispatchEvent(new Event('change',{bubbles:true}));
+              const imp=m.querySelectorAll('input[type="checkbox"][name*="importance"]');let f=0;imp.forEach(cb=>{if(['2','3'].includes(cb.value)){cb.checked=true;f++}else cb.checked=false;cb.dispatchEvent(new Event('change',{bubbles:true}))});
+              const btn=[...m.querySelectorAll('button,a,input[type="submit"],input[type="button"]')].find(b=>/aplicar|apply|mostrar|show/i.test((b.innerText||b.value||'')));btn?.click();return f>=2
+            });await s(1500);return ok}
+          (async()=>{
+            const b=await puppeteer.launch({headless:'new',args:['--no-sandbox','--disable-setuid-sandbox','--lang=es-ES,es','--disable-dev-shm-usage']});
+            const p=await b.newPage();await p.setUserAgent('Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36');
+            await p.setExtraHTTPHeaders({'Accept-Language':'es-ES,es;q=0.9'});await p.setViewport({width:1440,height:2400,deviceScaleFactor:2});
+            try{await p.emulateTimezone('Europe/Madrid')}catch(e){}
+            await p.goto('https://es.investing.com/economic-calendar/',{waitUntil:'domcontentloaded',timeout:6e4});
+            await p.evaluate(()=>{const b=[...document.querySelectorAll("button,a,[role='button']")].find(x=>/aceptar|accept|consent|agree/i.test((x.innerText||'')));b?.click()}).catch(()=>{});
+            await s(800);
+            const dow=new Date().getDay();await clickTxt(p,'a,button',dow===1?['esta semana','this week']:['hoy','today'],6e3);await s(600);
+            await nativeFilters(p);
+            // Filtro DOM y extracción
+            const data=await p.evaluate(()=>{
+              const keepUS=tr=>{const c=tr.getAttribute('data-country')||tr.dataset?.country||'';if(c==='5')return true;
+                const f=tr.querySelector('td.flagCur span,[class*="flag"] span');const cl=(f?.className||'').toLowerCase();const tt=(f?.getAttribute('title')||'').toLowerCase();
+                if(/usa|united\s*states/.test(cl)||/estados unidos|united states/.test(tt))return true;
+                const cur=(tr.querySelector('td.cur,td.currency,td:nth-child(2)')?.innerText||'').trim().toUpperCase();return cur==='USD'};
+              const star23=tr=>{const imp=tr.getAttribute('data-importance')||tr.dataset?.importance||'';if(imp==='2'||imp==='3')return true;
+                const s=tr.querySelector('td.sentiment,td.impact,.sentiment');if(!s)return false;return s.querySelectorAll('i,svg').length>=2};
+              document.querySelectorAll('#topBarAndAds,.midHeader,#banner,.stickyFooter,.js-consent-banner,iframe,.adsbygoogle,.advertisement').forEach(e=>e.remove());
+              const rows=[...document.querySelectorAll('tr[id^="eventRowId_"],tr.js-event-item,tr[data-event-datetime]')];
+              rows.forEach(tr=>{if(!(keepUS(tr)&&star23(tr)))tr.style.display='none'});
+              // ocultar cabeceras vacías
+              [...document.querySelectorAll('tr.theDay,tr.newDay,tr.dayHeader')].forEach(h=>{
+                let ok=false;for(let n=h.nextElementSibling;n;n=n.nextElementSibling){if(n.matches('tr.theDay,tr.newDay,tr.dayHeader'))break;if(n.matches('tr[id^="eventRowId_"],tr.js-event-item,tr[data-event-datetime]')&&n.style.display!=='none'){ok=true;break}}
+                if(!ok)h.style.display='none'
               });
-
-              // Aplicar
-              const btn = Array.from(modal.querySelectorAll('button,a,input[type="submit"],input[type="button"]'))
-                .find(b => /aplicar|apply|mostrar|show/i.test((b.innerText||b.value||'')+''));
-              btn?.click();
-              return found >= 2;
+              const vis=rows.filter(tr=>tr.style.display!=='none');
+              const evts=vis.map(tr=>{
+                const tds=tr.querySelectorAll('td');
+                const title=(tr.querySelector('td.event,td.event a,td.left')?.innerText||tds[2]?.innerText||'').trim();
+                const impAttr=tr.getAttribute('data-importance')||'';let importance=impAttr?parseInt(impAttr,10):0;
+                if(!importance||isNaN(importance)){const s=tr.querySelector('td.sentiment,td.impact,.sentiment');if(s){const c=s.querySelectorAll('i,svg').length;importance=c>=3?3:c>=2?2:1}}
+                const iso=tr.getAttribute('data-event-datetime')||'';return {
+                  iso, time:(tds[0]?.innerText||'').trim(), currency:(tds[1]?.innerText||'').trim(),
+                  title, importance, forecast:(tr.querySelector('td.fore,td.forecast')?.innerText||'').trim(),
+                  previous:(tr.querySelector('td.prev,td.previous')?.innerText||'').trim()
+                }
+              });
+              return {events:evts, visible:evts.length};
             });
-
-            if (!ok) { log('Could not programmatically set filters'); return false; }
-            await sleep(1500);
-            return true;
-          }
-
-          function parseRow(tr) {
-            const getAttr = (k)=>tr.getAttribute(k) || tr.dataset?.[k.replace(/^data-/, '')] || '';
-
-            // Importancia: por atributo o contando iconos
-            let importance = parseInt(getAttr('data-importance')||'0',10);
-            if (!importance || isNaN(importance)) {
-              const senti = tr.querySelector('td.sentiment, td.impact, .sentiment');
-              if (senti) {
-                const iTags = senti.querySelectorAll('i, svg').length;
-                importance = iTags >= 3 ? 3 : (iTags >= 2 ? 2 : 1);
-              }
-            }
-            if (![1,2,3].includes(importance)) importance = 0;
-
-            // Fecha/hora
-            const dateStr = getAttr('data-event-datetime') || getAttr('data-time-zone');
-            let iso = null;
-            if (dateStr) {
-              // Investing suele traer ISO o epoch; intentamos parse simple
-              const d = new Date(dateStr);
-              if (!isNaN(d)) iso = d.toISOString();
-            }
-            // Celdas
-            const tds = tr.querySelectorAll('td');
-            const timeTxt = safeTxt(tds[0]);
-            const curTxt  = safeTxt(tds[1]);
-            const titleEl = tr.querySelector('td.event, td.event a, td.left');
-            const title   = safeTxt(titleEl) || safeTxt(tds[2]);
-
-            const actual  = safeTxt(tr.querySelector('td.act, td.actual'));
-            const forecast= safeTxt(tr.querySelector('td.fore, td.forecast'));
-            const previous= safeTxt(tr.querySelector('td.prev, td.previous'));
-
-            // País
-            let country = getAttr('data-country') || '';
-            if (!country) {
-              const flagSpan = tr.querySelector('td.flagCur span, .flagCur span, [class*="flag"] span');
-              const titleFlag = (flagSpan?.getAttribute('title') || '').toLowerCase();
-              if (/estados unidos|united states|usa/.test(titleFlag)) country = '5';
-            }
-
-            return {
-              iso, time: timeTxt, currency: curTxt, title, importance,
-              country, actual, forecast, previous
-            };
-          }
-
-          (async () => {
-            const browser = await puppeteer.launch({
-              headless: 'new',
-              args: ['--no-sandbox','--disable-setuid-sandbox','--lang=es-ES,es','--disable-dev-shm-usage']
-            });
-            const page = await browser.newPage();
-            await page.setUserAgent('Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36');
-            await page.setExtraHTTPHeaders({ 'Accept-Language': 'es-ES,es;q=0.9' });
-            await page.setViewport({ width: 1440, height: 2400, deviceScaleFactor: 2 });
-            try { await page.emulateTimezone('Europe/Madrid'); } catch(e) {}
-
-            const url = 'https://es.investing.com/economic-calendar/';
-            log('Go to', url);
-            await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
-
-            // Cookies
-            await page.evaluate(() => {
-              const btn = [...document.querySelectorAll("button,a,[role='button']")]
-                .find(b => /aceptar|accept|consent|agree/i.test((b.innerText||'')+''));
-              btn?.click();
-            }).catch(()=>{});
-            await sleep(800);
-
-            // Lunes -> Esta semana | Resto -> Hoy
-            const dow = new Date().getDay();
-            if (dow === 1) { await clickByText(page, 'a,button', ['esta semana','this week'], 6000); }
-            else { await clickByText(page, 'a,button', ['hoy','today'], 6000); }
-            await sleep(600);
-
-            const nativeOK = await applyNativeFilters(page);
-            await forceLoadRows(page, 4);
-
-            // Filtro DOM
-            const rowsSelector = 'tr[id^="eventRowId_"], tr.js-event-item, tr[data-event-datetime]';
-            const visibleCount = await page.evaluate((selector) => {
-              const isUSRow = (tr) => {
-                const c = tr.getAttribute('data-country') || tr.dataset?.country || '';
-                if (c === '5') return true;
-                const flagSpan = tr.querySelector('td.flagCur span, .flagCur span, [class*="flag"] span');
-                const flagClass = (flagSpan?.className || '').toLowerCase();
-                const flagTitle = (flagSpan?.getAttribute('title') || '').toLowerCase();
-                if (/usa|united\s*states/.test(flagClass) || /estados unidos|united states/.test(flagTitle)) return true;
-                const curCell = tr.querySelector('td.cur, td.currency, td:nth-child(2)');
-                const curTxt = (curCell?.innerText || '').trim().toUpperCase();
-                if (curTxt === 'USD') return true;
-                return false;
-              };
-              const has2or3Stars = (tr) => {
-                const imp = tr.getAttribute('data-importance') || tr.dataset?.importance || '';
-                if (imp === '2' || imp === '3') return true;
-                const senti = tr.querySelector('td.sentiment, td.impact, .sentiment');
-                if (!senti) return false;
-                const iTags = senti.querySelectorAll('i, svg').length;
-                return iTags >= 2;
-              };
-
-              for (const sel of [
-                '#topBarAndAds','.midHeader','#banner','.stickyFooter','.js-consent-banner',
-                'iframe','.adsbygoogle','.advertisement'
-              ]) document.querySelectorAll(sel).forEach(e => e.remove());
-
-              const rows = Array.from(document.querySelectorAll(selector));
-              let kept = 0;
-              rows.forEach(tr => {
-                const keep = isUSRow(tr) && has2or3Stars(tr);
-                if (!keep) tr.style.display = 'none'; else kept++;
-              });
-
-              // Cabeceras con hijos visibles
-              const dayHeaders = Array.from(document.querySelectorAll('tr.theDay, tr.newDay, tr.dayHeader'));
-              const isVisibleEvent = (el) => el.matches(selector) && el.style.display !== 'none';
-              for (const hdr of dayHeaders) {
-                let has = false;
-                for (let sib = hdr.nextElementSibling; sib; sib = sib.nextElementSibling) {
-                  if (sib.matches('tr.theDay, tr.newDay, tr.dayHeader')) break;
-                  if (isVisibleEvent(sib)) { has = true; break; }
-                }
-                if (!has) hdr.style.display = 'none';
-              }
-              return kept;
-            }, rowsSelector);
-
-            // Extraer eventos visibles a JSON
-            const events = await page.evaluate((selector) => {
-              const toEvent = (tr) => {
-                const getAttr = (k)=>tr.getAttribute(k) || tr.dataset?.[k.replace(/^data-/, '')] || '';
-                let importance = parseInt(getAttr('data-importance')||'0',10);
-                if (!importance || isNaN(importance)) {
-                  const senti = tr.querySelector('td.sentiment, td.impact, .sentiment');
-                  if (senti) {
-                    const iTags = senti.querySelectorAll('i, svg').length;
-                    importance = iTags >= 3 ? 3 : (iTags >= 2 ? 2 : 1);
-                  }
-                }
-                if (![1,2,3].includes(importance)) importance = 0;
-
-                const tds = tr.querySelectorAll('td');
-                const tm   = (tds[0]?.innerText || '').trim();
-                const cur  = (tds[1]?.innerText || '').trim();
-                const title= (tr.querySelector('td.event, td.event a, td.left')?.innerText || tds[2]?.innerText || '').trim();
-
-                const actual   = (tr.querySelector('td.act, td.actual')?.innerText || '').trim();
-                const forecast = (tr.querySelector('td.fore, td.forecast')?.innerText || '').trim();
-                const previous = (tr.querySelector('td.prev, td.previous')?.innerText || '').trim();
-
-                let iso = getAttr('data-event-datetime') || '';
-                return { iso, time: tm, currency: cur, title, importance, actual, forecast, previous };
-              };
-
-              const vis = [];
-              document.querySelectorAll(selector).forEach(tr => {
-                if (tr.style.display === 'none') return;
-                if (tr.matches('tr.theDay, tr.newDay, tr.dayHeader')) return;
-                vis.push(toEvent(tr));
-              });
-              return vis;
-            }, rowsSelector);
-
-            // Captura
-            const table = await page.$('#economicCalendarData') || await page.$('table.genTbl') || await page.$('table');
-            await page.evaluate(() => window.scrollTo(0, 0));
-            await sleep(500);
-            if (table) await table.screenshot({ path: 'calendar.png' });
-            else await page.screenshot({ path: 'calendar.png', fullPage: true });
-
-            // Guardar JSON
-            fs.writeFileSync('calendar.json', JSON.stringify({ nativeOK, visibleCount, events }, null, 2));
-
-            if (!visibleCount || visibleCount === 0 || !events.length) {
-              log('No visible events after filtering. Finishing without image/summary.');
-              await browser.close(); process.exit(0); // salida suave
-            }
-
-            log('✅ Captura y JSON generados.');
-            await browser.close();
-          })().catch(err => { console.error(err); process.exit(1); });
+            // captura
+            const tbl=await p.$('#economicCalendarData')||await p.$('table.genTbl')||await p.$('table');
+            await p.evaluate(()=>window.scrollTo(0,0));await s(400);
+            if(tbl)await tbl.screenshot({path:'calendar.png'});else await p.screenshot({path:'calendar.png',fullPage:true});
+            fs.writeFileSync('calendar.json',JSON.stringify(data,null,2));
+            await b.close(); if(!data.visible){process.exit(0)}
+          })().catch(e=>{console.error(e);process.exit(1)});
           EOF
+          node grab.js
 
-      # ---------- Ejecutar scraper ----------
-      - name: Run grabber
-        id: grabber
-        run: node grab.js
-        continue-on-error: true
-
-      # ---------- Construir caption ----------
       - name: Build caption (ES/Madrid)
         if: ${{ hashFiles('calendar.png') != '' }}
         run: |
           export TZ=Europe/Madrid
-          DOW=$(date +%u)
-          if [ "$DOW" -eq 1 ]; then
+          if [ "$(date +%u)" -eq 1 ]; then
             A=$(date -d "monday this week" +%Y-%m-%d)
             B=$(date -d "sunday this week" +%Y-%m-%d)
             echo "CAPTION=🗓️ Calendario USA (⭐️⭐️/⭐️⭐️⭐️) — Semana ${A}–${B}" >> $GITHUB_ENV
           else
-            HOY=$(date +%Y-%m-%d)
-            echo "CAPTION=🗓️ Calendario USA (⭐️⭐️/⭐️⭐️⭐️) — Hoy ${HOY}" >> $GITHUB_ENV
+            echo "CAPTION=🗓️ Calendario USA (⭐️⭐️/⭐️⭐️⭐️) — Hoy $(date +%Y-%m-%d)" >> $GITHUB_ENV
           fi
 
-      # ---------- Construir resumen interpretado (10–12 líneas) ----------
-      - name: Build summary text
+      - name: Build summary (10–12 líneas)
         if: ${{ hashFiles('calendar.json') != '' }}
-        id: build_summary
         run: |
           python3 - <<'PY'
-          import os, json, datetime, textwrap, sys
+          import json,datetime
           from zoneinfo import ZoneInfo
-
-          tz = ZoneInfo("Europe/Madrid")
-          weekly = datetime.datetime.now(tz).isoweekday() == 1
-
-          try:
-            data = json.load(open('calendar.json','r',encoding='utf-8'))
-          except Exception as e:
-            print("No JSON:", e); sys.exit(0)
-
-          events = data.get('events', [])
-          if not events:
-            print("No events in JSON"); sys.exit(0)
-
-          # Parse ISO/time and score importance: 3*2 + 2*1
-          def parse_iso(iso, fallback_time):
-            # Investing a veces deja iso vacío; intentamos con hora local "HH:MM"
+          tz=ZoneInfo("Europe/Madrid"); now=datetime.datetime.now(tz)
+          weekly=(now.isoweekday()==1)
+          data=json.load(open('calendar.json','r',encoding='utf-8'))
+          ev=data.get('events',[])
+          def when(e):
+            iso=e.get('iso') or ''
             if iso:
               try:
                 return datetime.datetime.fromisoformat(iso.replace('Z','+00:00')).astimezone(tz)
-              except:
-                pass
-            # fallback: hoy con hora HH:MM
-            try:
-              hh, mm = (fallback_time or "00:00").split(":")[:2]
-              now = datetime.datetime.now(tz)
-              return now.replace(hour=int(hh), minute=int(mm), second=0, microsecond=0)
-            except:
-              return datetime.datetime.now(tz)
-
-          for ev in events:
-            ev['when'] = parse_iso(ev.get('iso') or '', ev.get('time') or '')
-            ev['impScore'] = (3 if ev.get('importance')==3 else 0)*2 + (1 if ev.get('importance')==2 else 0)
-
-          # Orden: importancia desc, fecha asc
-          events.sort(key=lambda e: (-e['impScore'], e['when']))
-
-          # Selección por modo
-          max_items = 6 if weekly else 4
-          sel = [e for e in events if e['impScore']>0][:max_items]
-          if not sel:
-            print("No selected events"); sys.exit(0)
-
-          # Helper impacto rápido según palabra clave
-          def quick_impact(title):
-            t = title.lower()
-            if 'ipc' in t or 'inflación' in t or 'cpi' in t or 'ppi' in t:
-              return "sensibilidad en Tesoros y USD; impacto directo en expectativas de tipos."
-            if 'pce' in t:
-              return "referencia clave para la Fed; efecto en curva de tipos y growth."
-            if 'fed' in t or 'fomc' in t or 'powel' in t:
-              return "volatilidad en USD y yields; reprecio de la senda de tipos."
-            if 'nóminas' in t or 'empleo' in t or 'nfp' in t or 'desempleo' in t:
-              return "ritmo de empleo → presión salarial; impacto en riesgo y bonos."
-            if 'pmi' in t or 'ism' in t:
-              return "termómetro de ciclo; riesgo para cíclicas y USD."
-            if 'ventas minoristas' in t or 'retail sales' in t:
-              return "pulso del consumo; efecto en growth/defensivas."
-            if 'pib' in t or 'gdp' in t:
-              return "lectura de actividad; puede mover curva y cíclicas."
-            if 'inventarios' in t or 'crudo' in t or 'eia' in t:
-              return "puede mover energía; ojo a WTI/Brent."
-            return "posible movimiento en USD, bonos y equity según sorpresa."
-
-          # Formatear líneas (máx. ~10–12 líneas)
-          lines = ["📰 <b>Resumen principales noticias</b>"]
-          for e in sel:
-            hhmm = e['when'].strftime('%a %H:%M')
-            imp = "⭐️⭐️⭐️" if e.get('importance')==3 else "⭐️⭐️"
-            title = e.get('title','').strip()
-            # recorta título si es larguísimo
-            if len(title) > 90:
-              title = title[:87] + "…"
-            extras = []
-            if e.get('forecast'): extras.append(f"prev {e['forecast']}")
-            if e.get('previous'): extras.append(f"ant {e['previous']}")
-            meta = (" — " + ", ".join(extras)) if extras else ""
-            hint = quick_impact(title)
-            lines.append(f"• {imp} {hhmm}: {title}{meta}. {hint}")
-
-          # Limitar a 12 líneas total
-          lines = lines[:12]
-
-          # Cuida límite de 1024 chars en caption (lo uniremos al caption principal)
-          text = "\n".join(lines)
-          if len(text) > 950:
-            # recorta desde el final
-            cut = text[:950].rsplit("\n",1)[0] + "\n• (…)"
-            text = cut
-
-          # Export env
-          print("SUMMARY<<EOF")
-          print(text)
-          print("EOF")
+              except: pass
+            t=(e.get('time') or '00:00')[:5]
+            hh,mm=(t.split(':')+['0'])[:2]
+            return now.replace(hour=int(hh),minute=int(mm),second=0,microsecond=0)
+          def score(e): return (3 if e.get('importance')==3 else 0)*2 + (1 if e.get('importance')==2 else 0)
+          ev=[{**e,'when':when(e),'score':score(e)} for e in ev if score(e)>0]
+          ev.sort(key=lambda x:(-x['score'],x['when']))
+          take=6 if weekly else 4
+          ev=ev[:take]
+          if not ev: open('summary.txt','w').close(); raise SystemExit(0)
+          def impact(t):
+            t=t.lower()
+            if any(k in t for k in ['ipc','inflación','cpi','ppi']): return "sensibilidad en Tesoros y USD; guía de tipos."
+            if 'pce' in t: return "referencia clave para la Fed y curva."
+            if any(k in t for k in ['fed','fomc','powel']): return "posible reprecio de la senda de tipos."
+            if any(k in t for k in ['nóminas','empleo','nfp','desempleo']): return "lectura de ciclo laboral; mueve bonos y riesgo."
+            if any(k in t for k in ['pmi','ism']): return "termómetro de actividad; cíclicas vs defensivas."
+            if any(k in t for k in ['ventas minoristas','retail sales']): return "pulso del consumo; impacto en growth."
+            if any(k in t for k in ['pib','gdp']): return "actividad agregada; curva y cíclicas."
+            if any(k in t for k in ['inventarios','crudo','eia']): return "afecta energía; WTI/Brent."
+            return "posible movimiento en USD, bonos y equity."
+          lines=["📰 <b>Resumen principales noticias</b>"]
+          for e in ev:
+            imp="⭐️⭐️⭐️" if e['score']>=6 else "⭐️⭐️"
+            hhmm=e['when'].strftime('%a %H:%M')
+            title=(e.get('title') or '').strip()
+            if len(title)>90: title=title[:87]+"…"
+            meta=[]
+            if e.get('forecast'): meta.append(f"prev {e['forecast']}")
+            if e.get('previous'): meta.append(f"ant {e['previous']}")
+            meta=" — "+", ".join(meta) if meta else ""
+            lines.append(f"• {imp} {hhmm}: {title}{meta}. {impact(title)}")
+            if len(lines)>=12: break
+          text="\n".join(lines)
+          open('summary.txt','w',encoding='utf-8').write(text)
           PY
 
-      - name: Export summary to env
-        if: ${{ steps.build_summary.outcome == 'success' }}
-        run: |
-          echo "${{ steps.build_summary.outputs.SUMMARY }}" >/dev/null 2>&1 || true
-        shell: bash
-
-      # ---------- Enviar a Telegram ----------
-      - name: Send to Telegram (caption + resumen + imagen)
-        if: ${{ hashFiles('calendar.png') != '' && hashFiles('calendar.json') != '' }}
+      - name: Send to Telegram
+        if: ${{ hashFiles('calendar.png') != '' }}
         env:
           BOT_TOKEN: ${{ secrets.INVESTX_TOKEN }}
           CHAT_ID: ${{ secrets.CHAT_ID }}
           CAPTION: ${{ env.CAPTION }}
         run: |
           python3 - <<'PY'
-          import os, requests, re
-
-          bot = os.environ.get('BOT_TOKEN')
-          chat = os.environ.get('CHAT_ID')
-          base_caption = os.environ.get('CAPTION','Calendario USA')
-
-          # Recupera el SUMMARY impreso por el paso anterior desde los logs de GHA:
-          # GHA no expone outputs multiline fácilmente con cat; aquí re-leemos el archivo si existe.
-          summary = ""
-          try:
-            # Como no tenemos archivo, volvemos a construir desde calendar.json por seguridad ligera:
-            import json, datetime
-            from zoneinfo import ZoneInfo
-            tz = ZoneInfo("Europe/Madrid")
-            data = json.load(open('calendar.json','r',encoding='utf-8'))
-            events = data.get('events', [])
-            if events:
-              # marcador: si el paso anterior imprimió "SUMMARY<<EOF ... EOF" al log no es accesible; re-gen corto:
-              def imp(e): return "⭐️⭐️⭐️" if e.get('importance')==3 else ("⭐️⭐️" if e.get('importance')==2 else "⭐️")
-              def when(e):
-                iso = e.get('iso') or ""
-                if iso:
-                  try:
-                    from datetime import datetime
-                    dt = datetime.fromisoformat(iso.replace('Z','+00:00')).astimezone(tz)
-                    return dt.strftime('%a %H:%M')
-                  except: pass
-                return (e.get('time') or "").strip() or "--:--"
-              def impact(title):
-                t=title.lower()
-                if any(k in t for k in ['ipc','inflación','cpi','ppi']): return "sensibilidad en Tesoros y USD."
-                if 'pce' in t: return "referencia clave para la Fed."
-                if any(k in t for k in ['fed','fomc','powel']): return "reprecio de la senda de tipos."
-                if any(k in t for k in ['nóminas','empleo','nfp','desempleo']): return "impacto en riesgo y bonos."
-                if any(k in t for k in ['pmi','ism']): return "termómetro de ciclo."
-                if any(k in t for k in ['ventas minoristas','retail sales']): return "pulso del consumo."
-                if any(k in t for k in ['pib','gdp']): return "lectura de actividad."
-                return "posible movimiento en USD y equity."
-              # prioriza 3⭐ y 2⭐
-              scored = []
-              for e in events:
-                s = (3 if e.get('importance')==3 else 0)*2 + (1 if e.get('importance')==2 else 0)
-                scored.append(( -s, e.get('title',''), e))
-              scored.sort()
-              weekly = (datetime.datetime.now(tz).isoweekday()==1)
-              take = 6 if weekly else 4
-              use = [x[2] for x in scored[:take] if x[0] < 0]
-              lines = ["📰 <b>Resumen principales noticias</b>"]
-              for e in use:
-                title = (e.get('title','') or '').strip()
-                if len(title)>90: title = title[:87]+"…"
-                meta=[]
-                if e.get('forecast'): meta.append(f"prev {e['forecast']}")
-                if e.get('previous'): meta.append(f"ant {e['previous']}")
-                meta = (" — " + ", ".join(meta)) if meta else ""
-                lines.append(f"• {imp(e)} {when(e)}: {title}{meta}. {impact(title)}")
-                if len(lines)>=12: break
-              summary = "\n".join(lines)
-          except Exception as e:
-            summary = ""
-
-          # Ensambla caption final respetando límite ~1024
-          caption = base_caption
-          if summary:
-            combined = f"{base_caption}\n\n{summary}"
-            caption = combined[:1024]
-
+          import os,requests
+          bot=os.environ['BOT_TOKEN']; chat=os.environ['CHAT_ID']
+          caption=os.environ.get('CAPTION','Calendario USA')
+          summary=""
+          if os.path.exists('summary.txt'):
+            summary=open('summary.txt','r',encoding='utf-8').read().strip()
+          if summary: caption=(caption+"\n\n"+summary)[:1024]
           with open("calendar.png","rb") as f:
-              r = requests.post(
-                  f"https://api.telegram.org/bot{bot}/sendPhoto",
-                  data={"chat_id": chat, "caption": caption, "parse_mode":"HTML"},
-                  files={"photo": ("calendar.png", f, "image/png")},
-                  timeout=90
-              )
-              print(r.status_code, r.text)
-              r.raise_for_status()
+            r=requests.post(
+              f"https://api.telegram.org/bot{bot}/sendPhoto",
+              data={"chat_id":chat,"caption":caption,"parse_mode":"HTML"},
+              files={"photo":("calendar.png",f,"image/png")}, timeout=90
+            ); print(r.status_code, r.text); r.raise_for_status()
           PY
