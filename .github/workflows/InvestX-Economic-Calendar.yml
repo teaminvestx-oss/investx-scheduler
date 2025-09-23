@@ -93,21 +93,19 @@ jobs:
             await applyFilters(page);
             await wait(600);
 
+            // Limpieza y extracción: guardamos TODOS los eventos visibles
             const data = await page.evaluate(()=>{
               const rows = [...document.querySelectorAll('tr[id^="eventRowId_"],tr.js-event-item,tr[data-event-datetime]')];
 
               const cleanTitle = (tr)=>{
-                const pick = (...xs)=>xs.find(Boolean);
+                const pick = (...xs)=>xs.find(v=>v && v.trim && v.trim().length>0);
                 const byAttr = tr.getAttribute('data-event-title');
-                const aTitle = tr.querySelector('td.event a[title]')?.getAttribute('title');
-                const aria   = tr.querySelector('td.event [aria-label]')?.getAttribute('aria-label');
-                const txtSel = tr.querySelector('td.event, td.left, td.event a')?.textContent;
-                let raw = (pick(byAttr,aTitle,aria,txtSel)||'').replace(/\s+/g,' ').trim();
-                if (/^\d{1,2}:\d{2}$/.test(raw) || raw.length<4) {
-                  const tds=tr.querySelectorAll('td');
-                  const alt=(tds[2]?.textContent||'').trim();
-                  if(!/^\d{1,2}:\d{2}$/.test(alt) && alt.length>=4) raw = alt;
-                }
+                const aTitle = tr.querySelector('td[class*="event"] a[title]')?.getAttribute('title');
+                const aria   = tr.querySelector('td[class*="event"] [aria-label]')?.getAttribute('aria-label');
+                const txt1   = tr.querySelector('td[class*="event"] a')?.textContent;
+                const txt2   = tr.querySelector('td[class*="event"], td.left, td:nth-child(3)')?.textContent;
+                let raw = (pick(byAttr,aTitle,aria,txt1,txt2) || '').replace(/\s+/g,' ').trim();
+                if (/^\d{1,2}:\d{2}$/.test(raw) || raw.length < 4) raw = '';
                 return raw;
               };
 
@@ -115,7 +113,7 @@ jobs:
               for(const tr of rows){
                 if (tr.style.display==='none') continue; // respeta filtro UI (USA + 2/3⭐)
                 const tds = tr.querySelectorAll('td');
-                const time = (tds[0]?.innerText||'').trim(); // HH:MM local de la web
+                const time = (tds[0]?.innerText||'').trim(); // HH:MM de la web
                 const title = cleanTitle(tr);
                 if(!title) continue;
 
@@ -132,7 +130,7 @@ jobs:
                   time,
                   title,
                   importance: imp,
-                  iso: tr.getAttribute('data-event-datetime') || '', // no la usamos para hora
+                  iso: tr.getAttribute('data-event-datetime') || '',
                   forecast: (tr.querySelector('td.fore,td.forecast')?.innerText||'').trim(),
                   previous: (tr.querySelector('td.prev,td.previous')?.innerText||'').trim()
                 });
@@ -164,7 +162,7 @@ jobs:
           fi
 
       # ---------------- RESUMEN ANALISTA ----------------
-      - name: Build summary (párrafos 3–5 líneas)
+      - name: Build summary (párrafos 3–5 líneas con fallback)
         if: ${{ hashFiles('calendar.json') != '' }}
         run: |
           python3 - <<'PY'
@@ -180,75 +178,78 @@ jobs:
             s = unicodedata.normalize('NFKD', s or '').encode('ascii','ignore').decode()
             return re.sub(r'\s+',' ', s or '').strip().lower()
 
-          # Mapa de tipos → prioridad
+          # Tipo + score
           def kind_and_score(title, imp):
             t = norm(title)
-            if any(k in t for k in ['ipc','cpi']):                return ('CPI',   95+imp)
-            if 'pce' in t:                                        return ('PCE',   92+imp)
             if any(k in t for k in ['fed','fomc','powell']):      return ('FOMC', 100+imp)
-            if any(k in t for k in ['nóminas','nominas','empleo','nfp','desempleo']): return ('NFP',   90+imp)
-            if any(k in t for k in ['pib','gdp']):                return ('GDP',   85+imp)
-            if any(k in t for k in ['pmi','ism']):                return ('PMI',   80+imp)
+            if any(k in t for k in ['ipc','cpi']):                return ('CPI',    95+imp)
+            if 'pce' in t:                                        return ('PCE',    92+imp)
+            if any(k in t for k in ['nóminas','nominas','empleo','nfp','desempleo']): return ('NFP', 90+imp)
+            if any(k in t for k in ['pib','gdp']):                return ('GDP',    85+imp)
+            if any(k in t for k in ['pmi','ism']):                return ('PMI',    80+imp)
             return (None, imp)
 
-          # Dedup por título normalizado y filtrado ESTRICTO: solo tipos conocidos
-          seen, filtered = set(), []
+          # Dedup + anotación de tipo/score (NO filtramos por tipo aún)
+          seen, annotated = set(), []
           for e in events:
-            title = (e.get('title') or '').strip()
-            if len(title) < 4: continue
-            kind, sc = kind_and_score(title, int(e.get('importance') or 0))
-            if not kind: continue
-            key = norm(title)
+            t = (e.get('title') or '').strip()
+            if len(t) < 4: continue
+            k, sc = kind_and_score(t, int(e.get('importance') or 0))
+            key = norm(t)
             if key in seen: continue
-            seen.add(key)
-            e['_kind'], e['_score'] = kind, sc
-            filtered.append(e)
+            seen.add(key); e['_kind'], e['_score'] = k, sc
+            annotated.append(e)
 
-          if not filtered:
+          if not annotated:
             open('summary.txt','w').close(); raise SystemExit(0)
 
-          # Orden por score y hora (texto HH:MM)
-          filtered.sort(key=lambda x: (-x['_score'], x.get('time','')))
+          # Preferimos tipos estrella; si no hay, usamos los mejores 2–3 como fallback
+          stars = [x for x in annotated if x['_kind'] is not None]
+          base  = stars if stars else sorted(annotated, key=lambda x: -x['_score'])[:3]
 
-          # Límite: semana 4, día 3 (para quedar en 10–12 líneas)
-          take = 4 if datetime.now(tz).isoweekday()==1 else 3
-          sel = filtered[:take]
+          weekly = datetime.now(tz).isoweekday()==1
+          take = 4 if weekly else 3
+          sel = sorted(base, key=lambda x: (-x['_score'], x.get('time','')))[:take]
 
           def hhmm(e):
             h = (e.get('time') or '').strip()
             return h if re.match(r'^\d{1,2}:\d{2}$', h) else (h or '--:--')
 
-          def para(e):
+          def paragraph(e):
             t = (e.get('title') or '').strip()
             k = e['_kind']
             time = hhmm(e)
             prev, fore = e.get('previous'), e.get('forecast')
 
-            if k=='CPI':
-              ctx = ("La referencia clave de inflación mensual. El mercado vigilará subyacente "
-                     "(servicios ‘supercore’ y alquileres). > consenso → suben Tesoros (rendimientos) y USD; "
-                     "< consenso → respira la curva y apoyan índices growth.")
+            if k == 'CPI':
               head = f"📌 <b>IPC USA ({time})</b>"
-            elif k=='PCE':
-              ctx = ("PCE subyacente, indicador preferido por la Fed. Desviaciones frente al consenso mueven "
-                     "dólar y curva de tipos; sorpresa a la baja suele apoyar a renta variable.")
+              ctx  = ("La referencia clave de inflación mensual. El mercado vigilará subyacente "
+                      "(servicios ‘supercore’ y alquileres). > consenso → suben Tesoros (rendimientos) y USD; "
+                      "< consenso → respira la curva y apoyan índices growth.")
+            elif k == 'PCE':
               head = f"📌 <b>PCE subyacente ({time})</b>"
-            elif k=='FOMC':
-              ctx = ("Se valoran comunicado y tono de Powell. Hawkish → endurece condiciones financieras "
-                     "(USD/yields ↑, bolsa más volátil); dovish → alivio para equities y crédito.")
+              ctx  = ("Indicador preferido por la Fed. Desviaciones frente al consenso mueven dólar y curva; "
+                      "sorpresa a la baja suele apoyar a renta variable.")
+            elif k == 'FOMC':
               head = f"📌 <b>Decisión FOMC + Powell ({time})</b>"
-            elif k=='NFP':
-              ctx = ("Se miran creación de empleo, salarios/hora y participación. Fuerte + salarios altos mantiene "
-                     "presión de precios (yields ↑, USD ↑); débil abre espacio a recortes y apoya índices.")
+              ctx  = ("Se valoran comunicado y tono de Powell. Hawkish → condiciones financieras más duras "
+                      "(USD/yields ↑, bolsa volátil); dovish → alivio para equities y crédito.")
+            elif k == 'NFP':
               head = f"📌 <b>Nóminas no agrícolas – NFP ({time})</b>"
-            elif k=='GDP':
-              ctx = ("Pulso de la actividad. Lectura sólida refuerza resiliencia y puede presionar yields; "
-                     "dato flojo reaviva apuestas de recortes y favorece duration.")
+              ctx  = ("Se miran creación de empleo, salarios/hora y participación. Fuerte + salarios altos mantiene "
+                      "presión de precios (yields ↑, USD ↑); débil abre espacio a recortes y apoya índices.")
+            elif k == 'GDP':
               head = f"📌 <b>PIB (GDP) ({time})</b>"
-            else: # PMI
-              ctx = ("Termómetro adelantado del ciclo: foco en nuevas órdenes y precios pagados. "
-                     ">50 sostiene cíclicas y USD; <50 avisa de enfriamiento y favorece defensivas.")
+              ctx  = ("Pulso de la actividad. Lectura sólida refuerza resiliencia y puede presionar yields; "
+                      "dato flojo reaviva apuestas de recortes y favorece duration.")
+            elif k == 'PMI':
               head = f"📌 <b>ISM/PMI ({time})</b>"
+              ctx  = ("Termómetro adelantado del ciclo: foco en nuevas órdenes y precios pagados. "
+                      ">50 sostiene cíclicas y USD; <50 avisa de enfriamiento y favorece defensivas.")
+            else:
+              head = f"📌 <b>{t} ({time})</b>"
+              ctx  = ("Catalizador potencial para USD, bonos y equity según sorpresa frente al consenso; "
+                      "vigilar composición del dato y el tono de referencias cruzadas.")
 
             meta=[]
             if fore: meta.append(f"consenso {fore}")
@@ -258,13 +259,13 @@ jobs:
 
           lines = ["📰 <b>Resumen principales noticias</b>"]
           for e in sel:
-            lines.append(para(e))
+            lines.append(paragraph(e))
 
           open('summary.txt','w',encoding='utf-8').write("\n\n".join(lines))
-          # Log para debug
+          # Debug en logs
           print("=== DEBUG selección ===")
           for e in sel:
-            print(e['_kind'], e.get('time'), "|", e.get('title'))
+            print(e.get('_kind'), e.get('time'), "|", e.get('title'))
           PY
 
       # ---------------- ENVÍO A TELEGRAM (2 MENSAJES) ----------------
@@ -287,7 +288,7 @@ jobs:
             ); print(r.status_code,r.text); r.raise_for_status()
           PY
 
-      - name: Send summary to Telegram (texto separado)
+      - name: Send summary to Telegram (mensaje separado)
         if: ${{ hashFiles('summary.txt') != '' }}
         env:
           BOT_TOKEN: ${{ secrets.INVESTX_TOKEN }}
