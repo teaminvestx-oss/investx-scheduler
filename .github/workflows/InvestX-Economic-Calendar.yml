@@ -93,7 +93,7 @@ jobs:
             await applyFilters(page);
             await wait(600);
 
-            // Limpieza y extracción: guardamos TODOS los eventos visibles
+            // Guardamos TODOS los eventos visibles
             const data = await page.evaluate(()=>{
               const rows = [...document.querySelectorAll('tr[id^="eventRowId_"],tr.js-event-item,tr[data-event-datetime]')];
 
@@ -113,7 +113,7 @@ jobs:
               for(const tr of rows){
                 if (tr.style.display==='none') continue; // respeta filtro UI (USA + 2/3⭐)
                 const tds = tr.querySelectorAll('td');
-                const time = (tds[0]?.innerText||'').trim(); // HH:MM de la web
+                const time = (tds[0]?.innerText||'').trim(); // HH:MM
                 const title = cleanTitle(tr);
                 if(!title) continue;
 
@@ -138,7 +138,6 @@ jobs:
               return { events };
             });
 
-            // Captura
             const table = await page.$('#economicCalendarData') || await page.$('table.genTbl');
             if (table) { await table.screenshot({path:'calendar.png'}); }
 
@@ -161,8 +160,8 @@ jobs:
             echo "CAPTION=🗓️ Calendario USA (⭐️⭐️/⭐️⭐️⭐️) — Hoy $(date +%Y-%m-%d)" >> $GITHUB_ENV
           fi
 
-      # ---------------- RESUMEN ANALISTA ----------------
-      - name: Build summary (párrafos 3–5 líneas con fallback)
+      # ---------------- RESUMEN ANALISTA (con agrupaciones inteligentes) ----------------
+      - name: Build summary (párrafos 3–5 líneas)
         if: ${{ hashFiles('calendar.json') != '' }}
         run: |
           python3 - <<'PY'
@@ -171,101 +170,186 @@ jobs:
           from zoneinfo import ZoneInfo
 
           tz = ZoneInfo("Europe/Madrid")
-          data = json.load(open('calendar.json', encoding='utf-8'))
-          events = data.get('events', [])
+          events = json.load(open('calendar.json', encoding='utf-8')).get('events', [])
 
           def norm(s):
             s = unicodedata.normalize('NFKD', s or '').encode('ascii','ignore').decode()
             return re.sub(r'\s+',' ', s or '').strip().lower()
 
-          # Tipo + score
-          def kind_and_score(title, imp):
-            t = norm(title)
-            if any(k in t for k in ['fed','fomc','powell']):      return ('FOMC', 100+imp)
-            if any(k in t for k in ['ipc','cpi']):                return ('CPI',    95+imp)
-            if 'pce' in t:                                        return ('PCE',    92+imp)
-            if any(k in t for k in ['nóminas','nominas','empleo','nfp','desempleo']): return ('NFP', 90+imp)
-            if any(k in t for k in ['pib','gdp']):                return ('GDP',    85+imp)
-            if any(k in t for k in ['pmi','ism']):                return ('PMI',    80+imp)
-            return (None, imp)
+          # --- Clasificación: datos vs discursos ---
+          FED_NAMES = ['powell','waller','jefferson','cook','bowman','williams','bostic','kashkari','daly','goolsbee','barkin','logan','mester','harker','gustavo','michele','patrick']  # amplio
+          POLITICIANS = ['trump','biden','harris']
 
-          # Dedup + anotación de tipo/score (NO filtramos por tipo aún)
-          seen, annotated = set(), []
+          data_cpi, data_pce, data_nfp, data_gdp, data_pmi = [], [], [], [], []
+          data_ca = []     # cuenta corriente / balanza
+          fed_powell, fed_members = [], []
+          politics = []
+
           for e in events:
             t = (e.get('title') or '').strip()
-            if len(t) < 4: continue
-            k, sc = kind_and_score(t, int(e.get('importance') or 0))
-            key = norm(t)
-            if key in seen: continue
-            seen.add(key); e['_kind'], e['_score'] = k, sc
-            annotated.append(e)
+            tl = norm(t)
+            time = (e.get('time') or '').strip()
+            fore, prev = e.get('forecast'), e.get('previous')
 
-          if not annotated:
-            open('summary.txt','w').close(); raise SystemExit(0)
+            # discursos vs datos
+            is_speech = any(k in tl for k in ['comparecencia', 'declaraciones', 'discurso', 'habla'])
+            is_polit  = any(k in tl for k in POLITICIANS)
 
-          # Preferimos tipos estrella; si no hay, usamos los mejores 2–3 como fallback
-          stars = [x for x in annotated if x['_kind'] is not None]
-          base  = stars if stars else sorted(annotated, key=lambda x: -x['_score'])[:3]
+            if is_polit:
+              politics.append(e); continue
 
-          weekly = datetime.now(tz).isoweekday()==1
-          take = 4 if weekly else 3
-          sel = sorted(base, key=lambda x: (-x['_score'], x.get('time','')))[:take]
+            if is_speech or any(n in tl for n in FED_NAMES):
+              if 'powell' in tl:
+                fed_powell.append(e)
+              else:
+                fed_members.append(e)
+              continue
 
-          def hhmm(e):
-            h = (e.get('time') or '').strip()
-            return h if re.match(r'^\d{1,2}:\d{2}$', h) else (h or '--:--')
+            if any(k in tl for k in ['ipc','cpi']):
+              data_cpi.append(e); continue
+            if 'pce' in tl:
+              data_pce.append(e); continue
+            if any(k in tl for k in ['nóminas','nominas','nfp','empleo','desempleo']):
+              data_nfp.append(e); continue
+            if any(k in tl for k in ['pib','gdp']):
+              data_gdp.append(e); continue
+            if any(k in tl for k in ['pmi','ism']):
+              data_pmi.append(e); continue
+            if any(k in tl for k in ['cuenta corriente','balanza por cuenta corriente']):
+              data_ca.append(e); continue
+            # otros datos: los ignoramos para no “ensuciar”
 
-          def paragraph(e):
-            t = (e.get('title') or '').strip()
-            k = e['_kind']
-            time = hhmm(e)
-            prev, fore = e.get('previous'), e.get('forecast')
+          def pick_time_min_max(lst):
+            # trabaja con HH:MM strings
+            if not lst: return ('','')
+            times = [x.get('time','') for x in lst if x.get('time')]
+            if not times: return ('','')
+            return (min(times), max(times))
 
-            if k == 'CPI':
-              head = f"📌 <b>IPC USA ({time})</b>"
-              ctx  = ("La referencia clave de inflación mensual. El mercado vigilará subyacente "
-                      "(servicios ‘supercore’ y alquileres). > consenso → suben Tesoros (rendimientos) y USD; "
-                      "< consenso → respira la curva y apoyan índices growth.")
-            elif k == 'PCE':
-              head = f"📌 <b>PCE subyacente ({time})</b>"
-              ctx  = ("Indicador preferido por la Fed. Desviaciones frente al consenso mueven dólar y curva; "
-                      "sorpresa a la baja suele apoyar a renta variable.")
-            elif k == 'FOMC':
-              head = f"📌 <b>Decisión FOMC + Powell ({time})</b>"
-              ctx  = ("Se valoran comunicado y tono de Powell. Hawkish → condiciones financieras más duras "
-                      "(USD/yields ↑, bolsa volátil); dovish → alivio para equities y crédito.")
-            elif k == 'NFP':
-              head = f"📌 <b>Nóminas no agrícolas – NFP ({time})</b>"
-              ctx  = ("Se miran creación de empleo, salarios/hora y participación. Fuerte + salarios altos mantiene "
-                      "presión de precios (yields ↑, USD ↑); débil abre espacio a recortes y apoya índices.")
-            elif k == 'GDP':
-              head = f"📌 <b>PIB (GDP) ({time})</b>"
-              ctx  = ("Pulso de la actividad. Lectura sólida refuerza resiliencia y puede presionar yields; "
-                      "dato flojo reaviva apuestas de recortes y favorece duration.")
-            elif k == 'PMI':
-              head = f"📌 <b>ISM/PMI ({time})</b>"
-              ctx  = ("Termómetro adelantado del ciclo: foco en nuevas órdenes y precios pagados. "
-                      ">50 sostiene cíclicas y USD; <50 avisa de enfriamiento y favorece defensivas.")
-            else:
-              head = f"📌 <b>{t} ({time})</b>"
-              ctx  = ("Catalizador potencial para USD, bonos y equity según sorpresa frente al consenso; "
-                      "vigilar composición del dato y el tono de referencias cruzadas.")
+          # --- Construcción de párrafos ---
+          paras = []
 
-            meta=[]
+          # CPI
+          if data_cpi:
+            hh = data_cpi[0].get('time','--:--')
+            fore, prev = data_cpi[0].get('forecast'), data_cpi[0].get('previous')
+            meta = []
             if fore: meta.append(f"consenso {fore}")
             if prev: meta.append(f"anterior {prev}")
             extra = (" — " + ", ".join(meta)) if meta else ""
-            return f"{head}\n{ctx}{extra}"
+            paras.append(
+              f"📌 <b>IPC USA ({hh})</b>\n"
+              f"La referencia clave de inflación mensual. El mercado vigilará subyacente (servicios ‘supercore’ y alquileres). "
+              f"> consenso → suben Tesoros (rendimientos) y USD; < consenso → respira la curva y apoyan índices growth.{extra}"
+            )
 
-          lines = ["📰 <b>Resumen principales noticias</b>"]
-          for e in sel:
-            lines.append(paragraph(e))
+          # PCE
+          if data_pce:
+            hh = data_pce[0].get('time','--:--')
+            fore, prev = data_pce[0].get('forecast'), data_pce[0].get('previous')
+            meta = []
+            if fore: meta.append(f"consenso {fore}")
+            if prev: meta.append(f"anterior {prev}")
+            extra = (" — " + ", ".join(meta)) if meta else ""
+            paras.append(
+              f"📌 <b>PCE subyacente ({hh})</b>\n"
+              f"Indicador preferido por la Fed. Desviaciones frente al consenso mueven dólar y curva; sorpresa a la baja suele apoyar a renta variable.{extra}"
+            )
 
-          open('summary.txt','w',encoding='utf-8').write("\n\n".join(lines))
+          # NFP
+          if data_nfp:
+            hh = data_nfp[0].get('time','--:--')
+            paras.append(
+              f"📌 <b>Nóminas no agrícolas – NFP ({hh})</b>\n"
+              f"Se miran creación de empleo, salarios/hora y participación. Fuerte + salarios altos mantiene presión de precios (yields ↑, USD ↑); "
+              f"débil abre espacio a recortes y apoya índices."
+            )
+
+          # PIB
+          if data_gdp:
+            hh = data_gdp[0].get('time','--:--')
+            paras.append(
+              f"📌 <b>PIB (GDP) ({hh})</b>\n"
+              f"Pulso de la actividad. Lectura sólida refuerza resiliencia y puede presionar yields; dato flojo reaviva apuestas de recortes y favorece duration."
+            )
+
+          # PMI (agregado manu/servicios)
+          if data_pmi:
+            tmin, tmax = pick_time_min_max(data_pmi)
+            hh = tmin if tmin==tmax or not tmax else f"{tmin}–{tmax}"
+            paras.append(
+              f"📌 <b>PMI/ISM ({hh})</b>\n"
+              f"Termómetro adelantado del ciclo: foco en nuevas órdenes y precios pagados. >50 sostiene cíclicas y USD; <50 avisa de enfriamiento y favorece defensivas."
+            )
+
+          # Cuenta corriente (dato secundario útil si no hay estrellas)
+          if data_ca and len(paras) < 3:
+            hh = data_ca[0].get('time','--:--')
+            fore, prev = data_ca[0].get('forecast'), data_ca[0].get('previous')
+            meta = []
+            if fore: meta.append(f"consenso {fore}")
+            if prev: meta.append(f"anterior {prev}")
+            extra = (" — " + ", ".join(meta)) if meta else ""
+            paras.append(
+              f"📌 <b>Cuenta corriente ({hh})</b>\n"
+              f"Dato estructural sobre el déficit externo. Efecto en mercado suele ser limitado en el intradía, pero una mejora mayor a la prevista puede aliviar presión sobre el USD a medio plazo.{extra}"
+            )
+
+          # Discursos Powell
+          if fed_powell:
+            tmin, tmax = pick_time_min_max(fed_powell)
+            hh = tmin if tmin==tmax or not tmax else f"{tmin}–{tmax}"
+            paras.append(
+              f"📌 <b>Decisión/comparecencia de Powell ({hh})</b>\n"
+              f"Mercado pendiente del tono del presidente de la Fed. Hawkish → condiciones financieras más duras (USD/yields ↑, bolsa volátil); "
+              f"dovish → alivio para equities y crédito."
+            )
+
+          # Discursos miembros secundarios (agregados con rango)
+          if fed_members:
+            tmin, tmax = pick_time_min_max(fed_members)
+            hh = tmin if tmin==tmax or not tmax else f"{tmin}–{tmax}"
+            # intenta listar hasta 3 apellidos distintos
+            names = []
+            for e in fed_members:
+              tl = norm(e.get('title',''))
+              m = re.findall(r'(bowman|bostic|williams|kashkari|waller|daly|goolsbee|barkin|logan|mester|harker)', tl)
+              if m:
+                names.append(m[0].capitalize())
+            uniq = []
+            for n in names:
+              if n not in uniq:
+                uniq.append(n)
+            who = f" ({', '.join(uniq[:3])})" if uniq else ""
+            paras.append(
+              f"📌 <b>Miembros de la Fed{who} ({hh})</b>\n"
+              f"Intervenciones con menor peso que Powell, salvo mensajes que contradigan la línea oficial. Un tono más hawkish podría presionar al USD y a la curva; impacto normalmente acotado."
+            )
+
+          # Políticos (ruido)
+          if politics and len(paras) < 4:
+            tmin, tmax = pick_time_min_max(politics)
+            hh = tmin if tmin==tmax or not tmax else f"{tmin}–{tmax}"
+            paras.append(
+              f"📌 <b>Declaraciones políticas ({hh})</b>\n"
+              f"Posible ruido de corto plazo. Su impacto en precios suele ser transitorio salvo anuncios con implicaciones fiscales o regulatorias claras."
+            )
+
+          # Selección final: máximo 4 párrafos (semana) o 3 (día)
+          weekly = datetime.now(tz).isoweekday()==1
+          limit = 4 if weekly else 3
+          paras = paras[:limit]
+
+          if not paras:
+            open('summary.txt','w').close(); raise SystemExit(0)
+
+          text = "📰 <b>Resumen principales noticias</b>\n\n" + "\n\n".join(paras)
+          open('summary.txt','w',encoding='utf-8').write(text)
+
           # Debug en logs
-          print("=== DEBUG selección ===")
-          for e in sel:
-            print(e.get('_kind'), e.get('time'), "|", e.get('title'))
+          print("=== DEBUG ===")
+          for p in paras: 
+            print(p.split("\\n")[0])
           PY
 
       # ---------------- ENVÍO A TELEGRAM (2 MENSAJES) ----------------
