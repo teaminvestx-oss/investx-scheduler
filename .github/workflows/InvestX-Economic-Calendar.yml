@@ -36,7 +36,7 @@ jobs:
           test -f package.json || npm init -y
           npm i puppeteer
 
-      # ------------ SCRAPER: PNG + JSON (robusto) ------------
+      # ---------------- SCRAPER ----------------
       - name: Build scraper (PNG + JSON)
         run: |
           cat > grab.js <<'EOF'
@@ -51,8 +51,7 @@ jobs:
                 for(const el of document.querySelectorAll(sel)){
                   const t = ((el.innerText||el.textContent||el.value||'')+'').toLowerCase().trim();
                   if(wants.some(w=>t.includes(w))){ el.click(); return true; }
-                }
-                return false;
+                } return false;
               }, {sel, wants});
               if(ok) return true;
               await wait(250);
@@ -94,7 +93,6 @@ jobs:
             await applyFilters(page);
             await wait(600);
 
-            // Limpieza y extracción
             const data = await page.evaluate(()=>{
               const rows = [...document.querySelectorAll('tr[id^="eventRowId_"],tr.js-event-item,tr[data-event-datetime]')];
 
@@ -115,9 +113,9 @@ jobs:
 
               const events = [];
               for(const tr of rows){
-                if (tr.style.display==='none') continue;
+                if (tr.style.display==='none') continue; // respeta filtro UI (USA + 2/3⭐)
                 const tds = tr.querySelectorAll('td');
-                const time = (tds[0]?.innerText||'').trim();
+                const time = (tds[0]?.innerText||'').trim(); // HH:MM local de la web
                 const title = cleanTitle(tr);
                 if(!title) continue;
 
@@ -134,7 +132,7 @@ jobs:
                   time,
                   title,
                   importance: imp,
-                  iso: tr.getAttribute('data-event-datetime') || '',
+                  iso: tr.getAttribute('data-event-datetime') || '', // no la usamos para hora
                   forecast: (tr.querySelector('td.fore,td.forecast')?.innerText||'').trim(),
                   previous: (tr.querySelector('td.prev,td.previous')?.innerText||'').trim()
                 });
@@ -154,6 +152,7 @@ jobs:
 
           node grab.js
 
+      # ---------------- CAPTION FECHA ----------------
       - name: Build caption (ES/Madrid)
         if: ${{ hashFiles('calendar.png') != '' }}
         run: |
@@ -164,7 +163,7 @@ jobs:
             echo "CAPTION=🗓️ Calendario USA (⭐️⭐️/⭐️⭐️⭐️) — Hoy $(date +%Y-%m-%d)" >> $GITHUB_ENV
           fi
 
-      # ------------ RESUMEN estilo analista (3–5 eventos) ------------
+      # ---------------- RESUMEN ANALISTA ----------------
       - name: Build summary (párrafos 3–5 líneas)
         if: ${{ hashFiles('calendar.json') != '' }}
         run: |
@@ -175,93 +174,102 @@ jobs:
 
           tz = ZoneInfo("Europe/Madrid")
           data = json.load(open('calendar.json', encoding='utf-8'))
-          ev = data.get('events', [])
+          events = data.get('events', [])
 
           def norm(s):
             s = unicodedata.normalize('NFKD', s or '').encode('ascii','ignore').decode()
-            s = re.sub(r'\s+',' ', s).strip().lower()
-            return s
+            return re.sub(r'\s+',' ', s or '').strip().lower()
 
-          # Score por tipo + importancia
-          def score(e):
-            t = norm(e.get('title',''))
-            imp = int(e.get('importance') or 0)
-            if any(k in t for k in ['fed','fomc','powell']): return 100 + imp
-            if any(k in t for k in ['ipc','cpi','inflacion','pce']): return 90 + imp
-            if any(k in t for k in ['nominas','empleo','nfp','desempleo']): return 80 + imp
-            if any(k in t for k in ['pib','gdp']): return 70 + imp
-            if any(k in t for k in ['pmi','ism']): return 60 + imp
-            return imp
+          # Mapa de tipos → prioridad
+          def kind_and_score(title, imp):
+            t = norm(title)
+            if any(k in t for k in ['ipc','cpi']):                return ('CPI',   95+imp)
+            if 'pce' in t:                                        return ('PCE',   92+imp)
+            if any(k in t for k in ['fed','fomc','powell']):      return ('FOMC', 100+imp)
+            if any(k in t for k in ['nóminas','nominas','empleo','nfp','desempleo']): return ('NFP',   90+imp)
+            if any(k in t for k in ['pib','gdp']):                return ('GDP',   85+imp)
+            if any(k in t for k in ['pmi','ism']):                return ('PMI',   80+imp)
+            return (None, imp)
 
-          # Limpiar y deduplicar por título
-          seen, clean = set(), []
-          for e in ev:
-            t = (e.get('title') or '').strip()
-            if len(t) < 4: continue
-            k = norm(t)
-            if k in seen: continue
-            seen.add(k); clean.append(e)
-          ev = clean
+          # Dedup por título normalizado y filtrado ESTRICTO: solo tipos conocidos
+          seen, filtered = set(), []
+          for e in events:
+            title = (e.get('title') or '').strip()
+            if len(title) < 4: continue
+            kind, sc = kind_and_score(title, int(e.get('importance') or 0))
+            if not kind: continue
+            key = norm(title)
+            if key in seen: continue
+            seen.add(key)
+            e['_kind'], e['_score'] = kind, sc
+            filtered.append(e)
 
-          # Orden y selección
-          weekly = datetime.now(tz).isoweekday()==1
-          ev.sort(key=lambda e: (-score(e), e.get('time','')))
-          sel = ev[:5 if weekly else 3]
-          if not sel:
+          if not filtered:
             open('summary.txt','w').close(); raise SystemExit(0)
 
-          # Hora “bonita”: usa la del calendario (más fiable que ISO en Investing)
-          def pretty_time(e):
-            hhmm = (e.get('time') or '').strip()
-            return hhmm if re.match(r'^\d{1,2}:\d{2}$', hhmm) else (hhmm or '--:--')
+          # Orden por score y hora (texto HH:MM)
+          filtered.sort(key=lambda x: (-x['_score'], x.get('time','')))
 
-          # Plantillas por tipo (como tu ejemplo)
-          def paragraph(e):
+          # Límite: semana 4, día 3 (para quedar en 10–12 líneas)
+          take = 4 if datetime.now(tz).isoweekday()==1 else 3
+          sel = filtered[:take]
+
+          def hhmm(e):
+            h = (e.get('time') or '').strip()
+            return h if re.match(r'^\d{1,2}:\d{2}$', h) else (h or '--:--')
+
+          def para(e):
             t = (e.get('title') or '').strip()
-            tl = norm(t)
-            hhmm = pretty_time(e)
+            k = e['_kind']
+            time = hhmm(e)
             prev, fore = e.get('previous'), e.get('forecast')
-            lead = f"📌 <b>{t} ({hhmm})</b>"
 
-            if any(k in tl for k in ['ipc','cpi']):
+            if k=='CPI':
               ctx = ("La referencia clave de inflación mensual. El mercado vigilará subyacente "
-                     "(servicios ‘supercore’ y alquileres). > consenso → suben Tesoros (rendimientos) "
-                     "y USD; < consenso → respira la curva y apoyan índices growth.")
-            elif 'pce' in tl:
-              ctx = ("PCE subyacente, indicador preferido por la Fed. Desviaciones frente al consenso "
-                     "mueven dólar y curva de tipos; sorpresa a la baja suele apoyar a renta variable.")
-            elif any(k in tl for k in ['fed','fomc','powell']):
-              ctx = ("Importa comunicado y tono de Powell. Hawkish → endurece condiciones financieras "
+                     "(servicios ‘supercore’ y alquileres). > consenso → suben Tesoros (rendimientos) y USD; "
+                     "< consenso → respira la curva y apoyan índices growth.")
+              head = f"📌 <b>IPC USA ({time})</b>"
+            elif k=='PCE':
+              ctx = ("PCE subyacente, indicador preferido por la Fed. Desviaciones frente al consenso mueven "
+                     "dólar y curva de tipos; sorpresa a la baja suele apoyar a renta variable.")
+              head = f"📌 <b>PCE subyacente ({time})</b>"
+            elif k=='FOMC':
+              ctx = ("Se valoran comunicado y tono de Powell. Hawkish → endurece condiciones financieras "
                      "(USD/yields ↑, bolsa más volátil); dovish → alivio para equities y crédito.")
-            elif any(k in tl for k in ['nominas','empleo','nfp','desempleo']):
-              ctx = ("Se miran creación de empleo, salarios/hora y participación. Fuerte + salarios altos "
-                     "mantiene presión de precios (yields ↑, USD ↑); débil abre espacio a recortes y apoya índices.")
-            elif any(k in tl for k in ['pib','gdp']):
-              ctx = ("Pulso de actividad macro. Lectura sólida refuerza resiliencia y puede presionar yields; "
+              head = f"📌 <b>Decisión FOMC + Powell ({time})</b>"
+            elif k=='NFP':
+              ctx = ("Se miran creación de empleo, salarios/hora y participación. Fuerte + salarios altos mantiene "
+                     "presión de precios (yields ↑, USD ↑); débil abre espacio a recortes y apoya índices.")
+              head = f"📌 <b>Nóminas no agrícolas – NFP ({time})</b>"
+            elif k=='GDP':
+              ctx = ("Pulso de la actividad. Lectura sólida refuerza resiliencia y puede presionar yields; "
                      "dato flojo reaviva apuestas de recortes y favorece duration.")
-            elif any(k in tl for k in ['pmi','ism']):
+              head = f"📌 <b>PIB (GDP) ({time})</b>"
+            else: # PMI
               ctx = ("Termómetro adelantado del ciclo: foco en nuevas órdenes y precios pagados. "
                      ">50 sostiene cíclicas y USD; <50 avisa de enfriamiento y favorece defensivas.")
-            else:
-              ctx = ("Catalizador para USD, bonos y equity según sorpresa frente al consenso; "
-                     "vigilar desviaciones y tono de los componentes.")
+              head = f"📌 <b>ISM/PMI ({time})</b>"
 
             meta=[]
             if fore: meta.append(f"consenso {fore}")
             if prev: meta.append(f"anterior {prev}")
             extra = (" — " + ", ".join(meta)) if meta else ""
-            return f"{lead}\n{ctx}{extra}"
+            return f"{head}\n{ctx}{extra}"
 
           lines = ["📰 <b>Resumen principales noticias</b>"]
           for e in sel:
-            lines.append(paragraph(e))
+            lines.append(para(e))
 
-          # Guardar (3–5 párrafos; 10–12 líneas aprox.)
           open('summary.txt','w',encoding='utf-8').write("\n\n".join(lines))
+          # Log para debug
+          print("=== DEBUG selección ===")
+          for e in sel:
+            print(e['_kind'], e.get('time'), "|", e.get('title'))
           PY
 
-      - name: Send to Telegram
-        if: ${{ hashFiles('calendar.png') != '' && hashFiles('summary.txt') != '' }}
+      # ---------------- ENVÍO A TELEGRAM (2 MENSAJES) ----------------
+      - name: Send image to Telegram
+        if: ${{ hashFiles('calendar.png') != '' }}
         env:
           BOT_TOKEN: ${{ secrets.INVESTX_TOKEN }}
           CHAT_ID: ${{ secrets.CHAT_ID }}
@@ -271,12 +279,28 @@ jobs:
           import os,requests
           bot=os.environ['BOT_TOKEN']; chat=os.environ['CHAT_ID']
           caption=os.environ.get('CAPTION','Calendario USA')
-          summary=open('summary.txt','r',encoding='utf-8').read().strip()
-          if summary: caption=(caption+"\n\n"+summary)[:1024]
           with open("calendar.png","rb") as f:
             r=requests.post(
               f"https://api.telegram.org/bot{bot}/sendPhoto",
               data={"chat_id":chat,"caption":caption,"parse_mode":"HTML"},
               files={"photo":("calendar.png",f,"image/png")}, timeout=90
+            ); print(r.status_code,r.text); r.raise_for_status()
+          PY
+
+      - name: Send summary to Telegram (texto separado)
+        if: ${{ hashFiles('summary.txt') != '' }}
+        env:
+          BOT_TOKEN: ${{ secrets.INVESTX_TOKEN }}
+          CHAT_ID: ${{ secrets.CHAT_ID }}
+        run: |
+          python3 - <<'PY'
+          import os,requests
+          bot=os.environ['BOT_TOKEN']; chat=os.environ['CHAT_ID']
+          text=open('summary.txt','r',encoding='utf-8').read().strip()
+          if text:
+            r=requests.post(
+              f"https://api.telegram.org/bot{bot}/sendMessage",
+              data={"chat_id":chat,"text":text,"parse_mode":"HTML","disable_web_page_preview":True},
+              timeout=90
             ); print(r.status_code,r.text); r.raise_for_status()
           PY
