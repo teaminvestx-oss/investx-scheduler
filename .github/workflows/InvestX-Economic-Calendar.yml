@@ -93,7 +93,7 @@ jobs:
             await applyFilters(page);
             await wait(600);
 
-            // Guardamos TODOS los eventos visibles
+            // Guardamos TODOS los eventos visibles con título robusto
             const data = await page.evaluate(()=>{
               const rows = [...document.querySelectorAll('tr[id^="eventRowId_"],tr.js-event-item,tr[data-event-datetime]')];
 
@@ -177,7 +177,7 @@ jobs:
             return re.sub(r'\s+',' ', s or '').strip().lower()
 
           # --- Clasificación: datos vs discursos ---
-          FED_NAMES = ['powell','waller','jefferson','cook','bowman','williams','bostic','kashkari','daly','goolsbee','barkin','logan','mester','harker','gustavo','michele','patrick']  # amplio
+          FED_NAMES = ['powell','waller','jefferson','cook','bowman','williams','bostic','kashkari','daly','goolsbee','barkin','logan','mester','harker']
           POLITICIANS = ['trump','biden','harris']
 
           data_cpi, data_pce, data_nfp, data_gdp, data_pmi = [], [], [], [], []
@@ -188,8 +188,6 @@ jobs:
           for e in events:
             t = (e.get('title') or '').strip()
             tl = norm(t)
-            time = (e.get('time') or '').strip()
-            fore, prev = e.get('forecast'), e.get('previous')
 
             # discursos vs datos
             is_speech = any(k in tl for k in ['comparecencia', 'declaraciones', 'discurso', 'habla'])
@@ -217,16 +215,14 @@ jobs:
               data_pmi.append(e); continue
             if any(k in tl for k in ['cuenta corriente','balanza por cuenta corriente']):
               data_ca.append(e); continue
-            # otros datos: los ignoramos para no “ensuciar”
+            # otros datos: ignoramos
 
           def pick_time_min_max(lst):
-            # trabaja con HH:MM strings
             if not lst: return ('','')
             times = [x.get('time','') for x in lst if x.get('time')]
             if not times: return ('','')
             return (min(times), max(times))
 
-          # --- Construcción de párrafos ---
           paras = []
 
           # CPI
@@ -240,7 +236,7 @@ jobs:
             paras.append(
               f"📌 <b>IPC USA ({hh})</b>\n"
               f"La referencia clave de inflación mensual. El mercado vigilará subyacente (servicios ‘supercore’ y alquileres). "
-              f"> consenso → suben Tesoros (rendimientos) y USD; < consenso → respira la curva y apoyan índices growth.{extra}"
+              f">&gt; consenso → suben Tesoros (rendimientos) y USD; &lt; consenso → respira la curva y apoyan índices growth.{extra}"
             )
 
           # PCE
@@ -279,10 +275,10 @@ jobs:
             hh = tmin if tmin==tmax or not tmax else f"{tmin}–{tmax}"
             paras.append(
               f"📌 <b>PMI/ISM ({hh})</b>\n"
-              f"Termómetro adelantado del ciclo: foco en nuevas órdenes y precios pagados. >50 sostiene cíclicas y USD; <50 avisa de enfriamiento y favorece defensivas."
+              f"Termómetro adelantado del ciclo: foco en nuevas órdenes y precios pagados. &gt;50 sostiene cíclicas y USD; &lt;50 avisa de enfriamiento y favorece defensivas."
             )
 
-          # Cuenta corriente (dato secundario útil si no hay estrellas)
+          # Cuenta corriente (si faltan estrellas)
           if data_ca and len(paras) < 3:
             hh = data_ca[0].get('time','--:--')
             fore, prev = data_ca[0].get('forecast'), data_ca[0].get('previous')
@@ -295,7 +291,7 @@ jobs:
               f"Dato estructural sobre el déficit externo. Efecto en mercado suele ser limitado en el intradía, pero una mejora mayor a la prevista puede aliviar presión sobre el USD a medio plazo.{extra}"
             )
 
-          # Discursos Powell
+          # Discursos Powell (rango)
           if fed_powell:
             tmin, tmax = pick_time_min_max(fed_powell)
             hh = tmin if tmin==tmax or not tmax else f"{tmin}–{tmax}"
@@ -305,22 +301,19 @@ jobs:
               f"dovish → alivio para equities y crédito."
             )
 
-          # Discursos miembros secundarios (agregados con rango)
+          # Discursos miembros secundarios (agregados)
           if fed_members:
             tmin, tmax = pick_time_min_max(fed_members)
             hh = tmin if tmin==tmax or not tmax else f"{tmin}–{tmax}"
-            # intenta listar hasta 3 apellidos distintos
             names = []
             for e in fed_members:
               tl = norm(e.get('title',''))
               m = re.findall(r'(bowman|bostic|williams|kashkari|waller|daly|goolsbee|barkin|logan|mester|harker)', tl)
               if m:
-                names.append(m[0].capitalize())
-            uniq = []
-            for n in names:
-              if n not in uniq:
-                uniq.append(n)
-            who = f" ({', '.join(uniq[:3])})" if uniq else ""
+                n=m[0].capitalize()
+                if n not in names:
+                  names.append(n)
+            who = f" ({', '.join(names[:3])})" if names else ""
             paras.append(
               f"📌 <b>Miembros de la Fed{who} ({hh})</b>\n"
               f"Intervenciones con menor peso que Powell, salvo mensajes que contradigan la línea oficial. Un tono más hawkish podría presionar al USD y a la curva; impacto normalmente acotado."
@@ -332,10 +325,9 @@ jobs:
             hh = tmin if tmin==tmax or not tmax else f"{tmin}–{tmax}"
             paras.append(
               f"📌 <b>Declaraciones políticas ({hh})</b>\n"
-              f"Posible ruido de corto plazo. Su impacto en precios suele ser transitorio salvo anuncios con implicaciones fiscales o regulatorias claras."
+              f"Posible ruido de corto plazo. Suele ser transitorio salvo anuncios con implicaciones fiscales o regulatorias claras."
             )
 
-          # Selección final: máximo 4 párrafos (semana) o 3 (día)
           weekly = datetime.now(tz).isoweekday()==1
           limit = 4 if weekly else 3
           paras = paras[:limit]
@@ -346,7 +338,7 @@ jobs:
           text = "📰 <b>Resumen principales noticias</b>\n\n" + "\n\n".join(paras)
           open('summary.txt','w',encoding='utf-8').write(text)
 
-          # Debug en logs
+          # Debug
           print("=== DEBUG ===")
           for p in paras: 
             print(p.split("\\n")[0])
@@ -379,13 +371,22 @@ jobs:
           CHAT_ID: ${{ secrets.CHAT_ID }}
         run: |
           python3 - <<'PY'
-          import os,requests
-          bot=os.environ['BOT_TOKEN']; chat=os.environ['CHAT_ID']
-          text=open('summary.txt','r',encoding='utf-8').read().strip()
-          if text:
-            r=requests.post(
-              f"https://api.telegram.org/bot{bot}/sendMessage",
-              data={"chat_id":chat,"text":text,"parse_mode":"HTML","disable_web_page_preview":True},
-              timeout=90
-            ); print(r.status_code,r.text); r.raise_for_status()
+          import os, requests, html
+          bot = os.environ['BOT_TOKEN']
+          chat = os.environ['CHAT_ID']
+          raw = open('summary.txt','r',encoding='utf-8').read().strip()
+          if raw:
+              # Mantener <b> y </b>, escapar el resto para HTML seguro
+              placeholder_open  = "__B_OPEN__"
+              placeholder_close = "__B_CLOSE__"
+              tmp = raw.replace("<b>", placeholder_open).replace("</b>", placeholder_close)
+              safe = html.escape(tmp)  # escapa <, >, & del contenido
+              safe = safe.replace(placeholder_open, "<b>").replace(placeholder_close, "</b>")
+              r = requests.post(
+                  f"https://api.telegram.org/bot{bot}/sendMessage",
+                  data={"chat_id": chat, "text": safe, "parse_mode": "HTML", "disable_web_page_preview": True},
+                  timeout=90
+              )
+              print(r.status_code, r.text)
+              r.raise_for_status()
           PY
