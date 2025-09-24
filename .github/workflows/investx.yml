@@ -2,16 +2,19 @@ name: InvestX Telegram Scheduler
 
 on:
   schedule:
-    - cron: "0 7 * * 1-5"     # CEST 09:00 Madrid
-    - cron: "0 8 * * 1-5"     # CET  09:00 Madrid
-    - cron: "30 8 * * 1-5"    # CEST 10:30 Madrid
-    - cron: "30 9 * * 1-5"    # CET  10:30 Madrid
-    - cron: "0 20 * * 1-5"    # CEST 22:00 Madrid
-    - cron: "0 21 * * 1-5"    # CET  22:00 Madrid
+    # 09:00 Madrid
+    - cron: "0 7 * * 1-5"     # CEST 09:00 (verano)
+    - cron: "0 8 * * 1-5"     # CET  09:00 (invierno)
+    # 10:30 Madrid
+    - cron: "30 8 * * 1-5"    # CEST 10:30 (verano)
+    - cron: "30 9 * * 1-5"    # CET  10:30 (invierno)
+    # 22:00 Madrid
+    - cron: "0 20 * * 1-5"    # CEST 22:00 (verano)
+    - cron: "0 21 * * 1-5"    # CET  22:00 (invierno)
   workflow_dispatch:
 
 concurrency:
-  group: investx-telegram-scheduler-${{ github.run_id }}
+  group: investx-telegram-scheduler
   cancel-in-progress: false
 
 jobs:
@@ -20,7 +23,7 @@ jobs:
     env:
       BOT_TOKEN: ${{ secrets.INVESTX_TOKEN }}
       CHAT_ID:   ${{ secrets.CHAT_ID }}
-      MESSAGE_MODE: ${{ vars.MESSAGE_MODE }}   # "fixed" (default) o "mix"
+      MESSAGE_MODE: ${{ vars.MESSAGE_MODE }}   # "fixed" (por defecto) o "mix"
     steps:
       - name: Diagnóstico
         run: |
@@ -41,108 +44,111 @@ jobs:
           DOW="$(date +%u)"                 # 1=L ... 7=D
           HHMM="$(date +'%H:%M')"
           DOY="$(date +%j)"                 # 001..366
-          IDX=$(( (10#${DOY} - 1) % 10 ))   # 0..9 determinista
+          IDX=$(( (10#${DOY} - 1) % 10 ))   # 0..9 determinista por día del año
           MODE="${MESSAGE_MODE:-fixed}"
 
+          # --- Horario laborable ---
           if [ "$DOW" -gt 5 ]; then
             echo "Fin de semana en Madrid; no se envía."
             exit 0
           fi
 
+          # --- Función Telegram ---
           send() {
             local text="$1"
             curl -sS "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
-              -d chat_id="${CHAT_ID}" -d parse_mode="HTML" \
-              --data-urlencode text="${text}" | jq -r '.ok,.description?'
+              -d chat_id="${CHAT_ID}" \
+              -d parse_mode="HTML" \
+              --data-urlencode text="${text}" >/dev/null
           }
 
           # =========================
           # VARIANTES FIJAS (10)
           # =========================
 
-          # 09:00 — Buenos días
+          # 09:00 — Buenos días (10)
           MORNING_VARS=(
-$'🌞 <b>¡Buenos días, equipo!</b>\nArrancamos en <b>InvestX</b>: setups claros, niveles clave y disciplina. Que hable la ejecución. 🚀'
-$'☕ <b>A por el día</b>\nListas preparadas: soportes, resistencias y catalizadores. Menos ruido, más señales. 💥'
-$'🌅 <b>Buenos días</b>\nContexto + confirmación: momentum, volumen institucional y zonas de liquidez. 🔎'
-$'🚀 <b>Comienza la sesión</b>\nMapa listo: <b>bias</b>, escenarios y gestión del riesgo. Entrada justificada, salida planificada. 🧭'
-$'🔔 <b>Apertura ON</b>\nTendencia mayor, zonas de valor y volatilidad esperada. Calidad > cantidad. ✅'
-$'📈 <b>Morning brief</b>\nRevisa watchlist, alinea timeframes y protege el capital. Hoy se suma consistencia. 🧱'
-$'💡 <b>Enfoque</b>\nPrimero contexto, luego señal. Evita perseguir; espera que el precio venga a tu zona. 🪤'
-$'🧭 <b>Plan primero</b>\nSesgo definido, invalidación clara y RR mínimo. Sin plan no hay trade. 📜'
-$'🔥 <b>Impulso inicial</b>\nBusca confluencias: nivel + flujo + timing. Donde coinciden, suele haber oportunidad. 🎯'
-$'🧠 <b>Mentalidad pro</b>\nObserva > reacciona. La paciencia filtra operaciones mediocres. ⏳'
+            "🌞 <b>¡Buenos días, equipo!</b>\n\nArrancamos en <b>InvestX</b> con setups claros, niveles clave y disciplina. Que hable la ejecución. 🚀"
+            "☕ <b>A por el día</b>\n\nListas preparadas: soportes, resistencias y catalizadores. Menos ruido, más señales. 💥"
+            "🌅 <b>Buenos días</b>\n\nContexto + confirmación: momentum, volumen institucional y zonas de liquidez. 🔎"
+            "🚀 <b>Comienza la sesión</b>\n\nMapa listo: sesgo, escenarios y gestión del riesgo. Entrada justificada, salida planificada. 🧭"
+            "🔔 <b>Apertura ON</b>\n\nTendencia mayor, zonas de valor y volatilidad esperada. Calidad por encima de cantidad. ✅"
+            "📈 <b>Morning brief</b>\n\nRevisa watchlist, alinea marcos temporales y protege el capital. Hoy sumamos consistencia. 🧱"
+            "💡 <b>Enfoque</b>\n\nPrimero contexto, luego señal. Evita perseguir; espera que el precio venga a tu zona. 🪤"
+            "🧭 <b>Plan primero</b>\n\nSesgo definido, invalidación clara y RR mínimo. Sin plan no hay trade. 📜"
+            "🔥 <b>Impulso inicial</b>\n\nBusca confluencias: nivel + flujo + timing. Donde coinciden, suele haber oportunidad. 🎯"
+            "🧠 <b>Mentalidad pro</b>\n\nObserva antes de reaccionar. La paciencia filtra operaciones mediocres. ⏳"
           )
 
-          # 10:30 — TIP del día
+          # 10:30 — TIP del día (10)
           TIP_VARS=(
-$'📌 <b>TIP</b>\nPulsa el <b>ticker con “#”</b> para ver todas las menciones y tener contexto al instante. 🔎'
-$'🧠 <b>TIP</b>\nDefine activación, invalidación y TP <b>antes</b> de abrir. Evita improvisar. 📝'
-$'⚙️ <b>TIP</b>\nRuptura sin volumen = paciencia. Espera el <i>retest</i> a zona. ⏳'
-$'🔍 <b>TIP</b>\nUnifica marcos: diario + 15m contando la misma historia = más probabilidad. 🎯'
-$'🧭 <b>TIP</b>\nMarca catalizadores (earnings, macro) y evita operar contra ellos. 📅'
-$'📊 <b>TIP</b>\nSi el plan depende de “que pase algo”, no es plan: reescribe el setup. ✍️'
-$'🛡️ <b>TIP</b>\nStop lógico detrás de nivel defendido, no arbitrario por distancia. 🛑'
-$'🔄 <b>TIP</b>\nSi falla el primer escenario, ten listo el alternativo con sesgo contrario. ♻️'
-$'📏 <b>TIP</b>\nNo sacrifiques RR por entrar “ya”. El precio da segundas oportunidades. 🎣'
-$'🎛️ <b>TIP</b>\nReduce tamaño si la volatilidad sube; preserva la curva de capital. 📉➡️📈'
+            "📌 <b>TIP</b>\n\nPulsa el <b>#ticker</b> para ver todas las menciones y tener contexto al instante. 🔎"
+            "🧠 <b>TIP</b>\n\nDefine activación, invalidación y TP <b>antes</b> de abrir. Evita improvisar. 📝"
+            "⚙️ <b>TIP</b>\n\nRuptura sin volumen = paciencia. Espera el <i>retest</i> a zona. ⏳"
+            "🔍 <b>TIP</b>\n\nUnifica marcos: diario y 15m contando la misma historia aumenta la probabilidad. 🎯"
+            "🧭 <b>TIP</b>\n\nMarca catalizadores (earnings, macro) y evita operar contra ellos. 📅"
+            "📊 <b>TIP</b>\n\nSi el plan depende de “que pase algo”, no es plan: reescribe el setup. ✍️"
+            "🛡️ <b>TIP</b>\n\nStop lógico detrás de nivel defendido, no arbitrario por distancia. 🛑"
+            "🔄 <b>TIP</b>\n\nSi falla el primer escenario, ten listo el alternativo con sesgo contrario. ♻️"
+            "📏 <b>TIP</b>\n\nNo sacrifiques RR por entrar “ya”. El precio da segundas oportunidades. 🎣"
+            "🎛️ <b>TIP</b>\n\nReduce tamaño si sube la volatilidad; preserva la curva de capital. 📉➡️📈"
           )
 
-          # 22:00 — Cierre
+          # 22:00 — Cierre (10)
           CLOSE_VARS=(
-$'🌙 <b>Cierre de mercado</b>\nAnota qué funcionó y qué no. La consistencia vive en el post-análisis. 📝'
-$'✅ <b>Diario</b>\nCaptura pantallas y lecciones. Mañana decides mejor con evidencia. 📚'
-$'🧩 <b>Resumen</b>\nRepasa setups activos, defensas institucionales y gaps pendientes. 🔄'
-$'📓 <b>Checklist</b>\nActualiza niveles → clasifica activos A/B → define sesgo para mañana. 😴'
-$'🔄 <b>Plan</b>\nMantén lo que aporta, elimina lo accesorio. La fuerza está en la simplicidad. 💡'
-$'🧠 <b>Higiene mental</b>\nCierra plataformas y deja escrito el primer trade <i>si</i> se da la señal. 🧘'
-$'🧱 <b>Base sólida</b>\nRR real, no ideal. Ajusta objetivos a la estructura. 🧮'
-$'🛰️ <b>Vista macro</b>\n¿Cambió el contexto? Alinea tu sesgo con el de mayor marco temporal. 🌍'
-$'📌 <b>Anclajes</b>\nSeñala niveles que el precio respetó hoy: suelen importar mañana. 📍'
-$'🗺️ <b>Ruta</b>\nEscenario 1 si continúa impulso, 2 si corrige a valor. Llega con mapa, no a ciegas. 🗺️'
+            "🌙 <b>Cierre de mercado</b>\n\nAnota qué funcionó y qué no. La consistencia vive en el post-análisis. 📝"
+            "✅ <b>Diario</b>\n\nCaptura pantallas y lecciones. Mañana decides mejor con evidencia. 📚"
+            "🧩 <b>Resumen</b>\n\nRepasa setups activos, defensas institucionales y gaps pendientes. 🔄"
+            "📓 <b>Checklist</b>\n\nActualiza niveles → clasifica activos A/B → define sesgo para mañana. 😴"
+            "🔄 <b>Plan</b>\n\nMantén lo que aporta, elimina lo accesorio. La fuerza está en la simplicidad. 💡"
+            "🧠 <b>Higiene mental</b>\n\nCierra plataformas y deja escrito el primer trade si se da la señal. 🧘"
+            "🧱 <b>Base sólida</b>\n\nRR real, no ideal. Ajusta objetivos a la estructura. 🧮"
+            "🛰️ <b>Vista macro</b>\n\n¿Cambió el contexto? Alinea el sesgo con el marco temporal mayor. 🌍"
+            "📌 <b>Anclajes</b>\n\nSeñala niveles que el precio respetó hoy: suelen importar mañana. 📍"
+            "🗺️ <b>Ruta</b>\n\nEscenario 1 si continúa impulso, 2 si corrige a valor. Llega con mapa, no a ciegas. 🗺️"
           )
 
           # =========================
           # MODO MIX (tipo IA sin APIs)
           # =========================
-          # Bancos de frases para componer mensajes “naturales”
-          OPENINGS_M=( $'🌞 <b>¡Buenos días, equipo!</b>' $'☕ <b>A por el día</b>' $'🌅 <b>Buenos días</b>' $'🚀 <b>Comienza la sesión</b>' $'🔔 <b>Apertura ON</b>' )
-          BODIES_M=( $'Arrancamos en <b>InvestX</b> con foco en setups de calidad y gestión del riesgo.' $'Mapeamos niveles, catalizadores y <b>sesgo</b> antes de tocar el botón.' $'Contexto + confirmación: que el precio venga a nuestra zona.' $'Primero plan, luego trade: activación e invalidación claras.' $'Menos ruido, más señales: volumen y zonas de valor mandan.' )
-          CLOSERS_M=( $'Que hable la ejecución. 🚀' $'Hoy sumamos consistencia. 🧱' $'Paciencia = ventaja. ⏳' $'Entrada justificada, salida planificada. 🧭' $'Calidad > cantidad. ✅' )
+          OPENINGS_M=( "🌞 <b>¡Buenos días, equipo!</b>" "☕ <b>A por el día</b>" "🌅 <b>Buenos días</b>" "🚀 <b>Comienza la sesión</b>" "🔔 <b>Apertura ON</b>" )
+          BODIES_M=( "Arrancamos en <b>InvestX</b> con setups de calidad y gestión del riesgo." "Mapeamos niveles, catalizadores y sesgo antes de tocar el botón." "Contexto + confirmación: que el precio venga a nuestra zona." "Primero plan, luego trade: activación e invalidación claras." "Menos ruido, más señales: volumen y zonas de valor mandan." )
+          CLOSERS_M=( "Que hable la ejecución. 🚀" "Hoy sumamos consistencia. 🧱" "Paciencia = ventaja. ⏳" "Entrada justificada, salida planificada. 🧭" "Calidad > cantidad. ✅" )
 
-          OPENINGS_T=( $'📌 <b>TIP</b>' $'🧠 <b>TIP</b>' $'🔍 <b>TIP</b>' $'⚙️ <b>TIP</b>' $'🧭 <b>TIP</b>' )
-          BODIES_T=( $'Pulsa el <b>#ticker</b> para contexto al instante.' $'Escribe activación, invalidación y TP antes de entrar.' $'Ruptura sin volumen → espera el <i>retest</i>.' $'Alinea diario y 15m para reforzar probabilidad.' $'Evita operar contra <b>catalizadores</b> del día.' )
-          CLOSERS_T=( $'Decidir con datos gana. 🔎' $'Menos impulsividad, más plan. 📝' $'La paciencia paga. ⏳' $'Confluencia > ocurrencias. 🎯' $'Controla el riesgo, no el mercado. 🛡️' )
+          OPENINGS_T=( "📌 <b>TIP</b>" "🧠 <b>TIP</b>" "🔍 <b>TIP</b>" "⚙️ <b>TIP</b>" "🧭 <b>TIP</b>" )
+          BODIES_T=( "Pulsa el <b>#ticker</b> para contexto al instante." "Escribe activación, invalidación y TP antes de entrar." "Ruptura sin volumen → espera el retest." "Alinea diario y 15m para reforzar probabilidad." "Evita operar contra catalizadores del día." )
+          CLOSERS_T=( "Decidir con datos gana. 🔎" "Menos impulsividad, más plan. 📝" "La paciencia paga. ⏳" "Confluencia > ocurrencias. 🎯" "Controla el riesgo, no el mercado. 🛡️" )
 
-          OPENINGS_C=( $'🌙 <b>Cierre de mercado</b>' $'✅ <b>Diario</b>' $'🧩 <b>Resumen</b>' $'📓 <b>Checklist</b>' $'🔄 <b>Plan</b>' )
-          BODIES_C=( $'Anota lo que funcionó y lo que no; ahí vive la mejora.' $'Actualiza niveles y clasifica activos para mañana.' $'Revisa gaps y defensas institucionales que dejó el día.' $'Alinea el sesgo con el marco mayor si cambió el contexto.' $'Deja escrito el primer trade <i>si</i> se da la señal.' )
-          CLOSERS_C=( $'La consistencia está en el post-análisis. 📝' $'Dormir con el plan hecho = ventaja. 😴' $'Simplicidad gana. 💡' $'RR real, no ideal. 🧮' $'Mañana se ejecuta mejor. 📚' )
+          OPENINGS_C=( "🌙 <b>Cierre de mercado</b>" "✅ <b>Diario</b>" "🧩 <b>Resumen</b>" "📓 <b>Checklist</b>" "🔄 <b>Plan</b>" )
+          BODIES_C=( "Anota lo que funcionó y lo que no; ahí vive la mejora." "Actualiza niveles y clasifica activos para mañana." "Revisa gaps y defensas institucionales que dejó el día." "Alinea el sesgo con el marco mayor si cambió el contexto." "Deja escrito el primer trade si se da la señal." )
+          CLOSERS_C=( "La consistencia está en el post-análisis. 📝" "Dormir con el plan hecho = ventaja. 😴" "Simplicidad gana. 💡" "RR real, no ideal. 🧮" "Mañana se ejecuta mejor. 📚" )
 
           pick_from_bank() {
-            local -n A=$1; local seed=$2
-            local n=${#A[@]}
+            # $1 nombre del array, $2 semilla
+            local name="$1"; local seed="$2"
+            local -n ARR="$name"
+            local n="${#ARR[@]}"
             local idx=$(( seed % n ))
-            echo "${A[$idx]}"
+            echo "${ARR[$idx]}"
           }
 
           build_mix() {
             local slot="$1"
-            # seed estable por día y franja
             local seed=$((10#${DOY} + $(echo "$HHMM" | tr -d ':') ))
             case "$slot" in
               morning)
                 echo -e "$(pick_from_bank OPENINGS_M $seed)\n$(pick_from_bank BODIES_M $((seed+1))) $(pick_from_bank CLOSERS_M $((seed+2)))"
-                ;;
+              ;;
               tip)
                 echo -e "$(pick_from_bank OPENINGS_T $seed)\n$(pick_from_bank BODIES_T $((seed+1))) $(pick_from_bank CLOSERS_T $((seed+2)))"
-                ;;
+              ;;
               close)
                 echo -e "$(pick_from_bank OPENINGS_C $seed)\n$(pick_from_bank BODIES_C $((seed+1))) $(pick_from_bank CLOSERS_C $((seed+2)))"
-                ;;
+              ;;
             esac
           }
 
-          # --- Selección final según hora ---
+          # --- Selector por hora ---
           case "$HHMM" in
             "09:00")
               if [ "$MODE" = "mix" ]; then TEXTO="$(build_mix morning)"; else TEXTO="${MORNING_VARS[$IDX]}"; fi
@@ -154,10 +160,10 @@ $'🗺️ <b>Ruta</b>\nEscenario 1 si continúa impulso, 2 si corrige a valor. L
               if [ "$MODE" = "mix" ]; then TEXTO="$(build_mix close)"; else TEXTO="${CLOSE_VARS[$IDX]}"; fi
               ;;
             *)
-              echo "Sin mensaje para ${HHMM}."
+              echo "No hay mensaje definido para ${HHMM}; no se envía."
               exit 0
               ;;
           esac
 
-          echo "Modo=${MODE} | DOY=${DOY} | IDX=${IDX} | Enviando ${HHMM}…"
+          echo "Modo=${MODE} | Día=${DOY} | Variante=${IDX} | Enviando ${HHMM} Madrid…"
           send "${TEXTO}"
