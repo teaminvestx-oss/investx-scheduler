@@ -10,31 +10,19 @@ jobs:
   premarket-us:
     runs-on: ubuntu-22.04
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: System deps
-        run: |
-          set -e
-          sudo apt-get update -y
-          sudo apt-get install -y \
-            jq curl unzip python3 \
-            libatk1.0-0 libatk-bridge2.0-0 libnss3 libx11-6 libx11-xcb1 \
-            libxcomposite1 libxdamage1 libxext6 libxfixes3 libxrandr2 \
-            libgbm1 libasound2 fonts-liberation ca-certificates
-
-      - name: Setup Node
-        uses: actions/setup-node@v4
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
-          node-version: '20'
-
-      - name: Install Puppeteer
-        run: npm i puppeteer@22
-
-      - name: Run Premarket Snapshot
+          python-version: "3.11"
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install pillow requests
+      - name: Run snapshot
         env:
           INVESTX_TOKEN: ${{ secrets.INVESTX_TOKEN }}
           CHAT_ID: ${{ secrets.CHAT_ID }}
-          FORCE_SEND: "0"
+          LOCAL_TZ: "Europe/Madrid"
           GITHUB_EVENT_NAME: ${{ github.event_name }}
-        run: node premarket_futures.js
+          FORCE_SEND: "0"   # pon "1" si quieres forzar envío fuera de ventana
+        run: python premarket_us_direct.py
