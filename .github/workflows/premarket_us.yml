@@ -1,26 +1,44 @@
-# .github/workflows/premarket_us.yml
 name: InvestX Premarket US (12h Madrid)
 
 on:
   schedule:
-    - cron: "0 10 * * 1-5"  # 12:00 Madrid en verano (CEST)
-    - cron: "0 11 * * 1-5"  # 12:00 Madrid en invierno (CET)
+    - cron: "0 10 * * 1-5"  # Verano CEST -> 12:00 Madrid
+    - cron: "0 11 * * 1-5"  # Invierno CET -> 12:00 Madrid
   workflow_dispatch:
 
 jobs:
   premarket-us:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with: { python-version: "3.11" }
-      - name: Install deps
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: System deps
         run: |
-          python -m pip install --upgrade pip
-          pip install yfinance==0.2.43 pandas pillow requests
-      - name: Run
+          set -e
+          sudo apt-get update -y
+          sudo apt-get install -y \
+            jq curl unzip python3 \
+            libatk1.0-0 libatk-bridge2.0-0 libnss3 libx11-6 libx11-xcb1 \
+            libxcomposite1 libxdamage1 libxext6 libxfixes3 libxrandr2 \
+            libgbm1 libasound2 fonts-liberation ca-certificates
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install Puppeteer
+        run: npm i puppeteer@22
+
+      - name: Run Premarket Snapshot
         env:
           INVESTX_TOKEN: ${{ secrets.INVESTX_TOKEN }}
           CHAT_ID: ${{ secrets.CHAT_ID }}
-          LOCAL_TZ: "Europe/Madrid"
-        run: python premarket_us.py
+          # Si alguna vez quieres forzar envío aunque esté fuera de ventana, pon FORCE_SEND=1
+          FORCE_SEND: "0"
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
+        run: |
+          mkdir -p scripts
+          # asegúrate de que el archivo existe en scripts/
+          node scripts/premarket_futures.js
