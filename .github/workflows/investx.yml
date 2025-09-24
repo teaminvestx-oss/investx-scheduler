@@ -3,15 +3,24 @@ name: InvestX Telegram Scheduler
 on:
   schedule:
     # 09:00 Madrid
-    - cron: "0 7 * * 1-5"     # CEST 09:00 (verano)
-    - cron: "0 8 * * 1-5"     # CET  09:00 (invierno)
+    - cron: "0 7 * * 1-5"     # CEST 09:00
+    - cron: "0 8 * * 1-5"     # CET  09:00
     # 10:30 Madrid
-    - cron: "30 8 * * 1-5"    # CEST 10:30 (verano)
-    - cron: "30 9 * * 1-5"    # CET  10:30 (invierno)
+    - cron: "30 8 * * 1-5"    # CEST 10:30
+    - cron: "30 9 * * 1-5"    # CET  10:30
     # 22:00 Madrid
-    - cron: "0 20 * * 1-5"    # CEST 22:00 (verano)
-    - cron: "0 21 * * 1-5"    # CET  22:00 (invierno)
+    - cron: "0 20 * * 1-5"    # CEST 22:00
+    - cron: "0 21 * * 1-5"    # CET  22:00
   workflow_dispatch:
+    inputs:
+      slot:
+        description: "Qué enviar al forzar: morning | tip | close | auto"
+        required: false
+        default: "auto"
+      mode:
+        description: "Mensaje: fixed (10 variantes) o mix (combinado)"
+        required: false
+        default: "fixed"
 
 concurrency:
   group: investx-telegram-scheduler
@@ -23,7 +32,7 @@ jobs:
     env:
       BOT_TOKEN: ${{ secrets.INVESTX_TOKEN }}
       CHAT_ID:   ${{ secrets.CHAT_ID }}
-      MESSAGE_MODE: ${{ vars.MESSAGE_MODE }}   # "fixed" (por defecto) o "mix"
+      MESSAGE_MODE: ${{ vars.MESSAGE_MODE }}
     steps:
       - name: Diagnóstico
         run: |
@@ -31,29 +40,42 @@ jobs:
           echo "event.schedule=${{ github.event.schedule }}"
           echo "now_utc=$(date -u +'%Y-%m-%d %H:%M:%S UTC')"
           echo "now_madrid=$(TZ=Europe/Madrid date +'%Y-%m-%d %H:%M:%S %Z')"
-          echo "MESSAGE_MODE=${MESSAGE_MODE:-fixed}"
+          echo "dispatch.slot=${{ github.event.inputs.slot }}"
+          echo "dispatch.mode=${{ github.event.inputs.mode }}"
+          echo "MESSAGE_MODE(default)=${MESSAGE_MODE:-fixed}"
 
-      - name: Enviar mensaje (rotación 10 variantes o mix) L-V
+      - name: Enviar (rotación o mix) L-V
         if: ${{ env.BOT_TOKEN != '' && env.CHAT_ID != '' }}
         env:
           TZ: Europe/Madrid
         run: |
           set -euo pipefail
 
-          # --- Fecha/hora Madrid ---
-          DOW="$(date +%u)"                 # 1=L ... 7=D
-          HHMM="$(date +'%H:%M')"
-          DOY="$(date +%j)"                 # 001..366
-          IDX=$(( (10#${DOY} - 1) % 10 ))   # 0..9 determinista por día del año
-          MODE="${MESSAGE_MODE:-fixed}"
+          # --------- Fecha/hora y flags ---------
+          DOW="$(date +%u)"                            # 1=L ... 7=D
+          HHMM_NOW="$(date +'%H:%M')"
+          DOY="$(date +%j)"                            # 001..366
+          IDX=$(( (10#${DOY} - 1) % 10 ))              # 0..9
+          DISPATCH_SLOT="${{ github.event.inputs.slot || 'auto' }}"
+          DISPATCH_MODE="${{ github.event.inputs.mode || '' }}"
+          MODE="${DISPATCH_MODE:-${MESSAGE_MODE:-fixed}}"
 
-          # --- Horario laborable ---
-          if [ "$DOW" -gt 5 ]; then
-            echo "Fin de semana en Madrid; no se envía."
+          # --------- Forzado manual ---------
+          # Si slot != auto, ignoramos la hora actual y enviamos ese bloque.
+          # Map de alias a franja para logs
+          case "$DISPATCH_SLOT" in
+            morning|tip|close) SLOT="$DISPATCH_SLOT";;
+            auto|"") SLOT="auto";;
+            *) echo "Valor slot inválido: $DISPATCH_SLOT (usa morning|tip|close|auto)"; exit 1;;
+          esac
+
+          # --------- Fin de semana ---------
+          if [ "$DOW" -gt 5 ] && [ "$SLOT" = "auto" ]; then
+            echo "Fin de semana en Madrid; no se envía (auto)."
             exit 0
           fi
 
-          # --- Función Telegram ---
+          # --------- Telegram helper ---------
           send() {
             local text="$1"
             curl -sS "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
@@ -65,8 +87,6 @@ jobs:
           # =========================
           # VARIANTES FIJAS (10)
           # =========================
-
-          # 09:00 — Buenos días (10)
           MORNING_VARS=(
             "🌞 <b>¡Buenos días, equipo!</b>\n\nArrancamos en <b>InvestX</b> con setups claros, niveles clave y disciplina. Que hable la ejecución. 🚀"
             "☕ <b>A por el día</b>\n\nListas preparadas: soportes, resistencias y catalizadores. Menos ruido, más señales. 💥"
@@ -80,7 +100,6 @@ jobs:
             "🧠 <b>Mentalidad pro</b>\n\nObserva antes de reaccionar. La paciencia filtra operaciones mediocres. ⏳"
           )
 
-          # 10:30 — TIP del día (10)
           TIP_VARS=(
             "📌 <b>TIP</b>\n\nPulsa el <b>#ticker</b> para ver todas las menciones y tener contexto al instante. 🔎"
             "🧠 <b>TIP</b>\n\nDefine activación, invalidación y TP <b>antes</b> de abrir. Evita improvisar. 📝"
@@ -94,7 +113,6 @@ jobs:
             "🎛️ <b>TIP</b>\n\nReduce tamaño si sube la volatilidad; preserva la curva de capital. 📉➡️📈"
           )
 
-          # 22:00 — Cierre (10)
           CLOSE_VARS=(
             "🌙 <b>Cierre de mercado</b>\n\nAnota qué funcionó y qué no. La consistencia vive en el post-análisis. 📝"
             "✅ <b>Diario</b>\n\nCaptura pantallas y lecciones. Mañana decides mejor con evidencia. 📚"
@@ -108,9 +126,7 @@ jobs:
             "🗺️ <b>Ruta</b>\n\nEscenario 1 si continúa impulso, 2 si corrige a valor. Llega con mapa, no a ciegas. 🗺️"
           )
 
-          # =========================
-          # MODO MIX (tipo IA sin APIs)
-          # =========================
+          # --------- Bancos para modo mix ---------
           OPENINGS_M=( "🌞 <b>¡Buenos días, equipo!</b>" "☕ <b>A por el día</b>" "🌅 <b>Buenos días</b>" "🚀 <b>Comienza la sesión</b>" "🔔 <b>Apertura ON</b>" )
           BODIES_M=( "Arrancamos en <b>InvestX</b> con setups de calidad y gestión del riesgo." "Mapeamos niveles, catalizadores y sesgo antes de tocar el botón." "Contexto + confirmación: que el precio venga a nuestra zona." "Primero plan, luego trade: activación e invalidación claras." "Menos ruido, más señales: volumen y zonas de valor mandan." )
           CLOSERS_M=( "Que hable la ejecución. 🚀" "Hoy sumamos consistencia. 🧱" "Paciencia = ventaja. ⏳" "Entrada justificada, salida planificada. 🧭" "Calidad > cantidad. ✅" )
@@ -123,47 +139,43 @@ jobs:
           BODIES_C=( "Anota lo que funcionó y lo que no; ahí vive la mejora." "Actualiza niveles y clasifica activos para mañana." "Revisa gaps y defensas institucionales que dejó el día." "Alinea el sesgo con el marco mayor si cambió el contexto." "Deja escrito el primer trade si se da la señal." )
           CLOSERS_C=( "La consistencia está en el post-análisis. 📝" "Dormir con el plan hecho = ventaja. 😴" "Simplicidad gana. 💡" "RR real, no ideal. 🧮" "Mañana se ejecuta mejor. 📚" )
 
-          pick_from_bank() {
-            # $1 nombre del array, $2 semilla
-            local name="$1"; local seed="$2"
-            local -n ARR="$name"
-            local n="${#ARR[@]}"
-            local idx=$(( seed % n ))
-            echo "${ARR[$idx]}"
-          }
+          pick_from_bank() { local -n ARR=$1; local seed=$2; local n=${#ARR[@]}; echo "${ARR[$((seed % n))]}"; }
 
           build_mix() {
             local slot="$1"
-            local seed=$((10#${DOY} + $(echo "$HHMM" | tr -d ':') ))
+            local seed=$((10#${DOY} + $(echo "$HHMM_NOW" | tr -d ':') ))
             case "$slot" in
-              morning)
-                echo -e "$(pick_from_bank OPENINGS_M $seed)\n$(pick_from_bank BODIES_M $((seed+1))) $(pick_from_bank CLOSERS_M $((seed+2)))"
-              ;;
-              tip)
-                echo -e "$(pick_from_bank OPENINGS_T $seed)\n$(pick_from_bank BODIES_T $((seed+1))) $(pick_from_bank CLOSERS_T $((seed+2)))"
-              ;;
-              close)
-                echo -e "$(pick_from_bank OPENINGS_C $seed)\n$(pick_from_bank BODIES_C $((seed+1))) $(pick_from_bank CLOSERS_C $((seed+2)))"
-              ;;
+              morning) echo -e "$(pick_from_bank OPENINGS_M $seed)\n$(pick_from_bank BODIES_M $((seed+1))) $(pick_from_bank CLOSERS_M $((seed+2)))";;
+              tip)     echo -e "$(pick_from_bank OPENINGS_T $seed)\n$(pick_from_bank BODIES_T $((seed+1))) $(pick_from_bank CLOSERS_T $((seed+2)))";;
+              close)   echo -e "$(pick_from_bank OPENINGS_C $seed)\n$(pick_from_bank BODIES_C $((seed+1))) $(pick_from_bank CLOSERS_C $((seed+2)))";;
             esac
           }
 
-          # --- Selector por hora ---
-          case "$HHMM" in
-            "09:00")
+          # --------- Determinar SLOT si auto ---------
+          if [ "$SLOT" = "auto" ]; then
+            case "$HHMM_NOW" in
+              "09:00") SLOT="morning";;
+              "10:30") SLOT="tip";;
+              "22:00") SLOT="close";;
+              *)
+                echo "Auto: hora actual ${HHMM_NOW} no tiene mensaje. No se envía."
+                exit 0
+                ;;
+            esac
+          fi
+
+          # --------- Construcción del mensaje ---------
+          case "$SLOT" in
+            morning)
               if [ "$MODE" = "mix" ]; then TEXTO="$(build_mix morning)"; else TEXTO="${MORNING_VARS[$IDX]}"; fi
               ;;
-            "10:30")
+            tip)
               if [ "$MODE" = "mix" ]; then TEXTO="$(build_mix tip)"; else TEXTO="${TIP_VARS[$IDX]}"; fi
               ;;
-            "22:00")
+            close)
               if [ "$MODE" = "mix" ]; then TEXTO="$(build_mix close)"; else TEXTO="${CLOSE_VARS[$IDX]}"; fi
-              ;;
-            *)
-              echo "No hay mensaje definido para ${HHMM}; no se envía."
-              exit 0
               ;;
           esac
 
-          echo "Modo=${MODE} | Día=${DOY} | Variante=${IDX} | Enviando ${HHMM} Madrid…"
+          echo "SLOT=${SLOT} | MODE=${MODE} | DOY=${DOY} | VAR=${IDX} | HHMM_NOW=${HHMM_NOW}"
           send "${TEXTO}"
