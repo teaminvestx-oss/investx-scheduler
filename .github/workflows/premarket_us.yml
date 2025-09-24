@@ -1,10 +1,9 @@
-# .github/workflows/premarket_us.yml
-name: InvestX Premarket US
+name: InvestX Premarket US (12h Madrid)
 
 on:
   schedule:
-    - cron: "25 13 * * 1-5"   # Lun-Vie 15:25 Madrid (CEST)
-    - cron: "30 13 * * 1-5"   # Lun-Vie 15:30 Madrid (CEST)
+    - cron: "0 10 * * 1-5"  # Cubre verano (CEST) -> 12:00 Madrid
+    - cron: "0 11 * * 1-5"  # Cubre invierno (CET) -> 12:00 Madrid
   workflow_dispatch:
 
 jobs:
@@ -24,7 +23,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install yfinance==0.2.43 pandas pillow requests
 
-      - name: Run premarket snapshot
+      - name: Premarket snapshot 12h local
         env:
           INVESTX_TOKEN: ${{ secrets.INVESTX_TOKEN }}
           CHAT_ID: ${{ secrets.CHAT_ID }}
