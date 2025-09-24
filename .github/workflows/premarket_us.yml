@@ -1,0 +1,33 @@
+# .github/workflows/premarket_us.yml
+name: InvestX Premarket US
+
+on:
+  schedule:
+    - cron: "25 13 * * 1-5"   # Lun-Vie 15:25 Madrid (CEST)
+    - cron: "30 13 * * 1-5"   # Lun-Vie 15:30 Madrid (CEST)
+  workflow_dispatch:
+
+jobs:
+  premarket-us:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install yfinance==0.2.43 pandas pillow requests
+
+      - name: Run premarket snapshot
+        env:
+          INVESTX_TOKEN: ${{ secrets.INVESTX_TOKEN }}
+          CHAT_ID: ${{ secrets.CHAT_ID }}
+          LOCAL_TZ: "Europe/Madrid"
+        run: |
+          python premarket_us.py
