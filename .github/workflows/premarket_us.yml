@@ -35,10 +35,6 @@ jobs:
         env:
           INVESTX_TOKEN: ${{ secrets.INVESTX_TOKEN }}
           CHAT_ID: ${{ secrets.CHAT_ID }}
-          # Si alguna vez quieres forzar envío aunque esté fuera de ventana, pon FORCE_SEND=1
           FORCE_SEND: "0"
           GITHUB_EVENT_NAME: ${{ github.event_name }}
-        run: |
-          mkdir -p scripts
-          # asegúrate de que el archivo existe en scripts/
-          node scripts/premarket_futures.js
+        run: node premarket_futures.js
