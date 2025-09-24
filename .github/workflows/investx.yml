@@ -161,4 +161,3 @@ $'🗺️ <b>Ruta</b>\nEscenario 1 si continúa impulso, 2 si corrige a valor. L
 
           echo "Modo=${MODE} | DOY=${DOY} | IDX=${IDX} | Enviando ${HHMM}…"
           send "${TEXTO}"
-
