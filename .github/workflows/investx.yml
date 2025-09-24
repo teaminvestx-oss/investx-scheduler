@@ -2,71 +2,163 @@ name: InvestX Telegram Scheduler
 
 on:
   schedule:
-    - cron: "0 7 * * 1-5"      # 09:00 Madrid (L-V) -> 07:00 UTC
-    - cron: "30 8 * * 1-5"     # 10:30 Madrid (L-V) -> 08:30 UTC
-    - cron: "0 19 * * 1-5"     # 21:00 Madrid (L-V) -> 19:00 UTC
-    - cron: "0 20 * * 1-5"     # 22:00 Madrid (L-V) -> 20:00 UTC
+    - cron: "0 7 * * 1-5"     # CEST 09:00 Madrid
+    - cron: "0 8 * * 1-5"     # CET  09:00 Madrid
+    - cron: "30 8 * * 1-5"    # CEST 10:30 Madrid
+    - cron: "30 9 * * 1-5"    # CET  10:30 Madrid
+    - cron: "0 20 * * 1-5"    # CEST 22:00 Madrid
+    - cron: "0 21 * * 1-5"    # CET  22:00 Madrid
   workflow_dispatch:
 
+concurrency:
+  group: investx-telegram-scheduler-${{ github.run_id }}
+  cancel-in-progress: false
+
 jobs:
-  diag:
+  send:
     runs-on: ubuntu-latest
+    env:
+      BOT_TOKEN: ${{ secrets.INVESTX_TOKEN }}
+      CHAT_ID:   ${{ secrets.CHAT_ID }}
+      MESSAGE_MODE: ${{ vars.MESSAGE_MODE }}   # "fixed" (default) o "mix"
     steps:
-      - name: Print event info
+      - name: Diagnóstico
         run: |
           echo "event_name=${{ github.event_name }}"
           echo "event.schedule=${{ github.event.schedule }}"
           echo "now_utc=$(date -u +'%Y-%m-%d %H:%M:%S UTC')"
           echo "now_madrid=$(TZ=Europe/Madrid date +'%Y-%m-%d %H:%M:%S %Z')"
+          echo "MESSAGE_MODE=${MESSAGE_MODE:-fixed}"
 
-  send-0900:
-    if: github.event_name == 'schedule' && github.event.schedule == '0 7 * * 1-5'
-    runs-on: ubuntu-latest
-    steps:
-      - name: Send 09:00 (Madrid, L-V)
+      - name: Enviar mensaje (rotación 10 variantes o mix) L-V
+        if: ${{ env.BOT_TOKEN != '' && env.CHAT_ID != '' }}
         env:
-          BOT_TOKEN: ${{ secrets.INVESTX_TOKEN }}
-          CHAT_ID: ${{ secrets.CHAT_ID }}
+          TZ: Europe/Madrid
         run: |
-          TEXTO="🌞 ¡Buenos días, equipo!Arrancamos la jornada en InvestX con energía 💥.Hoy os esperan setups claros, niveles clave y oportunidades de mercado para no dejar escapar. 🚀"
-          curl -sS "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
-            -d chat_id="${CHAT_ID}" -d parse_mode="HTML" --data-urlencode text="${TEXTO}"
+          set -euo pipefail
 
-  send-1030:
-    if: github.event_name == 'schedule' && github.event.schedule == '30 8 * * 1-5'
-    runs-on: ubuntu-latest
-    steps:
-      - name: Send 10:30 (Madrid, L-V)
-        env:
-          BOT_TOKEN: ${{ secrets.INVESTX_TOKEN }}
-          CHAT_ID: ${{ secrets.CHAT_ID }}
-        run: |
-          TEXTO="📌 TIP DEL DÍA-¿Sabías que si pulsas el ticker con \"#\" delante en el canal 📲 podrás ver al instante todas las menciones, informes y noticias de ese activo?¡Aprovéchalo para no perder contexto ni oportunidades! 🔎"
-          curl -sS "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
-            -d chat_id="${CHAT_ID}" -d parse_mode="HTML" --data-urlencode text="${TEXTO}"
+          # --- Fecha/hora Madrid ---
+          DOW="$(date +%u)"                 # 1=L ... 7=D
+          HHMM="$(date +'%H:%M')"
+          DOY="$(date +%j)"                 # 001..366
+          IDX=$(( (10#${DOY} - 1) % 10 ))   # 0..9 determinista
+          MODE="${MESSAGE_MODE:-fixed}"
 
-  send-2100:
-    if: github.event_name == 'schedule' && github.event.schedule == '0 19 * * 1-5'
-    runs-on: ubuntu-latest
-    steps:
-      - name: Send 21:00 (Madrid, L-V)
-        env:
-          BOT_TOKEN: ${{ secrets.INVESTX_TOKEN }}
-          CHAT_ID: ${{ secrets.CHAT_ID }}
-        run: |
-          TEXTO="🔔 21:00 — Última hora del mercado 📉📈Es el momento de revisar cómo cierra la sesión y qué setups siguen vivos.👀 Preparad la lupa, porque aquí es donde aparecen las pistas para mañana."
-          curl -sS "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
-            -d chat_id="${CHAT_ID}" -d parse_mode="HTML" --data-urlencode text="${TEXTO}"
+          if [ "$DOW" -gt 5 ]; then
+            echo "Fin de semana en Madrid; no se envía."
+            exit 0
+          fi
 
-  send-2200:
-    if: github.event_name == 'schedule' && github.event.schedule == '0 20 * * 1-5'
-    runs-on: ubuntu-latest
-    steps:
-      - name: Send 22:00 (Madrid, L-V)
-        env:
-          BOT_TOKEN: ${{ secrets.INVESTX_TOKEN }}
-          CHAT_ID: ${{ secrets.CHAT_ID }}
-        run: |
-          TEXTO="🌙 El mercado ya ha cerrado, equipo.Ahora toca revisar con calma los movimientos finales de la sesión y preparar el terreno para mañana 📝.💡 La volatilidad al cierre siempre deja oportunidades escondidas... ¡no las dejemos pasar!"
-          curl -sS "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
-            -d chat_id="${CHAT_ID}" -d parse_mode="HTML" --data-urlencode text="${TEXTO}"
+          send() {
+            local text="$1"
+            curl -sS "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+              -d chat_id="${CHAT_ID}" -d parse_mode="HTML" \
+              --data-urlencode text="${text}" | jq -r '.ok,.description?'
+          }
+
+          # =========================
+          # VARIANTES FIJAS (10)
+          # =========================
+
+          # 09:00 — Buenos días
+          MORNING_VARS=(
+$'🌞 <b>¡Buenos días, equipo!</b>\nArrancamos en <b>InvestX</b>: setups claros, niveles clave y disciplina. Que hable la ejecución. 🚀'
+$'☕ <b>A por el día</b>\nListas preparadas: soportes, resistencias y catalizadores. Menos ruido, más señales. 💥'
+$'🌅 <b>Buenos días</b>\nContexto + confirmación: momentum, volumen institucional y zonas de liquidez. 🔎'
+$'🚀 <b>Comienza la sesión</b>\nMapa listo: <b>bias</b>, escenarios y gestión del riesgo. Entrada justificada, salida planificada. 🧭'
+$'🔔 <b>Apertura ON</b>\nTendencia mayor, zonas de valor y volatilidad esperada. Calidad > cantidad. ✅'
+$'📈 <b>Morning brief</b>\nRevisa watchlist, alinea timeframes y protege el capital. Hoy se suma consistencia. 🧱'
+$'💡 <b>Enfoque</b>\nPrimero contexto, luego señal. Evita perseguir; espera que el precio venga a tu zona. 🪤'
+$'🧭 <b>Plan primero</b>\nSesgo definido, invalidación clara y RR mínimo. Sin plan no hay trade. 📜'
+$'🔥 <b>Impulso inicial</b>\nBusca confluencias: nivel + flujo + timing. Donde coinciden, suele haber oportunidad. 🎯'
+$'🧠 <b>Mentalidad pro</b>\nObserva > reacciona. La paciencia filtra operaciones mediocres. ⏳'
+          )
+
+          # 10:30 — TIP del día
+          TIP_VARS=(
+$'📌 <b>TIP</b>\nPulsa el <b>ticker con “#”</b> para ver todas las menciones y tener contexto al instante. 🔎'
+$'🧠 <b>TIP</b>\nDefine activación, invalidación y TP <b>antes</b> de abrir. Evita improvisar. 📝'
+$'⚙️ <b>TIP</b>\nRuptura sin volumen = paciencia. Espera el <i>retest</i> a zona. ⏳'
+$'🔍 <b>TIP</b>\nUnifica marcos: diario + 15m contando la misma historia = más probabilidad. 🎯'
+$'🧭 <b>TIP</b>\nMarca catalizadores (earnings, macro) y evita operar contra ellos. 📅'
+$'📊 <b>TIP</b>\nSi el plan depende de “que pase algo”, no es plan: reescribe el setup. ✍️'
+$'🛡️ <b>TIP</b>\nStop lógico detrás de nivel defendido, no arbitrario por distancia. 🛑'
+$'🔄 <b>TIP</b>\nSi falla el primer escenario, ten listo el alternativo con sesgo contrario. ♻️'
+$'📏 <b>TIP</b>\nNo sacrifiques RR por entrar “ya”. El precio da segundas oportunidades. 🎣'
+$'🎛️ <b>TIP</b>\nReduce tamaño si la volatilidad sube; preserva la curva de capital. 📉➡️📈'
+          )
+
+          # 22:00 — Cierre
+          CLOSE_VARS=(
+$'🌙 <b>Cierre de mercado</b>\nAnota qué funcionó y qué no. La consistencia vive en el post-análisis. 📝'
+$'✅ <b>Diario</b>\nCaptura pantallas y lecciones. Mañana decides mejor con evidencia. 📚'
+$'🧩 <b>Resumen</b>\nRepasa setups activos, defensas institucionales y gaps pendientes. 🔄'
+$'📓 <b>Checklist</b>\nActualiza niveles → clasifica activos A/B → define sesgo para mañana. 😴'
+$'🔄 <b>Plan</b>\nMantén lo que aporta, elimina lo accesorio. La fuerza está en la simplicidad. 💡'
+$'🧠 <b>Higiene mental</b>\nCierra plataformas y deja escrito el primer trade <i>si</i> se da la señal. 🧘'
+$'🧱 <b>Base sólida</b>\nRR real, no ideal. Ajusta objetivos a la estructura. 🧮'
+$'🛰️ <b>Vista macro</b>\n¿Cambió el contexto? Alinea tu sesgo con el de mayor marco temporal. 🌍'
+$'📌 <b>Anclajes</b>\nSeñala niveles que el precio respetó hoy: suelen importar mañana. 📍'
+$'🗺️ <b>Ruta</b>\nEscenario 1 si continúa impulso, 2 si corrige a valor. Llega con mapa, no a ciegas. 🗺️'
+          )
+
+          # =========================
+          # MODO MIX (tipo IA sin APIs)
+          # =========================
+          # Bancos de frases para componer mensajes “naturales”
+          OPENINGS_M=( $'🌞 <b>¡Buenos días, equipo!</b>' $'☕ <b>A por el día</b>' $'🌅 <b>Buenos días</b>' $'🚀 <b>Comienza la sesión</b>' $'🔔 <b>Apertura ON</b>' )
+          BODIES_M=( $'Arrancamos en <b>InvestX</b> con foco en setups de calidad y gestión del riesgo.' $'Mapeamos niveles, catalizadores y <b>sesgo</b> antes de tocar el botón.' $'Contexto + confirmación: que el precio venga a nuestra zona.' $'Primero plan, luego trade: activación e invalidación claras.' $'Menos ruido, más señales: volumen y zonas de valor mandan.' )
+          CLOSERS_M=( $'Que hable la ejecución. 🚀' $'Hoy sumamos consistencia. 🧱' $'Paciencia = ventaja. ⏳' $'Entrada justificada, salida planificada. 🧭' $'Calidad > cantidad. ✅' )
+
+          OPENINGS_T=( $'📌 <b>TIP</b>' $'🧠 <b>TIP</b>' $'🔍 <b>TIP</b>' $'⚙️ <b>TIP</b>' $'🧭 <b>TIP</b>' )
+          BODIES_T=( $'Pulsa el <b>#ticker</b> para contexto al instante.' $'Escribe activación, invalidación y TP antes de entrar.' $'Ruptura sin volumen → espera el <i>retest</i>.' $'Alinea diario y 15m para reforzar probabilidad.' $'Evita operar contra <b>catalizadores</b> del día.' )
+          CLOSERS_T=( $'Decidir con datos gana. 🔎' $'Menos impulsividad, más plan. 📝' $'La paciencia paga. ⏳' $'Confluencia > ocurrencias. 🎯' $'Controla el riesgo, no el mercado. 🛡️' )
+
+          OPENINGS_C=( $'🌙 <b>Cierre de mercado</b>' $'✅ <b>Diario</b>' $'🧩 <b>Resumen</b>' $'📓 <b>Checklist</b>' $'🔄 <b>Plan</b>' )
+          BODIES_C=( $'Anota lo que funcionó y lo que no; ahí vive la mejora.' $'Actualiza niveles y clasifica activos para mañana.' $'Revisa gaps y defensas institucionales que dejó el día.' $'Alinea el sesgo con el marco mayor si cambió el contexto.' $'Deja escrito el primer trade <i>si</i> se da la señal.' )
+          CLOSERS_C=( $'La consistencia está en el post-análisis. 📝' $'Dormir con el plan hecho = ventaja. 😴' $'Simplicidad gana. 💡' $'RR real, no ideal. 🧮' $'Mañana se ejecuta mejor. 📚' )
+
+          pick_from_bank() {
+            local -n A=$1; local seed=$2
+            local n=${#A[@]}
+            local idx=$(( seed % n ))
+            echo "${A[$idx]}"
+          }
+
+          build_mix() {
+            local slot="$1"
+            # seed estable por día y franja
+            local seed=$((10#${DOY} + $(echo "$HHMM" | tr -d ':') ))
+            case "$slot" in
+              morning)
+                echo -e "$(pick_from_bank OPENINGS_M $seed)\n$(pick_from_bank BODIES_M $((seed+1))) $(pick_from_bank CLOSERS_M $((seed+2)))"
+                ;;
+              tip)
+                echo -e "$(pick_from_bank OPENINGS_T $seed)\n$(pick_from_bank BODIES_T $((seed+1))) $(pick_from_bank CLOSERS_T $((seed+2)))"
+                ;;
+              close)
+                echo -e "$(pick_from_bank OPENINGS_C $seed)\n$(pick_from_bank BODIES_C $((seed+1))) $(pick_from_bank CLOSERS_C $((seed+2)))"
+                ;;
+            esac
+          }
+
+          # --- Selección final según hora ---
+          case "$HHMM" in
+            "09:00")
+              if [ "$MODE" = "mix" ]; then TEXTO="$(build_mix morning)"; else TEXTO="${MORNING_VARS[$IDX]}"; fi
+              ;;
+            "10:30")
+              if [ "$MODE" = "mix" ]; then TEXTO="$(build_mix tip)"; else TEXTO="${TIP_VARS[$IDX]}"; fi
+              ;;
+            "22:00")
+              if [ "$MODE" = "mix" ]; then TEXTO="$(build_mix close)"; else TEXTO="${CLOSE_VARS[$IDX]}"; fi
+              ;;
+            *)
+              echo "Sin mensaje para ${HHMM}."
+              exit 0
+              ;;
+          esac
+
+          echo "Modo=${MODE} | DOY=${DOY} | IDX=${IDX} | Enviando ${HHMM}…"
+          send "${TEXTO}"
+
