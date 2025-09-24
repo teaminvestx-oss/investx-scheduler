@@ -8,13 +8,10 @@ on:
     # 10:30 Madrid
     - cron: "30 8 * * 1-5"    # CEST 10:30 (verano)
     - cron: "30 9 * * 1-5"    # CET  10:30 (invierno)
-    # 22:00 Madrid
-    - cron: "0 20 * * 1-5"    # CEST 22:00 (verano)
-    - cron: "0 21 * * 1-5"    # CET  22:00 (invierno)
   workflow_dispatch:
     inputs:
       slot:
-        description: "Forzar franja: morning | tip | close | auto"
+        description: "Forzar franja: morning | tip | auto"
         required: false
         default: "auto"
 
@@ -87,55 +84,22 @@ jobs:
             $'🗂️ <b>TIP del canal.</b>\n\nTu flujo debería ser: idea → <b>#ticker</b> → validar → ejecutar. Proceso repetible = consistencia.'
           )
 
-          # 22:00 — Cierre de mercado (15, tono analista)
-          CLOSE_VARS=(
-            $'🌙 <b>Cierre de mercado</b>\n\nTipo de día: <i>tendencial</i>. Los tirones respetaron VWAP y dejaron <b>mínimos crecientes</b>.\nMapa para mañana: mantener sesgo mientras no se pierdan los <b>niveles de valor</b> marcados.'
-            $'🧩 <b>Cierre de mercado</b>\n\nSesión <i>equilibrada</i>: rotación por rangos y defensa clara del <b>PDC</b>.\nPlan: esperar ruptura con volumen o <i>retest</i> a borde del balance para buscar continuidad.'
-            $'📓 <b>Cierre de mercado</b>\n\nAnota <b>MAE/MFE</b> de tus entradas y si el <b>RR</b> fue real o ideal.\nAjusta objetivos a la estructura que dejó hoy el precio; mañana no fuerces extensiones.'
-            $'🔄 <b>Cierre de mercado</b>\n\nQuedaron <b>gaps</b> abiertos y zonas de liquidez barridas en la apertura.\nEscenario 1: barrido y continuación; Escenario 2: relleno de gap hacia valor. Ten ambos escritos.'
-            $'🧠 <b>Cierre de mercado</b>\n\n¿Qué <b>confluencias</b> funcionaron? (nivel + flujo + timing).\nDuplica lo que aportó y elimina lo accesorio. Consistencia > brillantez puntual.'
-            $'📍 <b>Cierre de mercado</b>\n\nNiveles que el precio <b>respetó</b> hoy: (1) semanal, (2) diaria, (3) intradía.\nEtiquétalos en tu watchlist; suelen ser los que importan en la apertura.'
-            $'🛰️ <b>Cierre de mercado</b>\n\nMacro sin sorpresas, técnica mandando. Revisa si el marco <b>diario</b> confirma lo visto en <b>15m</b>.\nSi cuentan la misma historia, la probabilidad sube.'
-            $'🧮 <b>Cierre de mercado</b>\n\nRecalcula tamaño por <b>volatilidad</b>: rango de hoy vs. media 10 sesiones.\nSi el rango se expandió, reduce tamaño para mantener riesgo constante.'
-            $'🧱 <b>Cierre de mercado</b>\n\nDefensa institucional visible: bloque de órdenes mantuvo zona.\nMañana, la invalidación va <b>detrás</b> de ese nivel, no por distancia arbitraria.'
-            $'🗺️ <b>Cierre de mercado</b>\n\nClasifica A/B: A = setups con confluencia y catalizador a favor; B = ideas a vigilar.\nOpera A, observa B. Menos dispersión, más edge.'
-            $'⚙️ <b>Cierre de mercado</b>\n\nHoy el <b>VWAP</b> actuó como bisagra. Si mañana abrimos por encima y se sostiene, sesgo alcista hasta zona de oferta; si no, vuelta a valor.'
-            $'📊 <b>Cierre de mercado</b>\n\nRevisa <b>delta/volumen</b>: las rupturas válidas llevaron participación, las falsas no.\nTu gatillo debe exigir confirmación, no suposiciones.'
-            $'🧭 <b>Cierre de mercado</b>\n\nCatalizadores de mañana (earnings/macro): marca horas y activos afectados.\nEvita abrir justo antes; mejor operar el <i>post-evento</i> con niveles claros.'
-            $'🔍 <b>Cierre de mercado</b>\n\nEstructura: <i>pullback a valor</i> y continuación.\nEscribe el primer trade condicional: precio en zona → señal → entrada; sin señal, no hay trade.'
-            $'💡 <b>Cierre de mercado</b>\n\nAprendizaje del día: ¿dónde te adelantaste? ¿dónde faltó paciencia?\nTu ventaja está en ejecutar el plan, no en adivinar el siguiente tick.'
-          )
-
           # --------- Determinar SLOT si auto ---------
           if [ "$SLOT" = "auto" ]; then
             case "$HHMM_NOW" in
               "09:00") SLOT="morning";;
               "10:30") SLOT="tip";;
-              "22:00") SLOT="close";;
               *) echo "Auto: ${HHMM_NOW} no tiene mensaje. No se envía."; exit 0;;
             esac
           fi
 
-          # --------- Selección del índice por franja (rotación por día) ---------
-          # Cálculo determinista por franja para evitar desbordes si tamaños difieren
-          pick_idx() {
-            local size="$1"; local doy="$2"
-            echo $(( (10#${doy} - 1) % size ))
-          }
+          # --------- Índice por franja (rotación por día) ---------
+          pick_idx() { local size="$1"; local doy="$2"; echo $(( (10#${doy} - 1) % size )); }
 
           case "$SLOT" in
-            morning)
-              i="$(pick_idx ${#MORNING_VARS[@]} "$DOY")"
-              TEXTO="${MORNING_VARS[$i]}"
-              ;;
-            tip)
-              i="$(pick_idx ${#TIP_VARS[@]} "$DOY")"
-              TEXTO="${TIP_VARS[$i]}"
-              ;;
-            close)
-              i="$(pick_idx ${#CLOSE_VARS[@]} "$DOY")"
-              TEXTO="${CLOSE_VARS[$i]}"
-              ;;
+            morning) i="$(pick_idx ${#MORNING_VARS[@]} "$DOY")"; TEXTO="${MORNING_VARS[$i]}";;
+            tip)     i="$(pick_idx ${#TIP_VARS[@]} "$DOY")";     TEXTO="${TIP_VARS[$i]}";;
+            *) echo "slot inválido: $SLOT"; exit 1;;
           esac
 
           echo "SLOT=${SLOT} | DOY=${DOY} | VAR=${i} | HHMM_NOW=${HHMM_NOW}"
