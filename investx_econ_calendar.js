@@ -1,27 +1,24 @@
-/* InvestX Economic Calendar — Render Cron
-   Stack: puppeteer-core + @sparticuz/chromium (robusto en Render)
-   ENV: INVESTX_TOKEN, CHAT_ID
-   Node: 20
+/* InvestX Economic Calendar — versión SIN Puppeteer (robusta en Render)
+   - Descarga el HTML del widget oficial de Investing (server-side)
+   - Filtra USA + importancia 2/3
+   - Envía resumen a Telegram
+   - Intenta generar PNG propio con PureImage (si falla, no rompe)
+   Requiere: INVESTX_TOKEN, CHAT_ID
 */
 
 const fs = require('fs');
 const path = require('path');
-const chromium = require('@sparticuz/chromium');
-const puppeteer = require('puppeteer-core');
+const cheerio = require('cheerio');
+const PImage = require('pureimage');
 
 // ---------- Utilidades de tiempo (Europe/Madrid) ----------
-function nowInTZ(tz = 'Europe/Madrid') {
-  const d = new Date();
-  const fmt = new Intl.DateTimeFormat('sv-SE', {
-    timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit',
-    hour: '2-digit', minute: '2-digit'
-  });
-  const parts = Object.fromEntries(fmt.formatToParts(d).map(p => [p.type, p.value]));
-  return `${parts.year}-${parts.month}-${parts.day} ${parts.hour}:${parts.minute}`;
-}
 function isMonday(tz = 'Europe/Madrid') {
-  return new Intl.DateTimeFormat('en-GB', { timeZone: tz, weekday: 'short' })
-    .format(new Date()).toLowerCase() === 'mon';
+  const wd = new Intl.DateTimeFormat('en-GB', { timeZone: tz, weekday: 'short' })
+    .format(new Date()).toLowerCase();
+  return wd === 'mon';
+}
+function todayISO(tz = 'Europe/Madrid') {
+  return new Intl.DateTimeFormat('sv-SE', { timeZone: tz, dateStyle: 'short' }).format(new Date());
 }
 function weekRangeISO(tz = 'Europe/Madrid') {
   const d = new Date();
@@ -33,194 +30,169 @@ function weekRangeISO(tz = 'Europe/Madrid') {
   const f = (x) => new Intl.DateTimeFormat('sv-SE',{timeZone:tz,dateStyle:'short'}).format(x);
   return { monday: f(monday), sunday: f(sunday) };
 }
-
-// ---------- Helpers ----------
-const wait = (ms)=>new Promise(r=>setTimeout(r,ms));
-
-async function clickByText(page, selector, texts, timeoutMs = 8000) {
-  const end = Date.now() + timeoutMs;
-  const wants = texts.map(t => t.toLowerCase());
-  while (Date.now() < end) {
-    const ok = await page.evaluate(({ selector, wants }) => {
-      for (const el of document.querySelectorAll(selector)) {
-        const t = ((el.innerText || el.textContent || el.value || '') + '').toLowerCase().trim();
-        if (wants.some(w => t.includes(w))) { el.click(); return true; }
-      }
-      return false;
-    }, { selector, wants });
-    if (ok) return true;
-    await wait(250);
-  }
-  return false;
+function nowInTZ(tz='Europe/Madrid'){
+  const d=new Date();
+  const fmt=new Intl.DateTimeFormat('sv-SE',{timeZone:tz,year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'});
+  const parts=Object.fromEntries(fmt.formatToParts(d).map(p=>[p.type,p.value]));
+  return `${parts.year}-${parts.month}-${parts.day} ${parts.hour}:${parts.minute}`;
 }
 
-async function applyFilters(page) {
-  // móvil: el panel de filtros también existe
-  await clickByText(page, 'button,a,[role="button"],input[type="button"]', ['filtro','filtros','filters'], 8000).catch(()=>{});
-  await wait(600);
-  await page.evaluate(() => {
-    const root = document.querySelector('.filterPopup,[class*="filterPop"]') || document;
-
-    const countries = [...root.querySelectorAll('input[type="checkbox"][name*="country"]')];
-    countries.forEach(cb => { cb.checked = false; cb.dispatchEvent(new Event('change', { bubbles:true })); });
-    let us = countries.find(cb => cb.value === '5') ||
-             countries.find(cb => /estados unidos|united states|ee\.uu/i.test((cb.closest('label,li,div')?.innerText||'')));
-    if (us) { us.checked = true; us.dispatchEvent(new Event('change', { bubbles:true })); }
-
-    const imps = [...root.querySelectorAll('input[type="checkbox"][name*="importance"]')];
-    imps.forEach(cb => { cb.checked = (cb.value === '2' || cb.value === '3'); cb.dispatchEvent(new Event('change', { bubbles:true })); });
-
-    const btn = [...root.querySelectorAll('button,a,input[type="submit"],input[type="button"]')]
-      .find(b => /aplicar|apply|mostrar|show/i.test((b.innerText || b.value || '')));
-    btn?.click();
-  });
-  await wait(1200);
-}
-
-// Navegación robusta con reintentos + espera a red ociosa
-async function navWithRetry(page, url, tries = 3) {
-  let lastErr;
-  for (let i = 0; i < tries; i++) {
-    try {
-      await page.goto(url, { waitUntil: 'networkidle2', timeout: 180000 });
-      if (typeof page.waitForNetworkIdle === 'function') {
-        try { await page.waitForNetworkIdle({ timeout: 15000 }); } catch {}
-      }
-      await wait(1200);
-      return;
-    } catch (e) {
-      lastErr = e;
-      try { await page.reload({ waitUntil: 'domcontentloaded', timeout: 90000 }); } catch {}
-      await wait(1200);
+// ---------- Descarga y parseo del widget ----------
+/*
+ Endpoint (widget oficial):
+ https://ec.forexprostools.com/?columns=exc,cur,event,act,for,pre&importance=2,3&countries=5&calType=day|week&timeZone=56
+ - countries=5 → USA
+ - importance=2,3 → 2 y 3 estrellas
+ - calType=day/week → día actual o semana
+ - timeZone=56 ~ Madrid/CET (aprox; el endpoint devuelve horas locales)
+*/
+async function fetchCalendar(calType) {
+  const url = `https://ec.forexprostools.com/?columns=exc,cur,event,act,for,pre&importance=2,3&countries=5&calType=${calType}&timeZone=56`;
+  const res = await fetch(url, {
+    headers: {
+      'User-Agent':'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36',
+      'Accept-Language':'es-ES,es;q=0.9'
     }
-  }
-  throw lastErr;
+  });
+  if (!res.ok) throw new Error(`Fetch calendar failed: ${res.status}`);
+  const html = await res.text();
+  return parseCalendar(html);
 }
 
-// ---------- Scraper principal ----------
-async function buildCalendar() {
-  const browser = await puppeteer.launch({
-    headless: true,
-    executablePath: await chromium.executablePath(),
-    args: [
-      ...chromium.args,
-      '--lang=es-ES,es',
-      '--no-sandbox',
-      '--disable-setuid-sandbox',
-      '--disable-dev-shm-usage',  // evita cuelgues por /dev/shm pequeño
-      '--single-process'          // útil en instancias pequeñas
-    ],
-    defaultViewport: { width: 414, height: 896, deviceScaleFactor: 2 }, // móvil = más ligero
-    protocolTimeout: 300000 // 5 min
-  });
+function parseCalendar(html) {
+  const $ = cheerio.load(html);
+  const rows = $('tr[id^="eventRowId_"], tr.js-event-item, tr[data-event-datetime]');
+  const events = [];
+  rows.each((_, tr) => {
+    const $tr = $(tr);
+    // hora (primera columna del widget suele ser la hora)
+    const time = ($tr.find('td').first().text() || '').trim();
 
-  const page = await browser.newPage();
-  page.setDefaultTimeout(120000);
-  page.setDefaultNavigationTimeout(180000);
-
-  // Bloquea recursos pesados (acelera carga)
-  await page.setRequestInterception(true);
-  page.on('request', req => {
-    const type = req.resourceType();
-    if (['image','media','font','stylesheet','websocket'].includes(type)) {
-      return req.abort();
+    // importancia: número de <i> o <span> en la celda de sentimiento
+    let imp = 0;
+    const $sent = $tr.find('td.sentiment, td.impact, .sentiment');
+    if ($sent.length) {
+      const n = $sent.find('i, svg, span').length;
+      imp = n >= 3 ? 3 : (n >= 2 ? 2 : (n >= 1 ? 1 : 0));
     }
-    req.continue();
+
+    // título del evento
+    const title = (
+      $tr.attr('data-event-title') ||
+      $tr.find('td.event, td.left, td:nth-child(3)').text() ||
+      $tr.text()
+    ).replace(/\s+/g,' ').trim();
+
+    if (!title || title.length < 4) return;
+
+    const forecast = ($tr.find('td.fore, td.forecast').text() || '').trim();
+    const previous = ($tr.find('td.prev, td.previous').text() || '').trim();
+    const iso = $tr.attr('data-event-datetime') || '';
+
+    // Filtrado redundante: importancia 2/3 ya viene del endpoint, pero por si acaso:
+    if (imp >= 2 || /⭐/.test($sent.text()||'')) {
+      events.push({ time, title, importance: imp || 2, forecast, previous, iso });
+    }
   });
+  return { events };
+}
 
-  // UA móvil + idioma español
-  await page.setUserAgent('Mozilla/5.0 (iPhone; CPU iPhone OS 16_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.4 Mobile/15E148 Safari/604.1');
-  await page.setExtraHTTPHeaders({ 'Accept-Language':'es-ES,es;q=0.9' });
-
-  // Versión móvil (más rápida)
-  await navWithRetry(page, 'https://m.investing.com/economic-calendar/', 3);
-
-  // cookies
-  await page.evaluate(() => {
-    const b = [...document.querySelectorAll("button,a,[role='button']")]
-      .find(x => /aceptar|accept|consent|agree/i.test((x.innerText || '')));
-    b?.click();
-  }).catch(()=>{});
-  await wait(400);
-
-  // Lunes → "Esta semana", resto → "Hoy"
-  if (isMonday()) { await clickByText(page, 'a,button', ['esta semana','this week','semana'], 6000); }
-  else            { await clickByText(page, 'a,button', ['hoy','today'], 6000); }
-  await wait(400);
-
-  await applyFilters(page);
-  await wait(600);
-
-  // espera a tabla/lista (mobile usa listas)
+// ---------- PNG simple con PureImage ----------
+async function drawPNG(events, caption) {
   try {
-    await page.waitForSelector('#economicCalendarData, table.genTbl, ul, .ecEvents', { timeout: 90000 });
-    if (typeof page.waitForNetworkIdle === 'function') {
-      try { await page.waitForNetworkIdle({ timeout: 10000 }); } catch {}
+    const width = 1200;
+    const rowH = 56;
+    const headerH = 100;
+    const h = headerH + rowH * Math.min(events.length, 18) + 40;
+    const img = PImage.make(width, h);
+    const ctx = img.getContext('2d');
+
+    // fondo
+    ctx.fillStyle = '#ffffff';
+    ctx.fillRect(0,0,width,h);
+
+    // Tipografía: intenta cargar DejaVuSans del sistema (si no, PureImage usará fallback)
+    const fontPath1 = '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf';
+    if (fs.existsSync(fontPath1)) {
+      const f = PImage.registerFont(fontPath1, 'UI');
+      await f.load();
     }
-  } catch {}
+    ctx.fillStyle = '#111111';
 
-  // Extraer eventos (tolerante a HTML móvil/escritorio)
-  const data = await page.evaluate(() => {
-    const pick = (...xs) => xs.find(v => v && v.trim && v.trim().length > 0);
-    const rows = [
-      ...document.querySelectorAll('tr[id^="eventRowId_"],tr.js-event-item,tr[data-event-datetime]'),
-      ...document.querySelectorAll('li[id^="eventRowId_"], li.js-event-item')
-    ];
+    // Título
+    ctx.font = '32pt UI, Arial';
+    ctx.fillText('Calendario económico USA (⭐️⭐️/⭐️⭐️⭐️)', 28, 56);
+    ctx.font = '18pt UI, Arial';
+    ctx.fillStyle = '#444444';
+    ctx.fillText(caption, 28, 86);
 
-    const events = [];
-    for (const el of rows) {
-      const isHidden = (el.style && el.style.display === 'none');
-      if (isHidden) continue;
+    // Cabeceras
+    ctx.fillStyle = '#222222';
+    ctx.font = '16pt UI, Arial';
+    ctx.fillText('Hora', 28, headerH);
+    ctx.fillText('Evento', 150, headerH);
+    ctx.fillText('Forecast', 900, headerH);
+    ctx.fillText('Previo', 1040, headerH);
 
-      // título robusto
-      const byAttr = el.getAttribute('data-event-title');
-      const aTitle = el.querySelector('[title]')?.getAttribute('title');
-      const aria   = el.querySelector('[aria-label]')?.getAttribute('aria-label');
-      const txt1   = el.querySelector('a, .event')?.textContent;
-      const txt2   = el.textContent;
-      let title = (pick(byAttr,aTitle,aria,txt1,txt2) || '').replace(/\s+/g,' ').trim();
-      if (/^\d{1,2}:\d{2}$/.test(title) || title.length < 4) continue;
+    // separador
+    ctx.strokeStyle = '#e5e7eb';
+    ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(20, headerH+10); ctx.lineTo(width-20, headerH+10); ctx.stroke();
 
-      // hora
-      let time = '';
-      const t1 = el.querySelector('td:first-child, .time, [data-event-datetime]');
-      if (t1) time = (t1.innerText || t1.textContent || '').trim();
+    // Filas
+    ctx.font = '15pt UI, Arial';
+    let y = headerH + 40;
+    const list = events.slice(0, 18);
+    for (const e of list) {
+      ctx.fillStyle = '#111111';
+      ctx.fillText(e.time || '--:--', 28, y);
 
-      // importancia
-      let imp = parseInt(el.getAttribute('data-importance') || '0', 10);
-      if (!imp || isNaN(imp)) {
-        const s = el.querySelector('.sentiment, .impact');
-        if (s) {
-          const n = s.querySelectorAll('i,svg').length;
-          imp = n >= 3 ? 3 : (n >= 2 ? 2 : 1);
-        } else { imp = 0; }
+      // evento (wrap simple)
+      const maxW = 720;
+      let t = e.title || '';
+      if (ctx.measureText(t).width > maxW) {
+        while (t.length && ctx.measureText(t+'…').width > maxW) t = t.slice(0, -1);
+        t += '…';
       }
+      ctx.fillText(t, 150, y);
 
-      const forecast = (el.querySelector('.fore, .forecast')?.textContent || '').trim();
-      const previous = (el.querySelector('.prev, .previous')?.textContent || '').trim();
-      const iso = el.getAttribute('data-event-datetime') || '';
+      ctx.fillStyle = '#2563eb';
+      ctx.fillText(e.forecast || '-', 900, y);
 
-      events.push({ time, title, importance: imp, iso, forecast, previous });
+      ctx.fillStyle = '#6b7280';
+      ctx.fillText(e.previous || '-', 1040, y);
+
+      // rayita
+      ctx.strokeStyle = '#f3f4f6';
+      ctx.beginPath(); ctx.moveTo(20, y+14); ctx.lineTo(width-20, y+14); ctx.stroke();
+
+      y += rowH;
     }
-    return { events };
-  });
 
-  // Screenshot básico (si existe algo parecido a tabla/lista)
-  const table = await page.$('#economicCalendarData') || await page.$('table.genTbl') || await page.$('.ecEvents, ul');
-  if (table) { await table.screenshot({ path: 'calendar.png' }); }
-
-  fs.writeFileSync('calendar.json', JSON.stringify(data, null, 2));
-  await browser.close();
-  return data;
+    const out = fs.createWriteStream('calendar.png');
+    await PImage.encodePNGToStream(img, out);
+    await new Promise(r => out.on('finish', r));
+    return true;
+  } catch (e) {
+    console.error('PNG generation failed:', e.message);
+    return false;
+  }
 }
 
-// ---------- Resumen simple (estable) ----------
+// ---------- Resumen ----------
 function buildSummary(events) {
   if (!events || !events.length) return '';
-  // Top 3 por importancia (3→2→1) manteniendo orden
+  // Top 3 por importancia (3→2→1) conservando orden
   const sorted = [...events].sort((a,b)=> (b.importance||0)-(a.importance||0));
-  const pick = sorted.slice(0,3).map(e => `📌 <b>${e.title}</b> (${e.time || '--:--'})`);
-  return pick.length ? "📰 <b>Resumen principales noticias</b>\n\n" + pick.join("\n\n") : '';
+  const top = sorted.slice(0, 3);
+  const blocks = top.map(e => {
+    const meta = [];
+    if (e.forecast) meta.push(`consenso ${e.forecast}`);
+    if (e.previous) meta.push(`anterior ${e.previous}`);
+    const extra = meta.length ? ` — ${meta.join(', ')}` : '';
+    return `📌 <b>${e.title}</b> (${e.time || '--:--'})${extra}`;
+  });
+  return "📰 <b>Resumen principales noticias</b>\n\n" + blocks.join("\n\n");
 }
 
 // ---------- Telegram ----------
@@ -232,51 +204,54 @@ async function sendTelegramPhoto(token, chatId, caption, filePath) {
   form.append('parse_mode', 'HTML');
   form.append('photo', new Blob([fs.readFileSync(filePath)]), path.basename(filePath));
   const res = await fetch(url, { method: 'POST', body: form });
-  if (!res.ok) { throw new Error(`sendPhoto failed: ${res.status} ${await res.text()}`); }
+  if (!res.ok) throw new Error(`sendPhoto failed: ${res.status} ${await res.text()}`);
 }
 async function sendTelegramText(token, chatId, htmlText) {
   const url = `https://api.telegram.org/bot${token}/sendMessage`;
-  const params = new URLSearchParams();
-  params.set('chat_id', chatId);
-  params.set('text', htmlText);
-  params.set('parse_mode', 'HTML');
-  params.set('disable_web_page_preview', 'true');
-  const res = await fetch(url, { method: 'POST', body: params });
-  if (!res.ok) { throw new Error(`sendMessage failed: ${res.status} ${await res.text()}`); }
+  const body = new URLSearchParams({
+    chat_id: chatId, text: htmlText, parse_mode: 'HTML', disable_web_page_preview: 'true'
+  });
+  const res = await fetch(url, { method: 'POST', body });
+  if (!res.ok) throw new Error(`sendMessage failed: ${res.status} ${await res.text()}`);
 }
 
 // ---------- Main ----------
 (async () => {
   const token = process.env.INVESTX_TOKEN;
   const chatId = process.env.CHAT_ID;
-  if (!token || !chatId) {
-    console.error('Faltan variables de entorno INVESTX_TOKEN y/o CHAT_ID');
-    process.exit(1);
-  }
+  if (!token || !chatId) { console.error('Faltan INVESTX_TOKEN / CHAT_ID'); process.exit(1); }
 
-  console.log(`[${nowInTZ()}] Iniciando scrape…`);
-  const { events = [] } = await buildCalendar();
+  console.log(`[${nowInTZ()}] Descargando calendario…`);
+  const mode = isMonday() ? 'week' : 'day';
+  const { events = [] } = await fetchCalendar(mode);
 
-  const pngExists = fs.existsSync('calendar.png');
-  const todayISO = new Intl.DateTimeFormat('sv-SE', { timeZone:'Europe/Madrid', dateStyle: 'short' }).format(new Date());
-  const { monday, sunday } = weekRangeISO('Europe/Madrid');
+  // Caption
+  const { monday, sunday } = weekRangeISO();
   const caption = isMonday()
     ? `🗓️ Calendario USA (⭐️⭐️/⭐️⭐️⭐️) — Semana ${monday}–${sunday}`
-    : `🗓️ Calendario USA (⭐️⭐️/⭐️⭐️⭐️) — Hoy ${todayISO}`;
+    : `🗓️ Calendario USA (⭐️⭐️/⭐️⭐️⭐️) — Hoy ${todayISO()}`;
 
-  if (pngExists) {
-    console.log('Enviando imagen a Telegram…');
-    await sendTelegramPhoto(token, chatId, caption, 'calendar.png');
+  // PNG (opcional, no rompe si falla)
+  let sentImage = false;
+  if (events.length) {
+    const ok = await drawPNG(events, caption);
+    if (ok && fs.existsSync('calendar.png')) {
+      console.log('Enviando imagen…');
+      await sendTelegramPhoto(token, chatId, caption, 'calendar.png');
+      sentImage = true;
+    }
   } else {
-    console.log('No se generó calendar.png (seguimos con el resumen si aplica)');
+    console.log('Sin eventos obtenidos del widget.');
   }
 
+  // Resumen (siempre que haya eventos)
   const summary = buildSummary(events);
   if (summary) {
-    console.log('Enviando resumen a Telegram…');
+    console.log('Enviando resumen…');
     await sendTelegramText(token, chatId, summary);
-  } else {
-    console.log('Sin resumen relevante.');
+  } else if (!sentImage) {
+    // Mensaje mínimo para no “quedarme callado”
+    await sendTelegramText(token, chatId, `🗓️ ${caption}\n\n(No hay eventos relevantes hoy).`);
   }
 
   console.log('Hecho.');
@@ -284,3 +259,4 @@ async function sendTelegramText(token, chatId, htmlText) {
   console.error('ERROR:', err);
   process.exit(1);
 });
+
