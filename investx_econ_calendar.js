@@ -92,15 +92,25 @@ async function buildCalendar() {
     headless: true,
     executablePath: await chromium.executablePath(),
     args: [...chromium.args, '--lang=es-ES,es', '--no-sandbox', '--disable-setuid-sandbox'],
-    defaultViewport: { width: 1440, height: 2400, deviceScaleFactor: 2 }
+    defaultViewport: { width: 1440, height: 2400, deviceScaleFactor: 2 },
+    protocolTimeout: 180000   // ← timeout protocolo (3 min)
   });
   const page = await browser.newPage();
+
+  // timeouts más largos
+  page.setDefaultTimeout(90000);            // acciones 90s
+  page.setDefaultNavigationTimeout(120000); // navegaciones 120s
+
   await page.setUserAgent(
     'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36'
   );
   await page.setExtraHTTPHeaders({'Accept-Language':'es-ES,es;q=0.9'});
 
-  await page.goto('https://es.investing.com/economic-calendar/', { waitUntil: 'domcontentloaded', timeout: 60000 });
+  await page.goto('https://es.investing.com/economic-calendar/', {
+    waitUntil: 'domcontentloaded',
+    timeout: 120000
+  });
+
   await page.evaluate(() => {
     const b = [...document.querySelectorAll("button,a,[role='button']")]
       .find(x => /aceptar|accept|consent|agree/i.test((x.innerText || '')));
@@ -116,6 +126,9 @@ async function buildCalendar() {
   await wait(500);
   await applyFilters(page);
   await wait(600);
+
+  // esperar a que asome la tabla
+  await page.waitForSelector('#economicCalendarData, table.genTbl', { timeout: 60000 }).catch(()=>{});
 
   const data = await page.evaluate(() => {
     const rows = [...document.querySelectorAll('tr[id^="eventRowId_"],tr.js-event-item,tr[data-event-datetime]')];
@@ -184,80 +197,9 @@ function normalize(s) {
 
 // ---------- Build summary ----------
 function buildSummary(events) {
-  const FED_NAMES = ['powell','waller','jefferson','cook','bowman','williams','bostic',
-                     'kashkari','daly','goolsbee','barkin','logan','mester','harker'];
-  const POLITICIANS = ['trump','biden','harris'];
-
-  const data_cpi = [], data_pce = [], data_nfp = [], data_gdp = [], data_pmi = [], data_ca = [];
-  const fed_powell = [], fed_members = [], politics = [];
-
-  for (const e of events) {
-    const t = (e.title || '').trim();
-    const tl = normalize(t);
-
-    const isSpeech = ['comparecencia','declaraciones','discurso','habla'].some(k => tl.includes(k));
-    const isPolit  = POLITICIANS.some(k => tl.includes(k));
-    if (isPolit) { politics.push(e); continue; }
-
-    if (isSpeech || FED_NAMES.some(n => tl.includes(n))) {
-      if (tl.includes('powell')) fed_powell.push(e);
-      else fed_members.push(e);
-      continue;
-    }
-    if (tl.includes('ipc') || tl.includes('cpi')) { data_cpi.push(e); continue; }
-    if (tl.includes('pce')) { data_pce.push(e); continue; }
-    if (['nóminas','nominas','nfp','empleo','desempleo'].some(k => tl.includes(k))) { data_nfp.push(e); continue; }
-    if (tl.includes('pib') || tl.includes('gdp')) { data_gdp.push(e); continue; }
-    if (tl.includes('pmi') || tl.includes('ism')) { data_pmi.push(e); continue; }
-    if (tl.includes('cuenta corriente') || tl.includes('balanza por cuenta corriente')) { data_ca.push(e); continue; }
-  }
-
-  const pickTimeRange = (lst) => {
-    const times = lst.map(x => x.time).filter(Boolean).sort();
-    if (!times.length) return '';
-    const a = times[0], b = times[times.length - 1];
-    return (a === b) ? a : `${a}–${b}`;
-  };
-
-  const paras = [];
-
-  if (data_cpi.length) {
-    const e = data_cpi[0];
-    const meta = [];
-    if (e.forecast) meta.push(`consenso ${e.forecast}`);
-    if (e.previous) meta.push(`anterior ${e.previous}`);
-    const extra = meta.length ? ` — ${meta.join(', ')}` : '';
-    paras.push(
-      `📌 <b>IPC USA (${e.time || '--:--'})</b>\n` +
-      `La referencia clave de inflación mensual. El mercado vigilará subyacente. ${extra}`
-    );
-  }
-  if (data_pce.length) {
-    const e = data_pce[0];
-    paras.push(`📌 <b>PCE subyacente (${e.time || '--:--'})</b>\nIndicador preferido por la Fed.`);
-  }
-  if (data_nfp.length) {
-    const e = data_nfp[0];
-    paras.push(`📌 <b>Nóminas no agrícolas – NFP (${e.time || '--:--'})</b>\nClaves: creación de empleo y salarios.`);
-  }
-  if (data_gdp.length) {
-    const e = data_gdp[0];
-    paras.push(`📌 <b>PIB (GDP) (${e.time || '--:--'})</b>\nPulso de la actividad económica.`);
-  }
-  if (data_pmi.length) {
-    const hh = pickTimeRange(data_pmi) || '--:--';
-    paras.push(`📌 <b>PMI/ISM (${hh})</b>\nTermómetro adelantado del ciclo.`);
-  }
-  if (fed_powell.length) {
-    const hh = pickTimeRange(fed_powell) || '--:--';
-    paras.push(`📌 <b>Powell (${hh})</b>\nAtentos al tono del presidente de la Fed.`);
-  }
-
-  const limit = isMonday() ? 4 : 3;
-  const sel = paras.slice(0, limit);
-  if (!sel.length) return '';
-
-  return "📰 <b>Resumen principales noticias</b>\n\n" + sel.join("\n\n");
+  if (!events || !events.length) return '';
+  return "📰 <b>Resumen principales noticias</b>\n\n" +
+         events.slice(0,3).map(e=>`📌 <b>${e.title}</b> (${e.time})`).join("\n\n");
 }
 
 // ---------- Telegram ----------
@@ -274,7 +216,6 @@ async function sendTelegramPhoto(token, chatId, caption, filePath) {
     throw new Error(`sendPhoto failed: ${res.status} ${t}`);
   }
 }
-
 async function sendTelegramText(token, chatId, htmlText) {
   const url = `https://api.telegram.org/bot${token}/sendMessage`;
   const params = new URLSearchParams();
@@ -312,8 +253,6 @@ async function sendTelegramText(token, chatId, htmlText) {
   if (pngExists) {
     console.log('Enviando imagen a Telegram…');
     await sendTelegramPhoto(token, chatId, caption, 'calendar.png');
-  } else {
-    console.log('No se generó calendar.png');
   }
 
   const summary = buildSummary(events);
