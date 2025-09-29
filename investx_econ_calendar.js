@@ -20,8 +20,8 @@ function nowInTZ(tz = 'Europe/Madrid') {
   return `${parts.year}-${parts.month}-${parts.day} ${parts.hour}:${parts.minute}`;
 }
 function isMonday(tz = 'Europe/Madrid') {
-  const wd = new Intl.DateTimeFormat('en-GB', { timeZone: tz, weekday: 'short' }).format(new Date()).toLowerCase();
-  return wd === 'mon';
+  return new Intl.DateTimeFormat('en-GB', { timeZone: tz, weekday: 'short' })
+    .format(new Date()).toLowerCase() === 'mon';
 }
 function weekRangeISO(tz = 'Europe/Madrid') {
   const d = new Date();
@@ -55,6 +55,7 @@ async function clickByText(page, selector, texts, timeoutMs = 8000) {
 }
 
 async function applyFilters(page) {
+  // móvil: el panel de filtros también existe
   await clickByText(page, 'button,a,[role="button"],input[type="button"]', ['filtro','filtros','filters'], 8000).catch(()=>{});
   await wait(600);
   await page.evaluate(() => {
@@ -77,20 +78,20 @@ async function applyFilters(page) {
 }
 
 // Navegación robusta con reintentos + espera a red ociosa
-async function navWithRetry(page, url, tries = 2) {
+async function navWithRetry(page, url, tries = 3) {
   let lastErr;
   for (let i = 0; i < tries; i++) {
     try {
       await page.goto(url, { waitUntil: 'networkidle2', timeout: 180000 });
       if (typeof page.waitForNetworkIdle === 'function') {
-        try { await page.waitForNetworkIdle(); } catch {}
+        try { await page.waitForNetworkIdle({ timeout: 15000 }); } catch {}
       }
-      await wait(1500);
+      await wait(1200);
       return;
     } catch (e) {
       lastErr = e;
       try { await page.reload({ waitUntil: 'domcontentloaded', timeout: 90000 }); } catch {}
-      await wait(1500);
+      await wait(1200);
     }
   }
   throw lastErr;
@@ -109,17 +110,30 @@ async function buildCalendar() {
       '--disable-dev-shm-usage',  // evita cuelgues por /dev/shm pequeño
       '--single-process'          // útil en instancias pequeñas
     ],
-    defaultViewport: { width: 1440, height: 2400, deviceScaleFactor: 2 },
-    protocolTimeout: 240000      // 4 min
+    defaultViewport: { width: 414, height: 896, deviceScaleFactor: 2 }, // móvil = más ligero
+    protocolTimeout: 300000 // 5 min
   });
 
   const page = await browser.newPage();
-  page.setDefaultTimeout(90000);
-  page.setDefaultNavigationTimeout(120000);
-  await page.setUserAgent('Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36');
+  page.setDefaultTimeout(120000);
+  page.setDefaultNavigationTimeout(180000);
+
+  // Bloquea recursos pesados (acelera carga)
+  await page.setRequestInterception(true);
+  page.on('request', req => {
+    const type = req.resourceType();
+    if (['image','media','font','stylesheet','websocket'].includes(type)) {
+      return req.abort();
+    }
+    req.continue();
+  });
+
+  // UA móvil + idioma español
+  await page.setUserAgent('Mozilla/5.0 (iPhone; CPU iPhone OS 16_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.4 Mobile/15E148 Safari/604.1');
   await page.setExtraHTTPHeaders({ 'Accept-Language':'es-ES,es;q=0.9' });
 
-  await navWithRetry(page, 'https://es.investing.com/economic-calendar/', 2);
+  // Versión móvil (más rápida)
+  await navWithRetry(page, 'https://m.investing.com/economic-calendar/', 3);
 
   // cookies
   await page.evaluate(() => {
@@ -127,69 +141,72 @@ async function buildCalendar() {
       .find(x => /aceptar|accept|consent|agree/i.test((x.innerText || '')));
     b?.click();
   }).catch(()=>{});
-  await wait(600);
+  await wait(400);
 
   // Lunes → "Esta semana", resto → "Hoy"
-  if (isMonday()) { await clickByText(page, 'a,button', ['esta semana','this week'], 6000); }
+  if (isMonday()) { await clickByText(page, 'a,button', ['esta semana','this week','semana'], 6000); }
   else            { await clickByText(page, 'a,button', ['hoy','today'], 6000); }
-  await wait(500);
+  await wait(400);
 
   await applyFilters(page);
   await wait(600);
 
-  // espera a tabla + red ociosa (sin romper si no aparece)
+  // espera a tabla/lista (mobile usa listas)
   try {
-    await page.waitForSelector('#economicCalendarData, table.genTbl', { timeout: 90000 });
+    await page.waitForSelector('#economicCalendarData, table.genTbl, ul, .ecEvents', { timeout: 90000 });
     if (typeof page.waitForNetworkIdle === 'function') {
-      try { await page.waitForNetworkIdle(); } catch {}
+      try { await page.waitForNetworkIdle({ timeout: 10000 }); } catch {}
     }
   } catch {}
 
-  // Extraer eventos
+  // Extraer eventos (tolerante a HTML móvil/escritorio)
   const data = await page.evaluate(() => {
-    const rows = [...document.querySelectorAll('tr[id^="eventRowId_"],tr.js-event-item,tr[data-event-datetime]')];
-
-    const cleanTitle = (tr) => {
-      const pick = (...xs) => xs.find(v => v && v.trim && v.trim().length > 0);
-      const byAttr = tr.getAttribute('data-event-title');
-      const aTitle = tr.querySelector('td[class*="event"] a[title]')?.getAttribute('title');
-      const aria   = tr.querySelector('td[class*="event"] [aria-label]')?.getAttribute('aria-label');
-      const txt1   = tr.querySelector('td[class*="event"] a')?.textContent;
-      const txt2   = tr.querySelector('td[class*="event"], td.left, td:nth-child(3)')?.textContent;
-      let raw = (pick(byAttr, aTitle, aria, txt1, txt2) || '').replace(/\s+/g,' ').trim();
-      if (/^\d{1,2}:\d{2}$/.test(raw) || raw.length < 4) raw = '';
-      return raw;
-    };
+    const pick = (...xs) => xs.find(v => v && v.trim && v.trim().length > 0);
+    const rows = [
+      ...document.querySelectorAll('tr[id^="eventRowId_"],tr.js-event-item,tr[data-event-datetime]'),
+      ...document.querySelectorAll('li[id^="eventRowId_"], li.js-event-item')
+    ];
 
     const events = [];
-    for (const tr of rows) {
-      if (tr.style.display === 'none') continue; // respeta filtros de UI
-      const tds = tr.querySelectorAll('td');
-      const time  = (tds[0]?.innerText || '').trim();
-      const title = cleanTitle(tr);
-      if (!title) continue;
+    for (const el of rows) {
+      const isHidden = (el.style && el.style.display === 'none');
+      if (isHidden) continue;
 
-      let imp = parseInt(tr.getAttribute('data-importance') || '0', 10);
+      // título robusto
+      const byAttr = el.getAttribute('data-event-title');
+      const aTitle = el.querySelector('[title]')?.getAttribute('title');
+      const aria   = el.querySelector('[aria-label]')?.getAttribute('aria-label');
+      const txt1   = el.querySelector('a, .event')?.textContent;
+      const txt2   = el.textContent;
+      let title = (pick(byAttr,aTitle,aria,txt1,txt2) || '').replace(/\s+/g,' ').trim();
+      if (/^\d{1,2}:\d{2}$/.test(title) || title.length < 4) continue;
+
+      // hora
+      let time = '';
+      const t1 = el.querySelector('td:first-child, .time, [data-event-datetime]');
+      if (t1) time = (t1.innerText || t1.textContent || '').trim();
+
+      // importancia
+      let imp = parseInt(el.getAttribute('data-importance') || '0', 10);
       if (!imp || isNaN(imp)) {
-        const s = tr.querySelector('td.sentiment,td.impact,.sentiment');
+        const s = el.querySelector('.sentiment, .impact');
         if (s) {
           const n = s.querySelectorAll('i,svg').length;
           imp = n >= 3 ? 3 : (n >= 2 ? 2 : 1);
         } else { imp = 0; }
       }
 
-      events.push({
-        time, title, importance: imp,
-        iso: tr.getAttribute('data-event-datetime') || '',
-        forecast: (tr.querySelector('td.fore,td.forecast')?.innerText || '').trim(),
-        previous: (tr.querySelector('td.prev,td.previous')?.innerText || '').trim()
-      });
+      const forecast = (el.querySelector('.fore, .forecast')?.textContent || '').trim();
+      const previous = (el.querySelector('.prev, .previous')?.textContent || '').trim();
+      const iso = el.getAttribute('data-event-datetime') || '';
+
+      events.push({ time, title, importance: imp, iso, forecast, previous });
     }
     return { events };
   });
 
-  // Screenshot si hay tabla visible
-  const table = await page.$('#economicCalendarData') || await page.$('table.genTbl');
+  // Screenshot básico (si existe algo parecido a tabla/lista)
+  const table = await page.$('#economicCalendarData') || await page.$('table.genTbl') || await page.$('.ecEvents, ul');
   if (table) { await table.screenshot({ path: 'calendar.png' }); }
 
   fs.writeFileSync('calendar.json', JSON.stringify(data, null, 2));
@@ -198,9 +215,6 @@ async function buildCalendar() {
 }
 
 // ---------- Resumen simple (estable) ----------
-function normalize(s) {
-  return (s || '').normalize('NFKD').replace(/[\u0300-\u036f]/g,'').replace(/\s+/g,' ').trim().toLowerCase();
-}
 function buildSummary(events) {
   if (!events || !events.length) return '';
   // Top 3 por importancia (3→2→1) manteniendo orden
