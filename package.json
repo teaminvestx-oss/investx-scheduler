@@ -8,6 +8,7 @@
     "start": "node investx_econ_calendar.js"
   },
   "dependencies": {
-    "puppeteer": "^23.7.2"
+    "@sparticuz/chromium": "^127.0.0",
+    "puppeteer-core": "^23.7.2"
   }
 }
