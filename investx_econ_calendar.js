@@ -96,6 +96,7 @@ async function applyFilters(page) {
 async function buildCalendar() {
   const browser = await puppeteer.launch({
     headless: 'new',
+    executablePath: puppeteer.executablePath(),
     args: ['--no-sandbox','--disable-setuid-sandbox','--lang=es-ES,es']
   });
   const page = await browser.newPage();
