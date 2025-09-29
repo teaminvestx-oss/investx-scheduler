@@ -1,34 +1,33 @@
-/* InvestX Economic Calendar — Render Cron version (no GitHub Actions)
+/* InvestX Economic Calendar — Render Cron version (puppeteer-core + @sparticuz/chromium)
    Requiere env vars: INVESTX_TOKEN, CHAT_ID
    Runtime: Node 20
 */
 
 const fs = require('fs');
 const path = require('path');
-const puppeteer = require('puppeteer');
+const chromium = require('@sparticuz/chromium');
+const puppeteer = require('puppeteer-core');
 
 // ---------- Utils de tiempo (Europe/Madrid) ----------
 function nowInTZ(tz = 'Europe/Madrid') {
   const d = new Date();
-  // convertir a tz usando Intl (solo para formatear strings)
-  const fmt = new Intl.DateTimeFormat('sv-SE', { timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit',
-    hour: '2-digit', minute: '2-digit' });
+  const fmt = new Intl.DateTimeFormat('sv-SE', {
+    timeZone: tz,
+    year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit'
+  });
   const parts = Object.fromEntries(fmt.formatToParts(d).map(p => [p.type, p.value]));
-  // yyyy-mm-dd HH:MM
   return `${parts.year}-${parts.month}-${parts.day} ${parts.hour}:${parts.minute}`;
 }
 function isMonday(tz = 'Europe/Madrid') {
-  // usar getUTCDay con offset del TZ es complejo; para nuestra lógica basta con formatear
   const d = new Date();
   const wd = new Intl.DateTimeFormat('en-GB', { timeZone: tz, weekday: 'short' }).format(d).toLowerCase();
   return wd === 'mon';
 }
 function weekRangeISO(tz = 'Europe/Madrid') {
-  // calculamos lunes y domingo (fecha local)
   const d = new Date();
   const wd = ['sun','mon','tue','wed','thu','fri','sat']
     .indexOf(new Intl.DateTimeFormat('en-US',{timeZone:tz,weekday:'short'}).format(d).toLowerCase());
-  // get diff to Monday
   const diffToMon = wd === 0 ? -6 : 1 - wd;
   const monday = new Date(d);
   monday.setDate(d.getDate() + diffToMon);
@@ -36,7 +35,6 @@ function weekRangeISO(tz = 'Europe/Madrid') {
   sunday.setDate(monday.getDate() + 6);
 
   const f = (x) => new Intl.DateTimeFormat('sv-SE',{timeZone:tz,dateStyle:'short'}).format(x);
-  // sv-SE short: yyyy-mm-dd
   return { monday: f(monday), sunday: f(sunday) };
 }
 
@@ -65,20 +63,16 @@ async function clickByText(page, selector, texts, timeoutMs = 8000) {
 }
 
 async function applyFilters(page) {
-  // Abrir filtros
   await clickByText(page, 'button,a,[role="button"],input[type="button"]', ['filtro','filtros','filters'], 8000).catch(()=>{});
   await wait(600);
-  // Ajustar checkboxes: USA + importancia 2/3
   await page.evaluate(() => {
     const root = document.querySelector('.filterPopup,[class*="filterPop"]') || document;
-    // Países
     const countryCbs = [...root.querySelectorAll('input[type="checkbox"][name*="country"]')];
     countryCbs.forEach(cb => { cb.checked = false; cb.dispatchEvent(new Event('change', { bubbles: true })); });
     let us = countryCbs.find(cb => cb.value === '5') ||
              countryCbs.find(cb => /estados unidos|united states|ee\.uu/i.test((cb.closest('label,li,div')?.innerText||'')));
     if (us) { us.checked = true; us.dispatchEvent(new Event('change', { bubbles: true })); }
 
-    // Importancia
     const impCbs = [...root.querySelectorAll('input[type="checkbox"][name*="importance"]')];
     impCbs.forEach(cb => {
       cb.checked = (cb.value === '2' || cb.value === '3');
@@ -95,19 +89,18 @@ async function applyFilters(page) {
 // ---------- Scraper principal ----------
 async function buildCalendar() {
   const browser = await puppeteer.launch({
-    headless: 'new',
-    executablePath: puppeteer.executablePath(),
-    args: ['--no-sandbox','--disable-setuid-sandbox','--lang=es-ES,es']
+    headless: true,
+    executablePath: await chromium.executablePath(),
+    args: [...chromium.args, '--lang=es-ES,es', '--no-sandbox', '--disable-setuid-sandbox'],
+    defaultViewport: { width: 1440, height: 2400, deviceScaleFactor: 2 }
   });
   const page = await browser.newPage();
   await page.setUserAgent(
     'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36'
   );
   await page.setExtraHTTPHeaders({'Accept-Language':'es-ES,es;q=0.9'});
-  await page.setViewport({ width: 1440, height: 2400, deviceScaleFactor: 2 });
 
   await page.goto('https://es.investing.com/economic-calendar/', { waitUntil: 'domcontentloaded', timeout: 60000 });
-  // cookies
   await page.evaluate(() => {
     const b = [...document.querySelectorAll("button,a,[role='button']")]
       .find(x => /aceptar|accept|consent|agree/i.test((x.innerText || '')));
@@ -115,7 +108,6 @@ async function buildCalendar() {
   }).catch(()=>{});
   await wait(600);
 
-  // Lunes → "Esta semana" ; resto → "Hoy"
   if (isMonday()) {
     await clickByText(page, 'a,button', ['esta semana','this week'], 6000);
   } else {
@@ -125,7 +117,6 @@ async function buildCalendar() {
   await applyFilters(page);
   await wait(600);
 
-  // Extraer datos
   const data = await page.evaluate(() => {
     const rows = [...document.querySelectorAll('tr[id^="eventRowId_"],tr.js-event-item,tr[data-event-datetime]')];
 
@@ -143,7 +134,7 @@ async function buildCalendar() {
 
     const events = [];
     for (const tr of rows) {
-      if (tr.style.display === 'none') continue; // respeta filtro UI
+      if (tr.style.display === 'none') continue;
       const tds = tr.querySelectorAll('td');
       const time = (tds[0]?.innerText || '').trim();
       const title = cleanTitle(tr);
@@ -170,7 +161,6 @@ async function buildCalendar() {
     return { events };
   });
 
-  // Screenshot de la tabla
   const table = await page.$('#economicCalendarData') || await page.$('table.genTbl');
   if (table) {
     await table.screenshot({ path: 'calendar.png' });
@@ -182,7 +172,7 @@ async function buildCalendar() {
   return data;
 }
 
-// ---------- Resumen “inteligente” ----------
+// ---------- Normalización texto ----------
 function normalize(s) {
   return (s || '')
     .normalize('NFKD')
@@ -192,6 +182,7 @@ function normalize(s) {
     .toLowerCase();
 }
 
+// ---------- Build summary ----------
 function buildSummary(events) {
   const FED_NAMES = ['powell','waller','jefferson','cook','bowman','williams','bostic',
                      'kashkari','daly','goolsbee','barkin','logan','mester','harker'];
@@ -238,86 +229,28 @@ function buildSummary(events) {
     const extra = meta.length ? ` — ${meta.join(', ')}` : '';
     paras.push(
       `📌 <b>IPC USA (${e.time || '--:--'})</b>\n` +
-      `La referencia clave de inflación mensual. El mercado vigilará subyacente (servicios ‘supercore’ y alquileres). ` +
-      `> consenso → suben Tesoros (rendimientos) y USD; < consenso → respira la curva y apoyan índices growth.${extra}`
+      `La referencia clave de inflación mensual. El mercado vigilará subyacente. ${extra}`
     );
   }
   if (data_pce.length) {
     const e = data_pce[0];
-    const meta = [];
-    if (e.forecast) meta.push(`consenso ${e.forecast}`);
-    if (e.previous) meta.push(`anterior ${e.previous}`);
-    const extra = meta.length ? ` — ${meta.join(', ')}` : '';
-    paras.push(
-      `📌 <b>PCE subyacente (${e.time || '--:--'})</b>\n` +
-      `Indicador preferido por la Fed. Desviaciones frente al consenso mueven dólar y curva; sorpresa a la baja suele apoyar a renta variable.${extra}`
-    );
+    paras.push(`📌 <b>PCE subyacente (${e.time || '--:--'})</b>\nIndicador preferido por la Fed.`);
   }
   if (data_nfp.length) {
     const e = data_nfp[0];
-    paras.push(
-      `📌 <b>Nóminas no agrícolas – NFP (${e.time || '--:--'})</b>\n` +
-      `Se miran creación de empleo, salarios/hora y participación. Fuerte + salarios altos mantiene presión de precios (yields ↑, USD ↑); ` +
-      `débil abre espacio a recortes y apoya índices.`
-    );
+    paras.push(`📌 <b>Nóminas no agrícolas – NFP (${e.time || '--:--'})</b>\nClaves: creación de empleo y salarios.`);
   }
   if (data_gdp.length) {
     const e = data_gdp[0];
-    paras.push(
-      `📌 <b>PIB (GDP) (${e.time || '--:--'})</b>\n` +
-      `Pulso de la actividad. Lectura sólida refuerza resiliencia y puede presionar yields; dato flojo reaviva apuestas de recortes y favorece duration.`
-    );
+    paras.push(`📌 <b>PIB (GDP) (${e.time || '--:--'})</b>\nPulso de la actividad económica.`);
   }
   if (data_pmi.length) {
     const hh = pickTimeRange(data_pmi) || '--:--';
-    paras.push(
-      `📌 <b>PMI/ISM (${hh})</b>\n` +
-      `Termómetro adelantado del ciclo: foco en nuevas órdenes y precios pagados. >50 sostiene cíclicas y USD; <50 avisa de enfriamiento y favorece defensivas.`
-    );
-  }
-  if (data_ca.length && paras.length < 3) {
-    const e = data_ca[0];
-    const meta = [];
-    if (e.forecast) meta.push(`consenso ${e.forecast}`);
-    if (e.previous) meta.push(`anterior ${e.previous}`);
-    const extra = meta.length ? ` — ${meta.join(', ')}` : '';
-    paras.push(
-      `📌 <b>Cuenta corriente (${e.time || '--:--'})</b>\n` +
-      `Dato estructural sobre el déficit externo. Efecto en mercado suele ser limitado en el intradía, pero una mejora mayor a la prevista puede ` +
-      `aliviar presión sobre el USD a medio plazo.${extra}`
-    );
+    paras.push(`📌 <b>PMI/ISM (${hh})</b>\nTermómetro adelantado del ciclo.`);
   }
   if (fed_powell.length) {
     const hh = pickTimeRange(fed_powell) || '--:--';
-    paras.push(
-      `📌 <b>Decisión/comparecencia de Powell (${hh})</b>\n` +
-      `Mercado pendiente del tono del presidente de la Fed. Hawkish → condiciones financieras más duras (USD/yields ↑, bolsa volátil); ` +
-      `dovish → alivio para equities y crédito.`
-    );
-  }
-  if (fed_members.length) {
-    const hh = pickTimeRange(fed_members) || '--:--';
-    // recoge hasta 3 nombres
-    const names = [];
-    for (const e of fed_members) {
-      const tl = normalize(e.title);
-      const m = (tl.match(/bowman|bostic|williams|kashkari|waller|daly|goolsbee|barkin|logan|mester|harker/)||[])
-        .map(x => x.charAt(0).toUpperCase()+x.slice(1));
-      for (const n of m) if (!names.includes(n)) names.push(n);
-    }
-    const who = names.length ? ` (${names.slice(0,3).join(', ')})` : '';
-    paras.push(
-      `📌 <b>Miembros de la Fed${who} (${hh})</b>\n` +
-      `Intervenciones con menor peso que Powell, salvo mensajes que contradigan la línea oficial. Un tono más hawkish podría ` +
-      `presionar al USD y a la curva; impacto normalmente acotado.`
-    );
-  }
-  if (politics.length && paras.length < 4) {
-    const hh = pickTimeRange(politics) || '--:--';
-    paras.push(
-      `📌 <b>Declaraciones políticas (${hh})</b>\n` +
-      `Posible ruido de corto plazo. Suele ser transitorio salvo anuncios con implicaciones fiscales o regulatorias claras.`
-    );
+    paras.push(`📌 <b>Powell (${hh})</b>\nAtentos al tono del presidente de la Fed.`);
   }
 
   const limit = isMonday() ? 4 : 3;
@@ -376,22 +309,19 @@ async function sendTelegramText(token, chatId, htmlText) {
     ? `🗓️ Calendario USA (⭐️⭐️/⭐️⭐️⭐️) — Semana ${monday}–${sunday}`
     : `🗓️ Calendario USA (⭐️⭐️/⭐️⭐️⭐️) — Hoy ${todayISO}`;
 
-  // Enviar imagen (si existe)
   if (pngExists) {
     console.log('Enviando imagen a Telegram…');
     await sendTelegramPhoto(token, chatId, caption, 'calendar.png');
   } else {
-    console.log('No se generó calendar.png (posible ausencia de tabla visible)');
+    console.log('No se generó calendar.png');
   }
 
-  // Resumen inteligente
   const summary = buildSummary(events);
   if (summary) {
     console.log('Enviando resumen a Telegram…');
     await sendTelegramText(token, chatId, summary);
   } else {
-    // Silencioso si no hay eventos o nada relevante
-    console.log('Sin resumen relevante para enviar.');
+    console.log('Sin resumen relevante.');
   }
 
   console.log('Hecho.');
