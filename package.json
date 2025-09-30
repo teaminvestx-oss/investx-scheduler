@@ -1,13 +1,14 @@
 {
   "name": "investx-econ-calendar",
   "version": "1.0.0",
+  "description": "InvestX Economic Calendar scraper for Render Cron",
   "main": "investx_econ_calendar.js",
   "type": "commonjs",
   "scripts": {
     "start": "node investx_econ_calendar.js"
   },
   "dependencies": {
-    "cheerio": "^1.0.0",
-    "pureimage": "^0.4.13"
+    "@sparticuz/chromium": "^127.0.0",
+    "puppeteer-core": "^23.7.2"
   }
 }
