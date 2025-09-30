@@ -12,18 +12,26 @@ DEEPL_API_KEY  = (os.getenv("DEEPL_API_KEY") or "").strip()
 DEEPL_PLAN     = (os.getenv("DEEPL_PLAN") or "").strip().lower()  # "free" | "pro" (auto si vacío)
 LOCAL_TZ       = ZoneInfo(os.getenv("LOCAL_TZ", "Europe/Madrid"))
 LOOKBACK_HOURS = int(os.getenv("LOOKBACK_HOURS", "10"))
-MAX_ITEMS_ENV  = int(os.getenv("MAX_ITEMS", "6"))
-MAX_ITEMS      = min(6, MAX_ITEMS_ENV)  # tope 6 noticias
+
+# --- Límite duro a 5 noticias ---
+MAX_ITEMS_ENV  = int(os.getenv("MAX_ITEMS", "5"))  # NEW (por defecto 5)
+MAX_ITEMS      = min(5, MAX_ITEMS_ENV)            # NEW (tope absoluto 5)
 
 INCLUDE_DESC   = (os.getenv("INCLUDE_DESC", "0").strip() in {"1","true","yes","y"})
 
+# Añadimos "trump" y otros términos de macro-política por defecto
 KEYWORDS = [s.strip().lower() for s in os.getenv("KEYWORDS",
-    "fed,ecb,boe,ipc,cpi,pmi,ism,nonfarm,empleo,inflación,inflation,tipos,rates,hike,cut,earnings,resultados,forecast,guidance,merger,acquisition,m&a,opa,downgrade,upgrade,oil,gas,war,china,tariffs"
+    "fed,ecb,boe,ipc,cpi,pmi,ism,nonfarm,empleo,inflación,inflation,tipos,rates,hike,cut,earnings,resultados,forecast,guidance,merger,acquisition,m&a,opa,downgrade,upgrade,oil,gas,war,china,tariffs,trump,biden,white house,election,elecciones,aranceles"
 ).split(",") if s.strip()]
 
 WATCHLIST = [s.strip().upper() for s in os.getenv("WATCHLIST",
     "AAPL,MSFT,AMZN,NVDA,GOOGL,META,TSLA,SAP,ASML,ADIDAS,CRM,SPOT,BTC,ETH"
 ).split(",") if s.strip()]
+
+# --- Entidades importantes (peso extra). Editable por ENV ---
+IMPORTANT_ENTITIES = [s.strip().lower() for s in os.getenv("IMPORTANT_ENTITIES",
+    "trump,donald trump,biden,white house,congress,senate,house,gop,democrats,election,elecciones,tariffs,aranceles"
+).split(",") if s.strip()]  # NEW
 
 FEEDS = [
     "https://www.cnbc.com/id/100003114/device/rss/rss.html",  # CNBC Top News
@@ -109,21 +117,34 @@ def deepl_translate(text: str) -> str:
 
 _TICKER_PATTERNS = [re.compile(rf"(?<![A-Z0-9]){re.escape(t)}(?![A-Z0-9])") for t in WATCHLIST if t]
 
+# NEW: patrones para entidades importantes (case-insensitive, palabras completas si procede)
+_IMPORTANT_PATTERNS = [re.compile(rf"\b{re.escape(term)}\b", re.IGNORECASE) for term in IMPORTANT_ENTITIES]  # NEW
+
 def score_item(title: str, link: str, published_utc: datetime) -> float:
     t = (title or "").lower()
     score = 0.0
+    # Keywords estándar
     for k in KEYWORDS:
         if k and k in t:
             score += 2.0
+    # Watchlist (tickers)
     up = (title or "").upper()
     for pat in _TICKER_PATTERNS:
         if pat.search(up):
             score += 3.0
+    # Boost por términos críticos (Trump, elecciones, etc.)
+    for pat in _IMPORTANT_PATTERNS:  # NEW
+        if pat.search(title or ""):
+            score += 3.5   # prioridad alta a estas noticias
+            break
+    # Palabras de urgencia
     for k in ("breaking", "urgent", "profit warning"):
         if k in t:
             score += 4.0
+    # Preferencia por CNBC (suele tener titulares de portadas) — puedes ajustar
     if "cnbc.com" in (link or "").lower():
         score += 2.5
+    # Recencia (≤ 3h con degradado)
     age_minutes = (datetime.now(timezone.utc) - published_utc).total_seconds() / 60.0
     if age_minutes <= 180:
         score += 2.0 * (1.0 - (age_minutes / 180.0))
@@ -172,7 +193,7 @@ def fetch_items():
         seen_title_dom.add(key)
         seen_url.add(link)
         uniq.append((s, dt_utc, title, link, desc))
-        if len(uniq) >= MAX_ITEMS:
+        if len(uniq) >= MAX_ITEMS:   # respeta el tope 5
             break
     return uniq
 
