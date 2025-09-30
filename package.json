@@ -1,12 +1,8 @@
 {
   "name": "investx-econ-calendar",
-  "version": "2.0.1",
+  "version": "2.0.3",
   "main": "investx_econ_calendar.js",
   "type": "commonjs",
-  "scripts": {
-    "start": "node investx_econ_calendar.js"
-  },
-  "dependencies": {
-    "pureimage": "^0.4.13"
-  }
+  "scripts": { "start": "node investx_econ_calendar.js" },
+  "dependencies": { "pureimage": "^0.4.13" }
 }
