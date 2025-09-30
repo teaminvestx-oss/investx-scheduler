@@ -1,154 +1,264 @@
-/* InvestX Economic Calendar — SIN Puppeteer (robusto en Render)
-   Requiere env: INVESTX_TOKEN, CHAT_ID
-*/
+# scripts/news_es.py
+import os, re, calendar, html, math
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
+import feedparser, requests
+from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode
 
-const fs = require('fs');
-const path = require('path');
-const cheerio = require('cheerio');
-const PImage = require('pureimage');
+# ========= Config =========
+CHAT_ID        = os.getenv("CHAT_ID")
+BOT_TOKEN      = os.getenv("INVESTX_TOKEN")
+DEEPL_API_KEY  = (os.getenv("DEEPL_API_KEY") or "").strip()
+DEEPL_PLAN     = (os.getenv("DEEPL_PLAN") or "").strip().lower()  # "free" | "pro" (auto si vacío)
+LOCAL_TZ       = ZoneInfo(os.getenv("LOCAL_TZ", "Europe/Madrid"))
+LOOKBACK_HOURS = int(os.getenv("LOOKBACK_HOURS", "10"))
 
-// ---------- Tiempo (Europe/Madrid) ----------
-function isMonday(tz='Europe/Madrid'){return new Intl.DateTimeFormat('en-GB',{timeZone:tz,weekday:'short'}).format(new Date()).toLowerCase()==='mon'}
-function todayISO(tz='Europe/Madrid'){return new Intl.DateTimeFormat('sv-SE',{timeZone:tz,dateStyle:'short'}).format(new Date())}
-function weekRangeISO(tz='Europe/Madrid'){
-  const d=new Date();
-  const wd=['sun','mon','tue','wed','thu','fri','sat'].indexOf(new Intl.DateTimeFormat('en-US',{timeZone:tz,weekday:'short'}).format(d).toLowerCase());
-  const diff=wd===0?-6:1-wd; const mon=new Date(d); mon.setDate(d.getDate()+diff); const sun=new Date(mon); sun.setDate(mon.getDate()+6);
-  const f=x=>new Intl.DateTimeFormat('sv-SE',{timeZone:tz,dateStyle:'short'}).format(x); return {monday:f(mon), sunday:f(sun)}
-}
-function nowInTZ(tz='Europe/Madrid'){const d=new Date();const f=new Intl.DateTimeFormat('sv-SE',{timeZone:tz,year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'});const p=Object.fromEntries(f.formatToParts(d).map(x=>[x.type,x.value]));return `${p.year}-${p.month}-${p.day} ${p.hour}:${p.minute}`}
+# --- Límite duro a 5 noticias ---
+MAX_ITEMS_ENV  = int(os.getenv("MAX_ITEMS", "5"))
+MAX_ITEMS      = min(5, MAX_ITEMS_ENV)  # tope absoluto
 
-// ---------- Descarga widget (con Referer/Origin) ----------
-async function fetchCalendar(calType){
-  // hosts espejo del widget
-  const hosts = ['ec.forexprostools.com', 'sslecal2.forexprostools.com'];
-  const qs = `columns=exc,cur,event,act,for,pre&importance=2,3&countries=5&calType=${calType}&timeZone=56&_=${Date.now()}`;
-  const headers = {
-    'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36',
-    'Accept': 'text/html, */*; q=0.01',
-    'Accept-Language': 'es-ES,es;q=0.9',
-    'Referer': 'https://www.investing.com/economic-calendar/',
-    'Origin': 'https://www.investing.com',
-    'X-Requested-With': 'XMLHttpRequest'
-  };
+INCLUDE_DESC   = (os.getenv("INCLUDE_DESC", "0").strip() in {"1","true","yes","y"})
 
-  let lastErr = null;
-  for (const host of hosts) {
-    const url = `https://${host}/?${qs}`;
-    try {
-      const res = await fetch(url, { headers, redirect: 'follow' });
-      if (!res.ok) { lastErr = new Error(`Fetch calendar failed (${host}): ${res.status}`); continue; }
-      const html = await res.text();
-      return parseCalendar(html);
-    } catch (e) {
-      lastErr = e;
-    }
-  }
-  throw lastErr || new Error('All widget hosts failed');
-}
+KEYWORDS = [s.strip().lower() for s in os.getenv("KEYWORDS",
+    "fed,ecb,boe,ipc,cpi,pmi,ism,nonfarm,empleo,inflación,inflation,tipos,rates,hike,cut,"
+    "earnings,resultados,forecast,guidance,merger,acquisition,m&a,opa,downgrade,upgrade,"
+    "oil,gas,war,china,tariffs,trump,biden,white house,election,elecciones,aranceles"
+).split(",") if s.strip()]
 
-function parseCalendar(html){
-  const $=cheerio.load(html);
-  const rows=$('tr[id^="eventRowId_"],tr.js-event-item,tr[data-event-datetime]');
-  const events=[];
-  rows.each((_,tr)=>{
-    const $tr=$(tr);
-    const time=($tr.find('td').first().text()||'').trim();
+WATCHLIST = [s.strip().upper() for s in os.getenv("WATCHLIST",
+    "AAPL,MSFT,AMZN,NVDA,GOOGL,META,TSLA,SAP,ASML,ADIDAS,CRM,SPOT,BTC,ETH"
+).split(",") if s.strip()]
 
-    let imp=0; const $sent=$tr.find('td.sentiment,td.impact,.sentiment');
-    if($sent.length){const n=$sent.find('i,svg,span').length; imp=n>=3?3:n>=2?2:n>=1?1:0;}
+IMPORTANT_ENTITIES = [s.strip().lower() for s in os.getenv("IMPORTANT_ENTITIES",
+    "trump,donald trump,biden,white house,congress,senate,house,gop,democrats,election,elecciones,tariffs,aranceles"
+).split(",") if s.strip()]
 
-    const title=(
-      $tr.attr('data-event-title') ||
-      $tr.find('td.event, td.left, td:nth-child(3)').text() ||
-      $tr.text()
-    ).replace(/\s+/g,' ').trim();
-    if(!title || title.length<4) return;
+FEEDS = [
+    "https://www.cnbc.com/id/100003114/device/rss/rss.html",
+    "https://www.cnbc.com/id/10001147/device/rss/rss.html",
+    "https://feeds.reuters.com/reuters/businessNews",
+    "https://feeds.reuters.com/reuters/marketsNews",
+    "https://feeds.a.dj.com/rss/RSSMarketsMain.xml",
+    "https://www.ft.com/companies?format=rss",
+]
 
-    const forecast=($tr.find('td.fore, td.forecast').text()||'').trim();
-    const previous=($tr.find('td.prev, td.previous').text()||'').trim();
-    const iso=$tr.attr('data-event-datetime')||'';
+DIAS_ES = ["Lun", "Mar", "Mié", "Jue", "Vie", "Sáb", "Dom"]
+MESES_ES = ["Ene", "Feb", "Mar", "Abr", "May", "Jun", "Jul", "Ago", "Sep", "Oct", "Nov", "Dic"]
 
-    if(imp>=2) events.push({ time, title, importance: imp, forecast, previous, iso });
-  });
-  return { events };
-}
+# ========= Utilidades =========
+def fecha_es(dt: datetime) -> str:
+    d = DIAS_ES[dt.weekday()]
+    m = MESES_ES[dt.month - 1]
+    return f"{d} {dt.day} {m} {dt:%H:%M}"
 
-// ---------- PNG simple ----------
-async function drawPNG(events, caption){
-  try{
-    const width=1200,rowH=56,headerH=100,h=headerH+rowH*Math.min(events.length,18)+40;
-    const img=PImage.make(width,h); const ctx=img.getContext('2d');
-    ctx.fillStyle='#fff'; ctx.fillRect(0,0,width,h);
-    const font='/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf'; if(fs.existsSync(font)){const f=PImage.registerFont(font,'UI'); await f.load();}
-    ctx.fillStyle='#111'; ctx.font='32pt UI, Arial'; ctx.fillText('Calendario económico USA (⭐️⭐️/⭐️⭐️⭐️)',28,56);
-    ctx.font='18pt UI, Arial'; ctx.fillStyle='#444'; ctx.fillText(caption,28,86);
-    ctx.fillStyle='#222'; ctx.font='16pt UI, Arial'; ctx.fillText('Hora',28,headerH); ctx.fillText('Evento',150,headerH); ctx.fillText('Forecast',900,headerH); ctx.fillText('Previo',1040,headerH);
-    ctx.strokeStyle='#e5e7eb'; ctx.beginPath(); ctx.moveTo(20,headerH+10); ctx.lineTo(width-20,headerH+10); ctx.stroke();
-    ctx.font='15pt UI, Arial'; let y=headerH+40;
-    for(const e of events.slice(0,18)){
-      ctx.fillStyle='#111'; ctx.fillText(e.time||'--:--',28,y);
-      const maxW=720; let t=e.title||''; while(t.length && ctx.measureText(t+'…').width>maxW) t=t.slice(0,-1); if(t!==e.title) t+='…';
-      ctx.fillText(t,150,y);
-      ctx.fillStyle='#2563eb'; ctx.fillText(e.forecast||'-',900,y);
-      ctx.fillStyle='#6b7280'; ctx.fillText(e.previous||'-',1040,y);
-      ctx.strokeStyle='#f3f4f6'; ctx.beginPath(); ctx.moveTo(20,y+14); ctx.lineTo(width-20,y+14); ctx.stroke();
-      y+=rowH;
-    }
-    const out=fs.createWriteStream('calendar.png');
-    await PImage.encodePNGToStream(img,out); await new Promise(r=>out.on('finish',r));
-    return true;
-  }catch(e){ console.error('PNG generation failed:', e.message); return false; }
-}
+def source_label(url: str) -> str:
+    try:
+        d = urlparse(url).netloc.lower()
+        if "cnbc.com" in d: return "CNBC"
+        if "reuters" in d: return "Reuters"
+        if "wsj" in d or "dowjones" in d: return "WSJ"
+        if "ft.com" in d: return "Financial Times"
+        return d.replace("www.", "").split(":")[0].capitalize()
+    except Exception:
+        return "Fuente"
 
-// ---------- Resumen ----------
-function buildSummary(events){
-  if(!events||!events.length) return '';
-  const top=[...events].sort((a,b)=>(b.importance||0)-(a.importance||0)).slice(0,3);
-  const blocks=top.map(e=>{
-    const meta=[]; if(e.forecast) meta.push(`consenso ${e.forecast}`); if(e.previous) meta.push(`anterior ${e.previous}`);
-    const extra=meta.length?` — ${meta.join(', ')}`:''; return `📌 <b>${e.title}</b> (${e.time||'--:--'})${extra}`;
-  });
-  return "📰 <b>Resumen principales noticias</b>\n\n"+blocks.join("\n\n");
-}
+def html_escape(s: str) -> str:
+    return html.escape(s or "", quote=False)
 
-// ---------- Telegram ----------
-async function sendTelegramPhoto(token,chatId,caption,filePath){
-  const url=`https://api.telegram.org/bot${token}/sendPhoto`;
-  const form=new FormData();
-  form.append('chat_id',chatId); form.append('caption',caption); form.append('parse_mode','HTML');
-  form.append('photo', new Blob([fs.readFileSync(filePath)]), path.basename(filePath));
-  const r=await fetch(url,{method:'POST',body:form}); if(!r.ok) throw new Error(`sendPhoto failed: ${r.status} ${await r.text()}`);
-}
-async function sendTelegramText(token,chatId,html){
-  const url=`https://api.telegram.org/bot${token}/sendMessage`;
-  const body=new URLSearchParams({chat_id:chatId,text:html,parse_mode:'HTML',disable_web_page_preview:'true'});
-  const r=await fetch(url,{method:'POST',body}); if(!r.ok) throw new Error(`sendMessage failed: ${r.status} ${await r.text()}`);
-}
+def normalize_url(u: str) -> str:
+    try:
+        p = urlparse(u)
+        blacklist = {"utm_source","utm_medium","utm_campaign","utm_term","utm_content",
+                     "utm_id","utm_name","utm_creative","cmpid","seg","mbid","ocid","sref"}
+        q = [(k,v) for k,v in parse_qsl(p.query, keep_blank_values=True) if k.lower() not in blacklist]
+        p = p._replace(query=urlencode(q), fragment="")
+        scheme = "https" if p.scheme in ("http","https") else p.scheme
+        netloc = p.netloc.lower().replace("www.", "")
+        return urlunparse((scheme, netloc, p.path, p.params, p.query, ""))
+    except Exception:
+        return u
 
-// ---------- Main ----------
-(async ()=>{
-  const token=process.env.INVESTX_TOKEN, chatId=process.env.CHAT_ID;
-  if(!token||!chatId){ console.error('Faltan INVESTX_TOKEN / CHAT_ID'); process.exit(1); }
+def build_requests_session() -> requests.Session:
+    s = requests.Session()
+    s.headers.update({
+        "User-Agent": "InvestX-NewsBot/1.1",
+        "Accept": "application/json, text/plain, */*",
+    })
+    return s
 
-  console.log(`[${nowInTZ()}] Descargando calendario…`);
-  const mode=isMonday()?'week':'day';
-  const {events=[]}=await fetchCalendar(mode);
+SESSION = build_requests_session()
 
-  const {monday,sunday}=weekRangeISO();
-  const caption=isMonday()?`🗓️ Calendario USA (⭐️⭐️/⭐️⭐️⭐️) — Semana ${monday}–${sunday}`:`🗓️ Calendario USA (⭐️⭐️/⭐️⭐️⭐️) — Hoy ${todayISO()}`;
+def deepl_translate(text: str) -> str:
+    if not DEEPL_API_KEY or not text:
+        return text
+    try:
+        if DEEPL_PLAN:
+            base = "https://api-free.deepl.com" if DEEPL_PLAN == "free" else "https://api.deepl.com"
+        else:
+            for base in ("https://api.deepl.com","https://api-free.deepl.com"):
+                try:
+                    r = SESSION.post(f"{base}/v2/translate",
+                                     data={"auth_key": DEEPL_API_KEY, "text": text, "target_lang": "ES"},
+                                     timeout=15)
+                    r.raise_for_status()
+                    js = r.json()
+                    return js["translations"][0]["text"]
+                except Exception:
+                    continue
+            return text
+        r = SESSION.post(f"{base}/v2/translate",
+                         data={"auth_key": DEEPL_API_KEY, "text": text, "target_lang": "ES"},
+                         timeout=15)
+        r.raise_for_status()
+        js = r.json()
+        return js["translations"][0]["text"]
+    except Exception:
+        return text
 
-  let sent=false;
-  if(events.length){
-    const ok=await drawPNG(events,caption);
-    if(ok && fs.existsSync('calendar.png')){ console.log('Enviando imagen…'); await sendTelegramPhoto(token,chatId,caption,'calendar.png'); sent=true; }
-  } else {
-    console.log('Sin eventos del widget (lista vacía).');
-  }
+_TICKER_PATTERNS = [re.compile(rf"(?<![A-Z0-9]){re.escape(t)}(?![A-Z0-9])") for t in WATCHLIST if t]
+_IMPORTANT_PATTERNS = [re.compile(rf"\b{re.escape(term)}\b", re.IGNORECASE) for term in IMPORTANT_ENTITIES]
 
-  const summary=buildSummary(events);
-  if(summary){ console.log('Enviando resumen…'); await sendTelegramText(token,chatId,summary); }
-  else if(!sent){ await sendTelegramText(token,chatId,`🗓️ ${caption}\n\n(No hay eventos relevantes hoy).`); }
+def score_item(title: str, link: str, published_utc: datetime) -> float:
+    t = (title or "").lower()
+    score = 0.0
+    for k in KEYWORDS:
+        if k and k in t:
+            score += 2.0
+    up = (title or "").upper()
+    for pat in _TICKER_PATTERNS:
+        if pat.search(up):
+            score += 3.0
+    for pat in _IMPORTANT_PATTERNS:
+        if pat.search(title or ""):
+            score += 3.5
+            break
+    for k in ("breaking", "urgent", "profit warning"):
+        if k in t:
+            score += 4.0
+    if "cnbc.com" in (link or "").lower():
+        score += 2.5
+    age_minutes = (datetime.now(timezone.utc) - published_utc).total_seconds() / 60.0
+    if age_minutes <= 180:
+        score += 2.0 * (1.0 - (age_minutes / 180.0))
+    return score
 
-  console.log('Hecho.');
-})().catch(err=>{ console.error('ERROR:',err); process.exit(1); });
+def _to_dt_utc(entry):
+    for fld in ("published_parsed", "updated_parsed"):
+        if hasattr(entry, fld) and getattr(entry, fld):
+            return datetime.fromtimestamp(calendar.timegm(getattr(entry, fld)), tz=timezone.utc)
+    return None
+
+def fetch_items():
+    items = []
+    now_utc = datetime.now(timezone.utc)
+    cutoff = now_utc - timedelta(hours=LOOKBACK_HOURS)
+
+    feedparser.USER_AGENT = "InvestX-NewsBot/1.1"
+    for url in FEEDS:
+        try:
+            feed = feedparser.parse(url)
+            for e in feed.entries[:80]:
+                dt_utc = _to_dt_utc(e)
+                if not dt_utc or dt_utc < cutoff:
+                    continue
+                title = (getattr(e, "title", "") or "").strip()
+                link  = (getattr(e, "link", "")  or "").strip()
+                if not title or not link:
+                    continue
+                link_norm = normalize_url(link)
+                s = score_item(title, link_norm, dt_utc)
+                desc = (getattr(e, "summary", "") or "").strip()
+                items.append((s, dt_utc, title, link_norm, desc))
+        except Exception:
+            continue
+
+    items.sort(key=lambda x: (x[0], x[1]), reverse=True)
+
+    seen_title_dom = set()
+    seen_url = set()
+    uniq = []
+    for s, dt_utc, title, link, desc in items:
+        dom = urlparse(link).netloc.lower().replace("www.", "")
+        key = (title.lower(), dom)
+        if key in seen_title_dom or link in seen_url:
+            continue
+        seen_title_dom.add(key)
+        seen_url.add(link)
+        uniq.append((s, dt_utc, title, link, desc))
+        if len(uniq) >= MAX_ITEMS:
+            break
+    return uniq
+
+def send_message(text: str):
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    r = SESSION.post(url, data={
+        "chat_id": CHAT_ID,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True,
+        "text": text
+    }, timeout=30)
+    r.raise_for_status()
+
+def rating_stars(index: int, total: int) -> str:
+    if total <= 2:
+        return "⭐⭐⭐" if index == 0 else "⭐⭐"
+    top_cut = max(1, math.ceil(total / 3))
+    mid_cut = max(1, math.ceil(2 * total / 3))
+    if index < top_cut:
+        return "⭐⭐⭐"
+    elif index < mid_cut:
+        return "⭐⭐"
+    else:
+        return "⭐"
+
+def build_bullet(stars: str, title_es: str, ts_local: datetime, link: str, fuente: str, desc_es: str = "") -> str:
+    title_es = html_escape(title_es)
+    fuente = html_escape(fuente)
+    line = f"{stars} <b>{title_es}</b>\n   {fecha_es(ts_local)} · <a href=\"{link}\">{fuente}</a>"
+    if INCLUDE_DESC and desc_es:
+        d = desc_es.strip().replace("\n", " ")
+        if len(d) > 160:
+            d = d[:160].rstrip() + "…"
+        line += f"\n   {html_escape(d)}"
+    return line
+
+def main():
+    items = fetch_items()
+    items = items[:MAX_ITEMS]  # Tope final de seguridad (máx 5)
+
+    now_local = datetime.now(LOCAL_TZ)
+    header = f"🗞️ <b>Noticias clave — {fecha_es(now_local)}</b>\n\n"
+
+    if not items:
+        send_message(header + "• No hay titulares destacados en la ventana seleccionada.")
+        return
+
+    lines = []
+    total = len(items)
+    for i, (s, dt_utc, title, link, desc) in enumerate(items):
+        title_es = deepl_translate(title) or title
+        desc_es  = deepl_translate(desc) if desc else ""
+        ts_local = dt_utc.astimezone(LOCAL_TZ)
+        fuente   = source_label(link)
+        stars    = rating_stars(i, total)
+        lines.append(build_bullet(stars, title_es, ts_local, link, fuente, desc_es))
+
+    text = header + "\n".join(lines)
+
+    MAX_TELEGRAM = 3900
+    if len(text) > MAX_TELEGRAM:
+        acc = header
+        for ln in lines:
+            if len(acc) + len(ln) + 1 > MAX_TELEGRAM - 10:
+                acc += "\n…"
+                break
+            acc += ("\n" + ln)
+        text = acc
+
+    send_message(text)
+
+if __name__ == "__main__":
+    if not BOT_TOKEN or not CHAT_ID:
+        raise SystemExit("Faltan variables de entorno: INVESTX_TOKEN y/o CHAT_ID")
+    main()
+
