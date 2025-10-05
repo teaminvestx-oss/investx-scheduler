@@ -1,12 +1,8 @@
 {
   "name": "investx-scheduler",
   "version": "2.0.4",
-  "description": "InvestX economic calendar and automation scripts for Telegram/Render",
-  "main": "tx_econ_calendar_ff_text.js",
   "type": "commonjs",
-  "scripts": {
-    "start": "node tx_econ_calendar_ff_text.js"
-  },
+  "scripts": { "start": "node tx_econ_calendar_ff_text.js" },
   "dependencies": {
     "axios": "^1.6.7",
     "luxon": "^3.5.0",
