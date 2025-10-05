@@ -1,215 +1,294 @@
-/*
-====================================================
-📅 InvestX Economic Calendar (🇺🇸)
-Versión: 2025-10-05 · CommonJS (.cjs sin imports)
-====================================================
-- Frecuencia: semanal (lunes) / diaria (mar-vie)
-- Rango forzado: FORCE_DATE_FROM / FORCE_DATE_TO
-- Filtro: Impacto medio/alto + USD
-- Zona horaria: Europe/Madrid
-- SHOW_DESC=1 activa descripciones breves
-====================================================
-*/
+/* =============================================================
+   InvestX – Calendario Económico (🇺🇸) vía ForexFactory
+   - JSON thisweek (+ nextweek si hace falta)
+   - USD + impacto Medium/High
+   - DeepL para traducir títulos (opcional)
+   - "Why Traders Care" desde página de SPECs (heurística de slug)
+   - Europe/Madrid, formato texto para Telegram
+   ============================================================= */
 
-console.log('Node runtime:', process.version);
-
-// ========= CONFIG =========
-const axios = require('axios');
-const dayjs = require('dayjs');
-const utc = require('dayjs/plugin/utc');
-const tz = require('dayjs/plugin/timezone');
-dayjs.extend(utc);
-dayjs.extend(tz);
+const VERBOSE = /^(1|true)$/i.test(process.env.VERBOSE || '');
+const SHOW_DESC = /^(1|true)$/i.test(process.env.SHOW_DESC || '');
+const IMPACT_MIN = (process.env.IMPACT_MIN || 'medium').toLowerCase();
+const TZ = process.env.TZ || 'Europe/Madrid';
 
 const BOT_TOKEN = process.env.INVESTX_TOKEN;
 const CHAT_ID = process.env.CHAT_ID;
+const DEEPL_API_KEY = process.env.DEEPL_API_KEY || '';
 
-const FORCE_DATE_FROM = process.env.FORCE_DATE_FROM || null;
-const FORCE_DATE_TO = process.env.FORCE_DATE_TO || null;
-const TZ = process.env.TZ || 'Europe/Madrid';
-const IMPACT_MIN = process.env.IMPACT_MIN || 'medium';
-const VERBOSE = (process.env.VERBOSE || '').toString().toLowerCase() === 'true';
-const SHOW_DESC = (process.env.SHOW_DESC || '').toString().toLowerCase() === '1';
-
-// ========= HELPERS =========
-const sleep = (ms) => new Promise(res => setTimeout(res, ms));
-
-function weekdayES(dt) {
-  const days = ['Domingo', 'Lunes', 'Martes', 'Miércoles', 'Jueves', 'Viernes', 'Sábado'];
-  return days[dt.getDay()];
+if (!BOT_TOKEN || !CHAT_ID) {
+  console.error('Faltan INVESTX_TOKEN / CHAT_ID');
+  process.exit(1);
 }
 
-function fmtDateES(dt) {
-  return dt.toISOString().split('T')[0].split('-').reverse().join('/');
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+/* ---------- Fechas y formato en TZ ---------- */
+function fmtDateISO(d) {
+  const p = Object.fromEntries(
+    new Intl.DateTimeFormat('sv-SE', { timeZone: TZ, dateStyle: 'short' })
+      .formatToParts(d).map(x=>[x.type,x.value])
+  );
+  return `${p.year}-${p.month}-${p.day}`;
+}
+const fmtDateES = (d) => new Intl.DateTimeFormat('es-ES',{timeZone:TZ,day:'2-digit',month:'2-digit',year:'numeric'}).format(d);
+const fmtTimeES = (d) => new Intl.DateTimeFormat('es-ES',{timeZone:TZ,hour:'2-digit',minute:'2-digit',hour12:false}).format(d);
+const weekdayES = (d) => { const s=new Intl.DateTimeFormat('es-ES',{timeZone:TZ,weekday:'long'}).format(d); return s[0].toUpperCase()+s.slice(1); };
+const isMonday  = () => new Intl.DateTimeFormat('en-GB',{timeZone:TZ,weekday:'short'}).format(new Date()).toLowerCase()==='mon';
+
+function weekRangeDates(){
+  const d = new Date();
+  const wd = ['sun','mon','tue','wed','thu','fri','sat']
+    .indexOf(new Intl.DateTimeFormat('en-US',{timeZone:TZ,weekday:'short'}).format(d).toLowerCase());
+  const diff = wd===0 ? -6 : 1-wd;
+  const mon = new Date(d); mon.setDate(d.getDate()+diff);
+  const sun = new Date(mon); sun.setDate(mon.getDate()+6);
+  return { mon, sun };
+}
+function weekMondayISO(dateISO){
+  const d=new Date(dateISO+'T00:00:00');
+  const wd=['sun','mon','tue','wed','thu','fri','sat']
+    .indexOf(new Intl.DateTimeFormat('en-US',{timeZone:TZ,weekday:'short'}).format(d).toLowerCase());
+  const diff=wd===0?-6:1-wd;
+  const mon=new Date(d); mon.setDate(d.getDate()+diff);
+  return fmtDateISO(mon);
 }
 
-// --- Heurística eventos típicos USA ---
+/* ---------- Fetch con timeout y reintentos ---------- */
+async function fetchWithTimeout(url, { timeoutMs=20000, retries=2, headers={}, method='GET', body } = {}){
+  let last;
+  for (let i=0;i<=retries;i++){
+    const ctrl = new AbortController();
+    const t = setTimeout(()=>ctrl.abort(new Error('Timeout')), timeoutMs);
+    try{
+      const res = await fetch(url, { signal: ctrl.signal, headers, method, body });
+      clearTimeout(t);
+      if(!res.ok) throw new Error(`HTTP ${res.status}`);
+      return res;
+    }catch(e){ clearTimeout(t); last=e; if(i<retries) await sleep(700*(i+1)); }
+  }
+  throw last || new Error('fetch failed');
+}
+
+/* ---------- ForexFactory JSON ---------- */
+async function fetchFFWeek(){
+  const r = await fetchWithTimeout(`https://nfs.faireconomy.media/ff_calendar_thisweek.json?_=${Date.now()}`,{
+    headers:{'User-Agent':'Mozilla/5.0','Accept':'application/json'}});
+  const j = await r.json();
+  if (VERBOSE) console.log('thisweek items:', Array.isArray(j)?j.length:0);
+  return j;
+}
+async function fetchFFNextWeek(){
+  const r = await fetchWithTimeout(`https://nfs.faireconomy.media/ff_calendar_nextweek.json?_=${Date.now()}`,{
+    headers:{'User-Agent':'Mozilla/5.0','Accept':'application/json'}});
+  const j = await r.json();
+  if (VERBOSE) console.log('nextweek items:', Array.isArray(j)?j.length:0);
+  return j;
+}
+
+/* ---------- Impacto/horas ---------- */
+function impactToStars(impact){
+  const s = (impact||'').toString().toLowerCase();
+  if (s.includes('high')) return '⭐️⭐️⭐️';
+  if (s.includes('medium')) return '⭐️⭐️';
+  return '⭐️';
+}
 function isTypicalUSAtHalf(title) {
   const s = (title || '').toLowerCase();
-  return (
-    /unemployment claims|jobless claims|non-?farm|payroll|nfp|cpi|consumer price|pce|retail sales|core pce|producer price|ppi/.test(s)
-  );
+  return /unemployment claims|jobless claims|non-?farm|payroll|nfp|cpi|consumer price|pce|retail sales|core pce|ppi|producer price|empire state|philly fed/.test(s);
 }
-
-// --- Formateador hora (redondea y fija :30 si aplica) ---
-function fmtTimeUS(dt, title) {
-  const snapped = new Date(Math.round(dt.getTime() / 60000) * 60000);
-  let parts = Object.fromEntries(
-    new Intl.DateTimeFormat('en-GB', {
-      timeZone: TZ, hour: '2-digit', minute: '2-digit', hour12: false
-    }).formatToParts(snapped).map(x => [x.type, x.value])
-  );
-  let hh = parseInt(parts.hour, 10);
-  let mm = parseInt(parts.minute, 10);
+function fmtTimeUS(dt, title){
+  // Redondeo al minuto y “snap” a :30 si es típico
+  const snapped = new Date(Math.round(dt.getTime()/60000)*60000);
+  let hhmm = fmtTimeES(snapped).split(':').map(Number);
+  let hh=hhmm[0], mm=hhmm[1];
   if (isTypicalUSAtHalf(title)) mm = 30;
-  const HH = String(hh).padStart(2, '0');
-  const MM = String(mm).padStart(2, '0');
-  return `${HH}:${MM}`;
+  return `${String(hh).padStart(2,'0')}:${String(mm).padStart(2,'0')}`;
 }
 
-// --- Descripción breve ---
-function shortDescES(title) {
-  const s = (title || '').toLowerCase();
-  if (/unemployment claims|jobless claims/.test(s))
-    return 'Solicitudes semanales de paro (indicador de ciclo).';
-  if (/continuing jobless/.test(s))
-    return 'Demandantes de paro continuados (presión sobre mercado laboral).';
-  if (/non-?farm|payroll|nfp/.test(s))
-    return 'Empleo no agrícola: referencia mensual clave del mercado laboral.';
-  if (/unemployment rate/.test(s))
-    return 'Porcentaje de parados vs fuerza laboral.';
-  if (/average hourly earnings/.test(s))
-    return 'Crecimiento salarial (tensión inflacionaria).';
-  if (/consumer price|cpi/.test(s))
-    return 'Inflación IPC (precios al consumo).';
-  if (/pce/.test(s))
-    return 'Inflación PCE (indicador favorito de la Fed).';
-  if (/retail sales/.test(s))
-    return 'Gasto del consumidor (motor del PIB).';
-  if (/fomc.*minutes/.test(s))
-    return 'Acta de la reunión de la Fed; pistas de orientación futura.';
-  if (/powell|fed chair.*speaks|remarks/.test(s))
-    return 'Comentarios de Powell con impacto potencial en expectativas.';
-  return null;
+/* ---------- DeepL (opcional) ---------- */
+async function deeplTranslate(text, targetLang='es'){
+  if (!DEEPL_API_KEY) return text; // sin traducir
+  try{
+    const url = 'https://api-free.deepl.com/v2/translate';
+    const body = new URLSearchParams({ auth_key: DEEPL_API_KEY, text, target_lang: targetLang.toUpperCase() });
+    const r = await fetchWithTimeout(url, { method:'POST', body, timeoutMs:20000 });
+    const j = await r.json();
+    const t = j?.translations?.[0]?.text;
+    return t || text;
+  }catch(_){ return text; }
 }
 
-// --- Impacto ---
-function impactToStars(impact) {
-  const s = (impact || '').toLowerCase();
-  if (s === 'high') return '⭐⭐⭐';
-  if (s === 'medium') return '⭐⭐';
-  return '⭐';
+/* ---------- SPEC (Why Traders Care) heurístico ----------
+   Intentamos resolver un slug como:
+   /calendar/us-<slug-del-evento>
+   Ej.: "FOMC Meeting Minutes" -> /calendar/us-fomc-meeting-minutes
+--------------------------------------------------------- */
+function slugifyTitle(t){
+  return (t||'').toLowerCase()
+    .replace(/&/g,' and ')
+    .replace(/[^a-z0-9\s-]/g,'')
+    .replace(/\s+/g,' ')
+    .trim()
+    .replace(/\s/g,'-');
+}
+async function fetchWhyTradersCare(country, title){
+  if (!SHOW_DESC) return null;
+  if (!/us|united states|usd/i.test(country||'')) return null;
+  const slug = `us-${slugifyTitle(title)}`;
+  const url = `https://www.forexfactory.com/calendar/${slug}`;
+  try{
+    const r = await fetchWithTimeout(url, { timeoutMs: 12000, headers:{'User-Agent':'Mozilla/5.0'} });
+    const html = await r.text();
+    // Extrae la sección "Why Traders Care" (inglés)
+    const m = html.match(/Why\s+Traders\s+Care<\/[^>]+>([\s\S]*?)<\/(?:div|td|section)>/i);
+    if (!m) return null;
+    const raw = m[1]
+      .replace(/<[^>]+>/g,' ')
+      .replace(/\s+/g,' ')
+      .trim();
+    if (!raw) return null;
+    // Traduce al español (si hay API), si no, deja inglés
+    const es = await deeplTranslate(raw, 'es');
+    return es;
+  }catch(_){ return null; }
 }
 
-// --- Traducción de títulos básicos ---
-function translateTitleES(t) {
-  return t
-    .replace(/Unemployment Claims/gi, 'Peticiones de subsidio por desempleo')
-    .replace(/Nonfarm Payrolls/gi, 'Empleo no agrícola (NFP)')
-    .replace(/Unemployment Rate/gi, 'Tasa de desempleo')
-    .replace(/FOMC Minutes/gi, 'Minutas del FOMC')
-    .replace(/Average Hourly Earnings/gi, 'Salario medio por hora m/m')
-    .replace(/Powell Speaks/gi, 'Discurso de Powell (Fed)')
-    .replace(/CPI/gi, 'IPC')
-    .replace(/PCE/gi, 'PCE')
-    .replace(/Retail Sales/gi, 'Ventas minoristas')
-    .replace(/FOMC Statement/gi, 'Declaración FOMC');
+/* ---------- Construye eventos desde JSON ---------- */
+function inImpact(impact){
+  const s=(impact||'').toLowerCase();
+  if (IMPACT_MIN==='high') return s.includes('high');
+  return s.includes('medium') || s.includes('high');
+}
+function isUSD(e){
+  const cc  = ((e.country||e.countryCode||'')+'').toUpperCase();
+  const cur = ((e.currency||'')+'').toUpperCase();
+  const name= (e.countryName||e.country||'');
+  return cc==='USD' || cc==='US' || cur==='USD' || /united\s*states|estados\s*unidos/i.test(name);
 }
 
-// --- Decorador ---
-function decorateTitleES(t) {
-  const s = t.toLowerCase();
-  if (/powell|fed/.test(s)) return '🗣 ' + t;
-  if (/payroll|nfp|unemployment|employment/.test(s)) return '📊 ' + t;
-  if (/price|inflation|cpi|pce/.test(s)) return '💰 ' + t;
-  if (/retail|sales/.test(s)) return '🛒 ' + t;
-  return t;
-}
+async function buildEvents(fromISO, toISO){
+  // Mezcla feeds
+  let raw=[];
+  const thisW = await fetchFFWeek(); if(Array.isArray(thisW)) raw=raw.concat(thisW);
+  const thisMonISO = weekMondayISO(fmtDateISO(new Date()));
+  const forceMonISO= weekMondayISO(fromISO);
+  const needNext = !!process.env.FORCE_DATE_FROM || ( (new Date(forceMonISO) - new Date(thisMonISO))/(86400000) >= 6 );
+  try{
+    if(needNext){ const nextW=await fetchFFNextWeek(); if(Array.isArray(nextW)) raw=raw.concat(nextW); }
+  }catch(e){ if(VERBOSE) console.log('Aviso: nextweek no disponible:', e.message); }
 
-// ========= FETCH =========
-async function fetchForexFactory(dateFrom, dateTo) {
-  const url = `https://cdn-nfs.faireconomy.media/ff_calendar_thisweek.json`;
-  const res = await axios.get(url, { timeout: 15000 });
-  return res.data || [];
-}
-
-// ========= BUILD EVENTS =========
-async function buildEvents() {
-  const from = FORCE_DATE_FROM || dayjs().tz(TZ).startOf('week').add(1, 'day').format('YYYY-MM-DD');
-  const to = FORCE_DATE_TO || dayjs(from).add(4, 'day').format('YYYY-MM-DD');
-  console.log('🧰 Prueba ACTIVADA:', from + '→' + to);
-
-  const data = await fetchForexFactory(from, to);
-  if (!Array.isArray(data)) {
-    console.log('⚠️ Datos vacíos');
-    return [];
+  if (VERBOSE){
+    console.log('Total items raw:', raw.length);
+    console.log('Muestra 3 del feed:', raw.slice(0,3).map(x=>({title:x.title,country:x.country,impact:x.impact,date:x.date})));
   }
 
-  let out = [];
-  for (const e of data) {
-    if (!e || !e.title || !e.country) continue;
-    if (e.country !== 'USD') continue;
-    if (!['medium', 'high'].includes(e.impact?.toLowerCase?.() || '')) continue;
+  const out=[];
+  for (const e of (raw||[])){
+    if (!isUSD(e)) continue;
+    if (!inImpact(e.impact)) continue;
 
-    const dt = new Date(e.date);
-    const dayKey = dayjs(dt).tz(TZ).format('YYYY-MM-DD');
+    // fecha del evento
+    let dt=null;
+    if (e.timestamp) {
+      const ts=Number(e.timestamp)||0;
+      if (ts) dt=new Date(ts*1000);
+    }
+    if (!dt && e.date){
+      const d = new Date(String(e.date)); // trae offset, OK
+      if(!isNaN(d.getTime())) dt=d;
+    }
+    if (!dt) continue;
+
+    const dayKey = fmtDateISO(dt);
+    if (dayKey < fromISO || dayKey > toISO) continue;
+
+    const timeLocal = fmtTimeUS(dt, e.title||'');
+
+    // Título traducido con DeepL (si hay API)
+    const titleES = await deeplTranslate(e.title||'', 'es');
+
+    // Why Traders Care (si SHOW_DESC=1)
+    let why = null;
+    if (SHOW_DESC) {
+      why = await fetchWhyTradersCare(e.country||'US', e.title||'');
+      // fallback: frase corta si no hay spec
+      if (!why) {
+        if (/unemployment claims|jobless claims/i.test(e.title||'')) why = 'Solicitudes semanales de paro (indicador de ciclo).';
+        else if (/non-?farm|payroll|nfp/i.test(e.title||'')) why = 'Empleo no agrícola: referencia mensual clave del mercado laboral.';
+        else if (/unemployment rate/i.test(e.title||'')) why = 'Porcentaje de parados vs fuerza laboral.';
+        else if (/average hourly earnings/i.test(e.title||'')) why = 'Crecimiento salarial (tensión inflacionaria).';
+      }
+    }
+
     out.push({
       dayKey,
       dayLabel: `${weekdayES(dt)} ${fmtDateES(dt)}`,
-      time: fmtTimeUS(dt, e.title || ''),
+      time: timeLocal,
       stars: impactToStars(e.impact),
-      title: decorateTitleES(translateTitleES(e.title || '')),
-      desc: SHOW_DESC ? shortDescES(e.title || '') : null
+      title: titleES ? titleES.trim() : (e.title||'').trim(),
+      desc: why
     });
   }
 
-  return out.sort((a, b) => a.dayKey.localeCompare(b.dayKey) || a.time.localeCompare(b.time));
+  out.sort((a,b)=> a.dayKey.localeCompare(b.dayKey) || a.time.localeCompare(b.time));
+  return out;
 }
 
-// ========= BUILD MESSAGE =========
-function buildMessage(events, from, to) {
-  if (!events.length) {
-    return `📅 *Calendario Económico (🇺🇸)* —\nRango ${from}→${to}\n(Europe/Madrid)\n\nNo hay eventos de EE. UU. con el filtro actual.`;
-  }
-
-  let msg = `📅 *Calendario Económico (🇺🇸)* —\nRango ${from}→${to}\n(Europe/Madrid)\nImpacto: ⭐⭐ (medio) · ⭐⭐⭐ (alto)\n\n`;
-  const grouped = events.reduce((acc, ev) => {
-    (acc[ev.dayLabel] = acc[ev.dayLabel] || []).push(ev);
-    return acc;
-  }, {});
-
-  for (const [day, arr] of Object.entries(grouped)) {
-    msg += `*${day}*\n`;
-    for (const ev of arr) {
-      msg += `• ${ev.time} — ${ev.stars} — ${ev.title}\n`;
-      if (ev.desc) msg += `  · ${ev.desc}\n`;
+/* ---------- Mensaje Telegram ---------- */
+function limitTelegram(s){ return s.length>3900 ? s.slice(0,3870)+'\n…recortado' : s; }
+function buildMessage(events, header){
+  const head=`🗓️ <b>Calendario Económico (🇺🇸)</b> — ${header} (${TZ})\nImpacto: ⭐️⭐️ (medio) · ⭐️⭐️⭐️ (alto)\n\n`;
+  if(!events.length) return `${head}No hay eventos de EE. UU. con el filtro actual.`;
+  const map=new Map(); for(const e of events){ if(!map.has(e.dayLabel)) map.set(e.dayLabel,[]); map.get(e.dayLabel).push(e); }
+  const lines=[head];
+  for(const [day,arr] of map){
+    lines.push(`<b>${day}</b>`);
+    for(const ev of arr){
+      lines.push(`• ${ev.time} — ${ev.stars} — ${ev.title}`);
+      if (ev.desc) lines.push(`  · ${ev.desc}`);
     }
-    msg += `\n`;
+    lines.push('');
   }
-
-  return msg.trim();
+  return limitTelegram(lines.join('\n').trim());
 }
 
-// ========= TELEGRAM =========
-async function sendTelegram(msg) {
-  const url = `https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`;
-  await axios.post(url, {
-    chat_id: CHAT_ID,
-    text: msg,
-    parse_mode: 'Markdown'
-  });
-  console.log('📨 Telegram OK · Fin');
+/* ---------- Telegram ---------- */
+async function sendTelegramText(token, chatId, html){
+  const url=`https://api.telegram.org/bot${token}/sendMessage`;
+  const body=new URLSearchParams({chat_id:chatId,text:html,parse_mode:'HTML',disable_web_page_preview:'true'});
+  const r=await fetch(url,{method:'POST', body});
+  const t=await r.text().catch(()=> '');
+  if(!r.ok) throw new Error(`Telegram ${r.status} ${t}`);
 }
 
-// ========= MAIN =========
-(async () => {
-  try {
-    const from = FORCE_DATE_FROM || dayjs().tz(TZ).startOf('week').add(1, 'day').format('YYYY-MM-DD');
-    const to = FORCE_DATE_TO || dayjs(from).add(4, 'day').format('YYYY-MM-DD');
-    const events = await buildEvents();
-    const msg = buildMessage(events, from, to);
-    await sendTelegram(msg);
-  } catch (err) {
-    console.error('❌ Error:', err.message);
+/* ===================== MAIN ===================== */
+(async ()=>{
+  try{
+    let fromISO, toISO, headerLabel='';
+    if(process.env.FORCE_DATE_FROM && process.env.FORCE_DATE_TO){
+      fromISO=process.env.FORCE_DATE_FROM.trim(); toISO=process.env.FORCE_DATE_TO.trim();
+      headerLabel = `Rango ${fmtDateES(new Date(fromISO+'T00:00:00'))}–${fmtDateES(new Date(toISO+'T00:00:00'))}`;
+      if (VERBOSE) console.log('🧰 Prueba ACTIVADA:', fromISO,'→',toISO);
+    } else if (isMonday()){
+      const {mon,sun}=weekRangeDates(); fromISO=fmtDateISO(mon); toISO=fmtDateISO(sun);
+      headerLabel = `Semana ${fmtDateES(mon)}–${fmtDateES(sun)}`;
+    } else {
+      const d=new Date(); fromISO=fmtDateISO(d); toISO=fmtDateISO(d);
+      headerLabel = `Hoy ${fmtDateES(d)}`;
+    }
+
+    const events = await buildEvents(fromISO, toISO);
+    if (VERBOSE) {
+      console.log('Eventos USD seleccionados:', events.length);
+      console.log('Sample:', events.slice(0,3));
+    }
+
+    const msg = buildMessage(events, headerLabel);
+    await sendTelegramText(BOT_TOKEN, CHAT_ID, msg);
+    console.log('Telegram OK · Fin');
+  }catch(err){
+    console.error('ERROR:', err && err.stack || err);
+    process.exit(1);
   }
 })();
