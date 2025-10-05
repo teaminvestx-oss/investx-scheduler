@@ -1,6 +1,7 @@
 /* InvestX Economic Calendar — feed JSON (ForexFactory) con timeouts y reintentos
    Requiere env: INVESTX_TOKEN, CHAT_ID
    Opcional: VERIFY_TELEGRAM=1 (ping de prueba)
+   NUEVO: SKIP_PNG=1 para desactivar la imagen y enviar solo texto
 */
 
 const fs = require('fs');
@@ -64,7 +65,7 @@ function withTimeout(promise, ms, label='op') {
 async function fetchWithTimeout(url, {
   timeoutMs = 15000,
   retries = 2,
-  retryDelayBaseMs = 800,   // backoff: base * (intento+1)
+  retryDelayBaseMs = 800,
   method = 'GET',
   headers = {},
   body = undefined,
@@ -128,32 +129,26 @@ function filterEvents(raw, onlyToday) {
 }
 
 /* ================== Imagen PNG (opcional) ================== */
-// ✅ Nueva versión: solo confía en la promesa de encodePNGToStream; sin 'finish' manual
 async function drawPNG(events, caption){
   try{
     const width=1200,rowH=56,headerH=100,shown=Math.min(events.length,22);
     const h=headerH+rowH*shown+40;
     const img=PImage.make(width,h); const ctx=img.getContext('2d');
 
-    // fondo
     ctx.fillStyle='#fff'; ctx.fillRect(0,0,width,h);
 
-    // fuente (best effort)
     const f='/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf';
     if (fs.existsSync(f)) { const font=PImage.registerFont(f,'UI'); await font.load(); }
 
-    // cabecera
     ctx.fillStyle='#111'; ctx.font='32pt UI, Arial';
     ctx.fillText('Calendario económico USA (⭐️⭐️/⭐️⭐️⭐️)',28,56);
     ctx.font='18pt UI, Arial'; ctx.fillStyle='#444'; ctx.fillText(caption,28,86);
 
-    // encabezados
     ctx.fillStyle='#222'; ctx.font='16pt UI, Arial';
     ctx.fillText('Fecha',28,headerH); ctx.fillText('Hora',140,headerH);
     ctx.fillText('Evento',230,headerH); ctx.fillText('Forecast',900,headerH); ctx.fillText('Previo',1040,headerH);
     ctx.strokeStyle='#e5e7eb'; ctx.beginPath(); ctx.moveTo(20,headerH+10); ctx.lineTo(width-20,headerH+10); ctx.stroke();
 
-    // filas
     ctx.font='15pt UI, Arial';
     let y=headerH+40;
     for (const e of events.slice(0,shown)) {
@@ -168,7 +163,6 @@ async function drawPNG(events, caption){
       y+=rowH;
     }
 
-    // exportar (confía en la promesa; no esperes 'finish' manual)
     const out = fs.createWriteStream('calendar.png');
     await PImage.encodePNGToStream(img, out);
     return true;
@@ -242,7 +236,7 @@ async function verifyTelegram(token, chatId){
 
 /* ================== Main con watchdog y fallback ================== */
 (async ()=>{
-  // watchdog global: mata proceso a los 3 min (ajusta si quieres)
+  // watchdog global: 3 min
   const watchdog = setTimeout(()=>{ 
     console.error('Watchdog: timeout global alcanzado, salgo.'); 
     process.exit(1); 
@@ -254,6 +248,8 @@ async function verifyTelegram(token, chatId){
     clearTimeout(watchdog); 
     process.exit(1); 
   }
+
+  const skipPNG = (process.env.SKIP_PNG || '').trim() === '1';
 
   console.log(`[${NOW()}] Start. CHAT_ID=${chatId}`);
   await verifyTelegram(token, chatId);
@@ -272,11 +268,11 @@ async function verifyTelegram(token, chatId){
     : `🗓️ Calendario USA (⭐️⭐️/⭐️⭐️⭐️) — Hoy ${fmtDate(new Date())}`;
 
   let sentPhoto=false;
-  if(events.length){
+
+  if(!skipPNG && events.length){
     console.log('Generando PNG…');
     let ok=false;
     try {
-      // timeout corto para evitar bloqueos de pureimage
       ok = await withTimeout(drawPNG(events, caption), 20000, 'drawPNG');
     } catch (e) {
       console.error('drawPNG timeout/fallo:', e.message);
@@ -292,8 +288,8 @@ async function verifyTelegram(token, chatId){
     } else {
       console.log('PNG no generado a tiempo, continúo con texto.');
     }
-  } else {
-    console.log('No hay eventos tras filtros.');
+  } else if (skipPNG) {
+    console.log('SKIP_PNG=1 → salto imagen y envío solo texto.');
   }
 
   const summary=buildSummary(events, !weekly);
