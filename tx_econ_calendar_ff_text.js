@@ -5,7 +5,7 @@
    - Rango forzado: FORCE_DATE_FROM / FORCE_DATE_TO (YYYY-MM-DD)
    - Mezcla thisweek + nextweek
    - Filtro USD + impacto (Medium/High)
-   - VERBOSE=1 para diagnósticos
+   - VERBOSE=1 para diagnósticos (incluye escaneo USD)
    ========================================================================= */
 
 const TZ = process.env.TZ || 'Europe/Madrid';
@@ -13,13 +13,14 @@ const VERBOSE = (process.env.VERBOSE || process.env.LOG_VERBOSE || '')
   .toString().toLowerCase() === '1' || (process.env.VERBOSE||'').toLowerCase()==='true';
 
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
-const fmtDateISO = (d) => {
+
+function fmtDateISO(d) {
   const p = Object.fromEntries(
     new Intl.DateTimeFormat('sv-SE', { timeZone: TZ, dateStyle: 'short' })
       .formatToParts(d).map(x=>[x.type,x.value])
   );
   return `${p.year}-${p.month}-${p.day}`;
-};
+}
 const fmtDateES = (d) => new Intl.DateTimeFormat('es-ES',{timeZone:TZ,day:'2-digit',month:'2-digit',year:'numeric'}).format(d);
 const fmtTime   = (d) => new Intl.DateTimeFormat('es-ES',{timeZone:TZ,hour:'2-digit',minute:'2-digit',hour12:false}).format(d);
 const weekdayES = (d) => { const s=new Intl.DateTimeFormat('es-ES',{timeZone:TZ,weekday:'long'}).format(d); return s[0].toUpperCase()+s.slice(1); };
@@ -100,45 +101,44 @@ function decorateTitleES(t){ const x=t.toLowerCase(); if(/ipc|cpi|inflaci|pce/.t
 /* ------------ construir eventos ------------ */
 function buildEventsFromFF(raw,{fromISO,toISO,impactMin='medium'}){
   const wantHighOnly = (impactMin||'medium').toLowerCase()==='high';
-  const start=new Date(fromISO+'T00:00:00');
-  const end  =new Date(toISO  +'T23:59:59');
 
-  let cntUSD=0, cntImpact=0, cntRange=0;
+  let cntUSDAll=0, cntUSDImpact=0, cntUSDRango=0; // diagnóstico
 
   const out=[];
   for(const e of (raw||[])){
     // 1) USD por cualquiera de estos campos:
-    const cc  = ((e.country||e.countryCode||'')+'').toUpperCase();  // a veces 'USD' (!)
-    const cur = ((e.currency||'')+'').toUpperCase();
+    const cc  = ((e.country||e.countryCode||'')+'').toUpperCase();  // ej. 'USD' o 'US'
+    const cur = ((e.currency||'')+'').toUpperCase();                // ej. 'USD'
     const name= (e.countryName||e.country||'');
     const isUSD = cc==='USD' || cc==='US' || cur==='USD' || /united\s*states|estados\s*unidos/i.test(name);
     if(!isUSD) continue;
-    cntUSD++;
+    cntUSDAll++;
 
     // 2) Impacto: Medium/High
     const imp=(e.impact||'').toString().toLowerCase();
     const rank = imp.includes('high') ? 2 : imp.includes('medium') ? 1 : 0;
     if (rank===0) continue;
     if (wantHighOnly && rank<2) continue;
-    cntImpact++;
+    cntUSDImpact++;
 
-    // 3) Fecha/hora: usar timestamp si existe, si no e.date (ISO con offset)
+    // 3) Fecha: usar timestamp o date; comparar por día en TZ Madrid
     let dt=null;
     if (e.timestamp) {
       const ts=Number(e.timestamp)||0;
       if (ts) dt=new Date(ts*1000);
     }
     if (!dt && e.date){
-      // ej: '2025-10-06T03:00:00-04:00'
-      const d = new Date(String(e.date));
+      const d = new Date(String(e.date)); // incluye offset, ok
       if(!isNaN(d.getTime())) dt=d;
     }
     if (!dt) continue;
-    if (dt<start || dt>end) continue;
-    cntRange++;
+
+    const dayISOinTZ = fmtDateISO(dt); // día del evento en TZ Madrid
+    if (dayISOinTZ < fromISO || dayISOinTZ > toISO) continue;
+    cntUSDRango++;
 
     out.push({
-      dayKey: fmtDateISO(dt),
+      dayKey: dayISOinTZ,
       dayLabel: `${weekdayES(dt)} ${fmtDateES(dt)}`,
       time: fmtTime(dt),
       stars: impactToStars(e.impact),
@@ -148,7 +148,7 @@ function buildEventsFromFF(raw,{fromISO,toISO,impactMin='medium'}){
   }
 
   if (VERBOSE) {
-    console.log(`DBG · USD: ${cntUSD} | impacto>=min: ${cntImpact} | en rango: ${cntRange}`);
+    console.log(`DBG · USD en feed: ${cntUSDAll} | USD con impacto>=min: ${cntUSDImpact} | USD en rango: ${cntUSDRango}`);
   }
 
   out.sort((a,b)=> a.dayKey.localeCompare(b.dayKey) || a.time.localeCompare(b.time));
@@ -213,12 +213,15 @@ async function sendTelegramText(token, chatId, html){
     const thisMonISO = weekMondayISO(fmtDateISO(new Date()));
     const forceMonISO = weekMondayISO(fromISO);
     const needNext = !!process.env.FORCE_DATE_FROM || ( (new Date(forceMonISO) - new Date(thisMonISO))/(86400000) >= 6 );
-    if(needNext){
-      try{ const nextW = await fetchFFNextWeek(); if(Array.isArray(nextW)) raw = raw.concat(nextW); }catch(e){ console.warn('Aviso: nextweek no disponible:', e.message); }
-    }
+    try{
+      if(needNext){
+        const nextW = await fetchFFNextWeek();
+        if(Array.isArray(nextW)) raw = raw.concat(nextW);
+      }
+    }catch(e){ console.warn('Aviso: nextweek no disponible:', e.message); }
     console.log('Total items raw (this+next):', raw.length);
 
-    // DEBUG: muestra primeros objetos
+    // DEBUG: muestra primeros objetos y USD muestreados
     if(VERBOSE && raw.length){
       console.log('--- Primeros elementos del feed ForexFactory ---');
       for(const e of raw.slice(0,5)){
@@ -232,6 +235,18 @@ async function sendTelegramText(token, chatId, html){
           timestamp: e.timestamp,
           date: e.date
         });
+      }
+      console.log('-----------------------------------------------');
+
+      const onlyUSD = raw.filter(e=>{
+        const cc  = ((e.country||e.countryCode||'')+'').toUpperCase();
+        const cur = ((e.currency||'')+'').toUpperCase();
+        const name= (e.countryName||e.country||'');
+        return cc==='USD'||cc==='US'||cur==='USD'||/united\s*states|estados\s*unidos/i.test(name);
+      });
+      console.log(`USD totales en feed: ${onlyUSD.length}`);
+      for(const e of onlyUSD.slice(0,5)){
+        console.log({ title:e.title, impact:e.impact, date:e.date, timestamp:e.timestamp });
       }
       console.log('-----------------------------------------------');
     }
