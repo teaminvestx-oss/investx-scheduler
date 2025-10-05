@@ -10,9 +10,9 @@
      TZ=Europe/Madrid
      IMPACT_MIN=medium|high
      BLOCK_WEEKENDS=1
-     INCLUDE_DETAILS=1                 // si quieres añadir descripción abajo de cada evento
-     DEEPL_API_KEY=xxxx               // si está, traduce descripción EN->ES con DeepL
-     DETAILS_MAX_CHARS=220            // recorte de la descripción por evento
+     INCLUDE_DETAILS=1                 // añade descripción debajo del evento
+     DEEPL_API_KEY=xxxx               // si está, traduce EN->ES con DeepL
+     DETAILS_MAX_CHARS=220            // recorte de la descripción
      FORCE_DATE_FROM=YYYY-MM-DD
      FORCE_DATE_TO=YYYY-MM-DD
 */
@@ -21,12 +21,10 @@ let _fetch = global.fetch, _FormData = global.FormData, _AbortController = globa
 async function ensureHTTP(){ if(_fetch&&_FormData&&_AbortController) return; const u=await import('undici'); _fetch=u.fetch; _FormData=u.FormData; _AbortController=u.AbortController; }
 
 const TZ = process.env.TZ || 'Europe/Madrid';
-
 const fmtDateISO = d => new Intl.DateTimeFormat('sv-SE',{timeZone:TZ,dateStyle:'short'}).format(d); // yyyy-mm-dd
 const fmtDateES  = d => new Intl.DateTimeFormat('es-ES',{timeZone:TZ,day:'2-digit',month:'2-digit',year:'numeric'}).format(d);
 const fmtTime    = d => new Intl.DateTimeFormat('es-ES',{timeZone:TZ,hour:'2-digit',minute:'2-digit',hour12:false}).format(d);
 const weekdayES  = d => { const s=new Intl.DateTimeFormat('es-ES',{timeZone:TZ,weekday:'long'}).format(d); return s.charAt(0).toUpperCase()+s.slice(1); };
-
 function isMonday(){return new Intl.DateTimeFormat('en-GB',{timeZone:TZ,weekday:'short'}).format(new Date()).toLowerCase()==='mon';}
 function isWeekend(){const w=new Intl.DateTimeFormat('en-US',{timeZone:TZ,weekday:'short'}).format(new Date()).toLowerCase(); return w==='sat'||w==='sun';}
 function weekRangeDates(){const d=new Date();const wd=['sun','mon','tue','wed','thu','fri','sat'].indexOf(new Intl.DateTimeFormat('en-US',{timeZone:TZ,weekday:'short'}).format(d).toLowerCase());const diff=wd===0?-6:1-wd;const mon=new Date(d);mon.setDate(d.getDate()+diff);const sun=new Date(mon);sun.setDate(mon.getDate()+6);return{mon,sun};}
@@ -48,11 +46,24 @@ async function fetchWithTimeout(url,{timeoutMs=15000,retries=2,method='GET',head
   throw lastErr || new Error('fetch failed');
 }
 
-/* ---------- Fuente: ForexFactory JSON semanal ---------- */
+/* ---------- Fuente: ForexFactory JSON (esta semana / próxima) ---------- */
 async function fetchFFWeek(){
   const url=`https://nfs.faireconomy.media/ff_calendar_thisweek.json?_=${Date.now()}`;
   const res=await fetchWithTimeout(url,{headers:{'User-Agent':'Mozilla/5.0','Accept':'application/json'}});
   return res.json();
+}
+async function fetchFFNextWeek(){
+  const url=`https://nfs.faireconomy.media/ff_calendar_nextweek.json?_=${Date.now()}`;
+  const res=await fetchWithTimeout(url,{headers:{'User-Agent':'Mozilla/5.0','Accept':'application/json'}});
+  return res.json();
+}
+function weekMonday(dateISO){
+  const d = new Date(dateISO+'T00:00:00');
+  const wd = ['sun','mon','tue','wed','thu','fri','sat']
+    .indexOf(new Intl.DateTimeFormat('en-US',{timeZone:TZ,weekday:'short'}).format(d).toLowerCase());
+  const diff = wd===0 ? -6 : 1-wd;
+  const mon = new Date(d); mon.setDate(d.getDate()+diff);
+  return fmtDateISO(mon); // yyyy-mm-dd
 }
 
 /* ---------- Traducción + decoración de títulos ---------- */
@@ -81,7 +92,6 @@ function decorateTitleES(t){ const x=t.toLowerCase(); if(/ipc|cpi|inflaci|pce/.t
 
 /* ---------- Enriquecimiento: descripción desde ficha FF + DeepL ---------- */
 async function fetchFFDescription(newsId){
-  // FF usa varios formatos; probamos ambos
   const urls = [
     `https://www.forexfactory.com/calendar?newsid=${newsId}`,
     `https://www.forexfactory.com/calendar?detail=${newsId}`,
@@ -94,18 +104,16 @@ async function fetchFFDescription(newsId){
         'Accept-Language':'en-US,en;q=0.9'
       }, timeoutMs: 20000});
       const html=await r.text();
-      // La “Description” suele estar en la caja Specs con label "Description"
       const m = html.match(/<td[^>]*>\s*Description\s*<\/td>\s*<td[^>]*>([\s\S]*?)<\/td>/i)
              || html.match(/<h3[^>]*>\s*Description\s*<\/h3>\s*<p[^>]*>([\s\S]*?)<\/p>/i);
       if (m) {
         const raw = stripTags(m[1]).replace(/\s+/g,' ').trim();
         if (raw) return raw;
       }
-    }catch(e){ /* sigue al siguiente patrón */ }
+    }catch(e){ /* sigue */ }
   }
   return '';
 }
-
 async function translateWithDeepL(text){
   const key = process.env.DEEPL_API_KEY;
   if(!key || !text) return text;
@@ -116,11 +124,9 @@ async function translateWithDeepL(text){
       { method:'POST', body, headers:{'Authorization':`DeepL-Auth-Key ${key}`, 'Content-Type':'application/x-www-form-urlencoded'}, timeoutMs:15000, retries:1 }
     );
     const json = await res.json();
-    const out = json?.translations?.[0]?.text;
-    return (out || text);
-  }catch(e){ return text; }
+    return json?.translations?.[0]?.text || text;
+  }catch{ return text; }
 }
-
 function stripTags(s){ return String(s).replace(/<[^>]*>/g,''); }
 
 /* ---------- Construir eventos desde FF ---------- */
@@ -141,17 +147,32 @@ function buildEventsFromFF(ff,{fromISO,toISO,impactMin='medium'}){
       newsId: e.id || e.newsid || e.newsId || null,
     });
   }
-  // ordenar
   out.sort((a,b)=> a.dayLabel.localeCompare(b.dayLabel) || a.time.localeCompare(b.time));
   return out;
 }
 
 /* ---------- Mensajes ---------- */
 function limitTelegram(s){ return s.length>3900 ? s.slice(0,3870)+'\n…recortado' : s; }
-
 function buildWeeklyMessage(events){
   const {monday,sunday}=weekRangeES();
   const head=`🗓️ Calendario Económico (🇺🇸) — Semana ${monday}–${sunday} (${TZ})\nImpacto: ⭐️⭐️ (medio) · ⭐️⭐️⭐️ (alto)\n`;
+  if(!events.length) return `${head}\nNo hay eventos de EE. UU. con el filtro actual.`;
+  const map=new Map(); for(const e of events){ if(!map.has(e.dayLabel)) map.set(e.dayLabel,[]); map.get(e.dayLabel).push(e); }
+  const lines=[head];
+  for(const [day,arr] of map){
+    lines.push(day);
+    const MAX=5;
+    for(const ev of arr.slice(0,MAX)){
+      lines.push(`• ${ev.time} — ${ev.stars} — ${ev.title}`);
+      if (ev.descES) lines.push(`   <i>${ev.descES}</i>`);
+    }
+    if(arr.length>MAX) lines.push(`  +${arr.length-MAX} más…`);
+    lines.push('');
+  }
+  return limitTelegram(lines.join('\n').trim());
+}
+function buildWeeklyMessageWithCustomHeader(events, rangeLabelES){
+  const head=`🗓️ Calendario Económico (🇺🇸) — Rango ${rangeLabelES || ''} (${TZ})\nImpacto: ⭐️⭐️ (medio) · ⭐️⭐️⭐️ (alto)\n`;
   if(!events.length) return `${head}\nNo hay eventos de EE. UU. con el filtro actual.`;
   const map=new Map(); for(const e of events){ if(!map.has(e.dayLabel)) map.set(e.dayLabel,[]); map.get(e.dayLabel).push(e); }
   const lines=[head];
@@ -196,10 +217,12 @@ async function sendTelegramText(token,chatId,text){
 
   const weekly=isMonday();
 
-  // Fechas (rango forzado o normal)
-  let fromISO,toISO;
+  // Fechas (rango forzado o normal) + etiqueta de header para rangos forzados
+  let fromISO,toISO, headerRangeLabel=null;
   if(process.env.FORCE_DATE_FROM && process.env.FORCE_DATE_TO){
-    fromISO=process.env.FORCE_DATE_FROM; toISO=process.env.FORCE_DATE_TO;
+    fromISO=process.env.FORCE_DATE_FROM.trim();
+    toISO=process.env.FORCE_DATE_TO.trim();
+    headerRangeLabel = `${fmtDateES(new Date(fromISO+'T00:00:00'))}–${fmtDateES(new Date(toISO+'T00:00:00'))}`;
     console.log(`🔧 Prueba: ${fromISO}→${toISO}`);
   } else if(weekly){
     const {mon,sun}=weekRangeDates(); fromISO=fmtDateISO(mon); toISO=fmtDateISO(sun);
@@ -207,9 +230,33 @@ async function sendTelegramText(token,chatId,text){
     const d=new Date(); fromISO=fmtDateISO(d); toISO=fmtDateISO(d);
   }
 
-  const ff = await fetchFFWeek();
-  let events = buildEventsFromFF(ff,{fromISO,toISO,impactMin:(process.env.IMPACT_MIN||'medium').toLowerCase()});
-  console.log(`Eventos FF: ${events.length}`);
+  // Descargar thisweek y, si corresponde, nextweek y mezclar
+  let raw = [];
+  try {
+    const thisW = await fetchFFWeek(); raw = raw.concat(thisW||[]);
+    const thisMonISO = weekMonday(fmtDateISO(new Date()));   // lunes semana actual
+    const forceMonISO = weekMonday(fromISO);                 // lunes del rango pedido
+    const oneWeekAhead = (a,b) => {
+      const A = new Date(a+'T00:00:00').getTime();
+      const B = new Date(b+'T00:00:00').getTime();
+      const diffDays = Math.round((A-B)/86400000);
+      return diffDays >= 6 && diffDays <= 8; // ~7 ±1 por TZ
+    };
+    if (process.env.FORCE_DATE_FROM && oneWeekAhead(forceMonISO, thisMonISO)) {
+      try{
+        const nextW = await fetchFFNextWeek();
+        raw = raw.concat(nextW||[]);
+        console.log(`FF nextweek añadido: ${nextW?.length||0} items`);
+      }catch(e){ console.warn('Aviso: no pude cargar ff_calendar_nextweek.json:', e.message); }
+    }
+  } catch(e){
+    console.error('Error descargando FF:', e);
+    raw = [];
+  }
+
+  // Construir eventos dentro del rango
+  let events = buildEventsFromFF(raw,{fromISO,toISO,impactMin:(process.env.IMPACT_MIN||'medium').toLowerCase()});
+  console.log(`Eventos FF dentro de rango: ${events.length}`);
 
   // Enriquecer con descripción si procede
   if ((process.env.INCLUDE_DETAILS||'').trim()==='1' && events.length){
@@ -217,21 +264,21 @@ async function sendTelegramText(token,chatId,text){
     for (const ev of events){
       if (!ev.newsId) continue;
       try{
-        const raw = await fetchFFDescription(ev.newsId);
-        if (!raw) continue;
-        let textES = raw;
-        if (process.env.DEEPL_API_KEY) textES = await translateWithDeepL(raw);
-        // limpieza mínima
+        const rawDesc = await fetchFFDescription(ev.newsId);
+        if (!rawDesc) continue;
+        let textES = rawDesc;
+        if (process.env.DEEPL_API_KEY) textES = await translateWithDeepL(rawDesc);
         textES = textES.replace(/\s+/g,' ').trim();
         if (textES.length > maxChars) textES = textES.slice(0, maxChars-1)+'…';
         ev.descES = textES;
-      }catch(e){ /* silencioso: seguimos sin descripción */ }
+      }catch{ /* silencioso */ }
     }
   }
 
-  const msg=(process.env.FORCE_DATE_FROM && process.env.FORCE_DATE_TO)
-    ? buildWeeklyMessage(events)
-    : (weekly?buildWeeklyMessage(events):buildDailyMessage(events));
+  // Mensaje
+  const msg = (process.env.FORCE_DATE_FROM && process.env.FORCE_DATE_TO)
+    ? buildWeeklyMessageWithCustomHeader(events, headerRangeLabel)
+    : (weekly ? buildWeeklyMessage(events) : buildDailyMessage(events));
 
   await sendTelegramText(token,chatId,msg);
   console.log('Telegram OK · Fin');
