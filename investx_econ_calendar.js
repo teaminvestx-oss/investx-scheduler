@@ -7,27 +7,26 @@ const fs = require('fs');
 const path = require('path');
 const PImage = require('pureimage');
 
-/* ====== runtimes: fetch / FormData / Blob (fallback a undici si no existen) ====== */
+/* ====== Polyfills HTTP (fetch/FormData/Blob/AbortController) vía undici si faltan ====== */
 let _fetch = global.fetch;
 let _FormData = global.FormData;
 let _Blob = global.Blob;
 let _AbortController = global.AbortController;
 
-(async () => {
-  if (!_fetch || !_FormData || !_Blob || !_AbortController) {
-    try {
-      const undici = await import('undici');
-      _fetch = _fetch || undici.fetch;
-      _FormData = _FormData || undici.FormData;
-      _Blob = _Blob || undici.Blob;
-      _AbortController = _AbortController || undici.AbortController;
-      console.log('[bootstrap] Usando undici como polyfill de fetch/FormData/Blob/AbortController');
-    } catch (e) {
-      console.error('No hay fetch/FormData/Blob nativos y falló undici. Instala undici o usa Node >= 18.');
-      process.exit(1);
-    }
+async function ensureHTTPPolyfills(){
+  if (_fetch && _FormData && _Blob && _AbortController) return;
+  try {
+    const undici = await import('undici');
+    _fetch = _fetch || undici.fetch;
+    _FormData = _FormData || undici.FormData;
+    _Blob = _Blob || undici.Blob;
+    _AbortController = _AbortController || undici.AbortController;
+    console.log('[bootstrap] Usando undici como polyfill de fetch/FormData/Blob/AbortController');
+  } catch (e) {
+    console.error('No hay fetch/FormData/Blob nativos y falló undici. Instala undici o usa Node >= 18.');
+    process.exit(1);
   }
-})();
+}
 
 /* ================== util: zona horaria y formatos ================== */
 const TZ = 'Europe/Madrid';
@@ -52,6 +51,15 @@ const weekRangeISO = () => {
   return { monday: fmtDate(mon), sunday: fmtDate(sun) };
 };
 
+/* ================== helper: timeout promisificado ================== */
+function withTimeout(promise, ms, label='op') {
+  let t;
+  const timeout = new Promise((_, rej) => {
+    t = setTimeout(() => rej(new Error(`timeout ${label} ${ms}ms`)), ms);
+  });
+  return Promise.race([promise.finally(() => clearTimeout(t)), timeout]);
+}
+
 /* ================== fetch con timeout + reintentos genérico ================== */
 async function fetchWithTimeout(url, {
   timeoutMs = 15000,
@@ -61,6 +69,7 @@ async function fetchWithTimeout(url, {
   headers = {},
   body = undefined,
 } = {}) {
+  await ensureHTTPPolyfills();
   let lastErr;
   for (let i = 0; i <= retries; i++) {
     const ctrl = new _AbortController();
@@ -69,7 +78,6 @@ async function fetchWithTimeout(url, {
       const res = await _fetch(url, { method, headers, body, signal: ctrl.signal });
       clearTimeout(timer);
       if (!res.ok) {
-        // intentar leer texto para diagnosticar
         let txt = '';
         try { txt = await res.text(); } catch(_){}
         throw new Error(`HTTP ${res.status}${txt ? ` — ${txt.slice(0,200)}`:''}`);
@@ -120,6 +128,7 @@ function filterEvents(raw, onlyToday) {
 }
 
 /* ================== Imagen PNG (opcional) ================== */
+// ✅ Nueva versión: solo confía en la promesa de encodePNGToStream; sin 'finish' manual
 async function drawPNG(events, caption){
   try{
     const width=1200,rowH=56,headerH=100,shown=Math.min(events.length,22);
@@ -129,7 +138,7 @@ async function drawPNG(events, caption){
     // fondo
     ctx.fillStyle='#fff'; ctx.fillRect(0,0,width,h);
 
-    // fuente
+    // fuente (best effort)
     const f='/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf';
     if (fs.existsSync(f)) { const font=PImage.registerFont(f,'UI'); await font.load(); }
 
@@ -138,7 +147,7 @@ async function drawPNG(events, caption){
     ctx.fillText('Calendario económico USA (⭐️⭐️/⭐️⭐️⭐️)',28,56);
     ctx.font='18pt UI, Arial'; ctx.fillStyle='#444'; ctx.fillText(caption,28,86);
 
-    // encabezados tabla
+    // encabezados
     ctx.fillStyle='#222'; ctx.font='16pt UI, Arial';
     ctx.fillText('Fecha',28,headerH); ctx.fillText('Hora',140,headerH);
     ctx.fillText('Evento',230,headerH); ctx.fillText('Forecast',900,headerH); ctx.fillText('Previo',1040,headerH);
@@ -149,8 +158,7 @@ async function drawPNG(events, caption){
     let y=headerH+40;
     for (const e of events.slice(0,shown)) {
       ctx.fillStyle='#111'; ctx.fillText(e.date,28,y); ctx.fillText(e.time,140,y);
-      // truncado simple por ancho
-      const maxW=650; let t=e.title||''; 
+      const maxW=650; let t=e.title||'';
       while (t.length && ctx.measureText(t+'…').width>maxW) t=t.slice(0,-1);
       if ((e.title||'').length!==t.length) t+='…';
       ctx.fillText(t,230,y);
@@ -160,17 +168,13 @@ async function drawPNG(events, caption){
       y+=rowH;
     }
 
-    // export
-    const out=fs.createWriteStream('calendar.png');
-    await PImage.encodePNGToStream(img,out); 
-    await new Promise((r,rej)=>{
-      out.on('finish',r); 
-      out.on('error',rej);
-    });
+    // exportar (confía en la promesa; no esperes 'finish' manual)
+    const out = fs.createWriteStream('calendar.png');
+    await PImage.encodePNGToStream(img, out);
     return true;
-  }catch(e){ 
-    console.error('PNG generation failed:', e.message); 
-    return false; 
+  }catch(e){
+    console.error('PNG generation failed:', e.message);
+    return false;
   }
 }
 
@@ -187,25 +191,22 @@ function buildSummary(events, onlyToday){
 
 /* ================== Telegram helpers (con reintentos) ================== */
 async function sendTelegramPhoto(token, chatId, caption, filePath){
+  await ensureHTTPPolyfills();
   const url=`https://api.telegram.org/bot${token}/sendPhoto`;
 
-  // construir form-data
   const form = new _FormData();
   form.append('chat_id', chatId);
   form.append('caption', caption);
   form.append('parse_mode', 'HTML');
 
-  // Node Blob acepta Buffer
   const fileBuf = fs.readFileSync(filePath);
-  const filename = path.basename(filePath);
-  form.append('photo', new _Blob([fileBuf]), filename);
+  form.append('photo', new _Blob([fileBuf]), path.basename(filePath));
 
   const res = await fetchWithTimeout(url, {
     method: 'POST',
     body: form,
     timeoutMs: 15000,
     retries: 2,
-    // headers: form.getHeaders?.() — innecesario para undici/fetch: lo pone solo
   });
   const json = await res.json();
   if (!json.ok) throw new Error(`sendPhoto Telegram error: ${JSON.stringify(json)}`);
@@ -213,6 +214,7 @@ async function sendTelegramPhoto(token, chatId, caption, filePath){
 }
 
 async function sendTelegramText(token, chatId, html){
+  await ensureHTTPPolyfills();
   const url=`https://api.telegram.org/bot${token}/sendMessage`;
   const body = new URLSearchParams({
     chat_id: chatId,
@@ -238,9 +240,9 @@ async function verifyTelegram(token, chatId){
   await sendTelegramText(token, chatId, '✅ InvestX cron conectado (ping).');
 }
 
-/* ================== Main con watchdog ================== */
+/* ================== Main con watchdog y fallback ================== */
 (async ()=>{
-  // watchdog global: mata proceso a los 3 min
+  // watchdog global: mata proceso a los 3 min (ajusta si quieres)
   const watchdog = setTimeout(()=>{ 
     console.error('Watchdog: timeout global alcanzado, salgo.'); 
     process.exit(1); 
@@ -272,7 +274,13 @@ async function verifyTelegram(token, chatId){
   let sentPhoto=false;
   if(events.length){
     console.log('Generando PNG…');
-    const ok=await drawPNG(events, caption);
+    let ok=false;
+    try {
+      // timeout corto para evitar bloqueos de pureimage
+      ok = await withTimeout(drawPNG(events, caption), 20000, 'drawPNG');
+    } catch (e) {
+      console.error('drawPNG timeout/fallo:', e.message);
+    }
     if(ok && fs.existsSync('calendar.png')){
       console.log('Enviando PNG…');
       try {
@@ -282,7 +290,7 @@ async function verifyTelegram(token, chatId){
         console.error('Fallo enviando PNG, continúo con texto:', e.message);
       }
     } else {
-      console.log('PNG no generado, continuaré con texto.');
+      console.log('PNG no generado a tiempo, continúo con texto.');
     }
   } else {
     console.log('No hay eventos tras filtros.');
