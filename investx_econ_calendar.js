@@ -1,26 +1,13 @@
 /* InvestX Economic Calendar — SOLO ForexFactory (JSON) + descripción opcional (ES)
-   Formato: hora — ⭐️ — evento (ES), agrupado por día.
-   Lunes => semanal | Mar–Vie => diario | Sáb/Dom => opcionalmente no ejecuta.
-   PRUEBA rango: FORCE_DATE_FROM / FORCE_DATE_TO (YYYY-MM-DD) o flags CLI --from/--to.
-
-   ENV requeridos:
-     INVESTX_TOKEN, CHAT_ID
-
-   ENV opcionales:
-     TZ=Europe/Madrid
-     IMPACT_MIN=medium|high
-     BLOCK_WEEKENDS=1
-     INCLUDE_DETAILS=1                 // añade descripción debajo del evento
-     DEEPL_API_KEY=xxxx               // si está, traduce EN->ES con DeepL
-     DETAILS_MAX_CHARS=220            // recorte de la descripción
-     FORCE_DATE_FROM=YYYY-MM-DD
-     FORCE_DATE_TO=YYYY-MM-DD
+   Robust: mezcla thisweek + nextweek, filtros USD/currency e impacto, rango forzado o normal.
 */
 
 let _fetch = global.fetch, _FormData = global.FormData, _AbortController = global.AbortController;
 async function ensureHTTP(){ if(_fetch&&_FormData&&_AbortController) return; const u=await import('undici'); _fetch=u.fetch; _FormData=u.FormData; _AbortController=u.AbortController; }
 
 const TZ = process.env.TZ || 'Europe/Madrid';
+const VERBOSE = (process.env.LOG_VERBOSE||'').trim()==='1';
+
 const fmtDateISO = d => new Intl.DateTimeFormat('sv-SE',{timeZone:TZ,dateStyle:'short'}).format(d); // yyyy-mm-dd
 const fmtDateES  = d => new Intl.DateTimeFormat('es-ES',{timeZone:TZ,day:'2-digit',month:'2-digit',year:'numeric'}).format(d);
 const fmtTime    = d => new Intl.DateTimeFormat('es-ES',{timeZone:TZ,hour:'2-digit',minute:'2-digit',hour12:false}).format(d);
@@ -29,13 +16,10 @@ function isMonday(){return new Intl.DateTimeFormat('en-GB',{timeZone:TZ,weekday:
 function isWeekend(){const w=new Intl.DateTimeFormat('en-US',{timeZone:TZ,weekday:'short'}).format(new Date()).toLowerCase(); return w==='sat'||w==='sun';}
 function weekRangeDates(){const d=new Date();const wd=['sun','mon','tue','wed','thu','fri','sat'].indexOf(new Intl.DateTimeFormat('en-US',{timeZone:TZ,weekday:'short'}).format(d).toLowerCase());const diff=wd===0?-6:1-wd;const mon=new Date(d);mon.setDate(d.getDate()+diff);const sun=new Date(mon);sun.setDate(mon.getDate()+6);return{mon,sun};}
 function weekRangeES(){const {mon,sun}=weekRangeDates();return{monday:fmtDateES(mon),sunday:fmtDateES(sun)};}
-function parseArgs(){ // lee --from=YYYY-MM-DD --to=YYYY-MM-DD
-  const out={}; for(const a of process.argv.slice(2)){ const m=a.match(/^--(from|to)=(\d{4}-\d{2}-\d{2})$/); if(m) out[m[1]]=m[2]; }
-  return out;
-}
-function isISODate(s){ return /^\d{4}-\d{2}-\d{2}$/.test(s||''); }
+function parseArgs(){ const out={}; for(const a of process.argv.slice(2)){ const m=a.match(/^--(from|to)=(\d{4}-\d{2}-\d{2})$/); if(m) out[m[1]]=m[2]; } return out; }
+function isISODate(s){ return /^\d{4}-\d{2}-\d{2}$/.test((s||'').trim()); }
 
-/* ---------- HTTP con timeout y reintentos ---------- */
+/* ---------- HTTP ---------- */
 async function fetchWithTimeout(url,{timeoutMs=15000,retries=2,method='GET',headers={},body}={}){
   await ensureHTTP();
   let lastErr;
@@ -51,28 +35,25 @@ async function fetchWithTimeout(url,{timeoutMs=15000,retries=2,method='GET',head
   throw lastErr || new Error('fetch failed');
 }
 
-/* ---------- ForexFactory JSON (esta semana / próxima) ---------- */
+/* ---------- FF feeds ---------- */
 async function fetchFFWeek(){
   const url=`https://nfs.faireconomy.media/ff_calendar_thisweek.json?_=${Date.now()}`;
   const res=await fetchWithTimeout(url,{headers:{'User-Agent':'Mozilla/5.0','Accept':'application/json'}});
-  return res.json();
+  const j = await res.json(); if (VERBOSE) console.log('thisweek items:', j?.length||0); return j;
 }
 async function fetchFFNextWeek(){
   const url=`https://nfs.faireconomy.media/ff_calendar_nextweek.json?_=${Date.now()}`;
   const res=await fetchWithTimeout(url,{headers:{'User-Agent':'Mozilla/5.0','Accept':'application/json'}});
-  return res.json();
-}
-function weekMonday(dateISO){
-  const d = new Date(dateISO+'T00:00:00');
-  const wd = ['sun','mon','tue','wed','thu','fri','sat']
-    .indexOf(new Intl.DateTimeFormat('en-US',{timeZone:TZ,weekday:'short'}).format(d).toLowerCase());
-  const diff = wd===0 ? -6 : 1-wd;
-  const mon = new Date(d); mon.setDate(d.getDate()+diff);
-  return fmtDateISO(mon); // yyyy-mm-dd
+  const j = await res.json(); if (VERBOSE) console.log('nextweek items:', j?.length||0); return j;
 }
 
 /* ---------- Traducción + decoración ---------- */
-function impactToStars(impact){ return /high/i.test(impact)?'⭐️⭐️⭐️':'⭐️⭐️'; }
+function impactToStars(impact){
+  const s=(impact||'').toString().toLowerCase();
+  if (s.includes('high')) return '⭐️⭐️⭐️';
+  if (s.includes('medium')) return '⭐️⭐️';
+  return '⭐️'; // por si llegara algo low, no debería pasar el filtro
+}
 function translateTitleES(t){
   const s=t.trim();
   const map=[
@@ -95,7 +76,7 @@ function translateTitleES(t){
 }
 function decorateTitleES(t){ const x=t.toLowerCase(); if(/ipc|cpi|inflaci|pce/.test(x)) return '📊 '+t; if(/nfp|no agrícola|payroll|desempleo/.test(x)) return '📊 '+t; if(/fomc|powell|fed/.test(x)) return '🗣️ '+t; return t; }
 
-/* ---------- Enriquecimiento: descripción FF + DeepL ---------- */
+/* ---------- Detalles (opcional) ---------- */
 async function fetchFFDescription(newsId){
   const urls = [
     `https://www.forexfactory.com/calendar?newsid=${newsId}`,
@@ -115,7 +96,7 @@ async function fetchFFDescription(newsId){
         const raw = stripTags(m[1]).replace(/\s+/g,' ').trim();
         if (raw) return raw;
       }
-    }catch(e){ /* sigue */ }
+    }catch(e){}
   }
   return '';
 }
@@ -136,14 +117,21 @@ function stripTags(s){ return String(s).replace(/<[^>]*>/g,''); }
 
 /* ---------- Construcción de eventos ---------- */
 function buildEventsFromFF(ff,{fromISO,toISO,impactMin='medium'}){
-  const minRank=impactMin==='high'?2:1; const rank=v=>/high/i.test(v)?2:/medium/i.test(v)?1:0;
+  const wantHighOnly = impactMin==='high';
   const out=[];
   for(const e of ff){
-    if((e.country||'').toUpperCase()!=='USD') continue;
-    if(rank(e.impact||'')<minRank) continue;
+    const cc = (e.country||'').toUpperCase();
+    const cur = (e.currency||'').toUpperCase();
+    if(cc!=='USD' && cur!=='USD') continue;                               // USD por país o moneda
+    const imp = (e.impact||'').toString().toLowerCase();
+    const rank = imp.includes('high') ? 2 : imp.includes('medium') ? 1 : 0;
+    if (rank===0) continue;
+    if (wantHighOnly && rank<2) continue;
+
     const ts=Number(e.timestamp)||0; if(!ts) continue;
     const dt=new Date(ts*1000);
     const dISO=fmtDateISO(dt); if(dISO<fromISO||dISO>toISO) continue;
+
     out.push({
       dayLabel: `${weekdayES(dt)} ${fmtDateES(dt)}`,
       time: fmtTime(dt),
@@ -153,6 +141,7 @@ function buildEventsFromFF(ff,{fromISO,toISO,impactMin='medium'}){
     });
   }
   out.sort((a,b)=> a.dayLabel.localeCompare(b.dayLabel) || a.time.localeCompare(b.time));
+  if (VERBOSE) console.log('sample events:', out.slice(0,5));
   return out;
 }
 
@@ -222,23 +211,19 @@ async function sendTelegramText(token,chatId,text){
 
   const weekly=isMonday();
 
-  // ==== Lectura robusta de rango forzado ====
+  // Rango forzado o normal
   const args = parseArgs();
-  const envFrom = (process.env.FORCE_DATE_FROM||'').trim();
-  const envTo   = (process.env.FORCE_DATE_TO||'').trim();
+  const envFrom=(process.env.FORCE_DATE_FROM||'').trim();
+  const envTo  =(process.env.FORCE_DATE_TO||'').trim();
   const forceFrom = isISODate(args.from) ? args.from : (isISODate(envFrom) ? envFrom : null);
   const forceTo   = isISODate(args.to)   ? args.to   : (isISODate(envTo)   ? envTo   : null);
 
   console.log('CFG:', {
-    script: 'ff_text',
-    weekly,
-    forceFrom, forceTo,
+    weekly, forceFrom, forceTo,
     impact: process.env.IMPACT_MIN || 'medium',
-    includeDetails: process.env.INCLUDE_DETAILS || '0',
-    tz: TZ
+    tz: TZ, verbose: VERBOSE
   });
 
-  // Fechas (rango forzado o normal) + etiqueta header
   let fromISO,toISO, headerRangeLabel=null;
   if(forceFrom && forceTo){
     fromISO=forceFrom; toISO=forceTo;
@@ -246,31 +231,22 @@ async function sendTelegramText(token,chatId,text){
     console.log(`🔧 Prueba ACTIVADA: ${fromISO}→${toISO}`);
   } else if(weekly){
     const {mon,sun}=weekRangeDates(); fromISO=fmtDateISO(mon); toISO=fmtDateISO(sun);
-  } else {
-    const d=new Date(); fromISO=fmtDateISO(d); toISO=fmtDateISO(d);
-  }
+  } else { const d=new Date(); fromISO=fmtDateISO(d); toISO=fmtDateISO(d); }
 
-  // Descargar thisweek y, si hay forzado, también nextweek (siempre mezclamos en forzado)
+  // Siempre descarga thisweek + nextweek y mezcla (evita “huecos” en rangos).
   let raw = [];
-  try {
-    const thisW = await fetchFFWeek(); raw = raw.concat(thisW||[]);
-    if (forceFrom && forceTo){
-      try{
-        const nextW = await fetchFFNextWeek();
-        raw = raw.concat(nextW||[]);
-        console.log(`FF nextweek añadido (forzado): ${nextW?.length||0} items`);
-      }catch(e){ console.warn('Aviso: no pude cargar ff_calendar_nextweek.json:', e.message); }
-    }
-  } catch(e){
-    console.error('Error descargando FF:', e);
-    raw = [];
-  }
+  try{
+    const [thisW, nextW] = await Promise.allSettled([fetchFFWeek(), fetchFFNextWeek()]);
+    if (thisW.status==='fulfilled' && Array.isArray(thisW.value)) raw = raw.concat(thisW.value);
+    if (nextW.status==='fulfilled' && Array.isArray(nextW.value)) raw = raw.concat(nextW.value);
+    console.log('Total items raw (this+next):', raw.length);
+  }catch(e){ console.error('Descarga FF falló:', e); }
 
-  // Construir eventos dentro del rango
+  // Construye eventos con filtros USD + impacto
   let events = buildEventsFromFF(raw,{fromISO,toISO,impactMin:(process.env.IMPACT_MIN||'medium').toLowerCase()});
   console.log(`Eventos FF dentro de rango: ${events.length}`);
 
-  // Enriquecer con descripción si procede
+  // Enriquecer con descripción (opcional)
   if ((process.env.INCLUDE_DETAILS||'').trim()==='1' && events.length){
     const maxChars = Number(process.env.DETAILS_MAX_CHARS||'220');
     for (const ev of events){
@@ -278,16 +254,14 @@ async function sendTelegramText(token,chatId,text){
       try{
         const rawDesc = await fetchFFDescription(ev.newsId);
         if (!rawDesc) continue;
-        let textES = rawDesc;
-        if (process.env.DEEPL_API_KEY) textES = await translateWithDeepL(rawDesc);
+        let textES = process.env.DEEPL_API_KEY ? await translateWithDeepL(rawDesc) : rawDesc;
         textES = textES.replace(/\s+/g,' ').trim();
         if (textES.length > maxChars) textES = textES.slice(0, maxChars-1)+'…';
         ev.descES = textES;
-      }catch{ /* silencioso */ }
+      }catch{}
     }
   }
 
-  // Mensaje
   const msg = (forceFrom && forceTo)
     ? buildWeeklyMessageWithCustomHeader(events, headerRangeLabel)
     : (weekly ? buildWeeklyMessage(events) : buildDailyMessage(events));
