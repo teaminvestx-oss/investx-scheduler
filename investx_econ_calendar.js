@@ -1,11 +1,17 @@
 /* InvestX Economic Calendar — FUENTE: Investing (widget público)
    Formato: hora — ⭐️ — evento (ES), agrupado por día
    Lunes => semanal | Mar–Vie => diario | Fines de semana => opcionalmente no ejecuta
-   Requiere env: INVESTX_TOKEN, CHAT_ID
+   PRUEBAS: puedes forzar rango con FORCE_DATE_FROM y FORCE_DATE_TO (YYYY-MM-DD)
+
+   Requiere env:
+     INVESTX_TOKEN, CHAT_ID
+
    Opcional:
      TZ=Europe/Madrid
      IMPACT_MIN=medium|high
      BLOCK_WEEKENDS=1
+     FORCE_DATE_FROM=YYYY-MM-DD
+     FORCE_DATE_TO=YYYY-MM-DD
 */
 
 let _fetch = global.fetch, _FormData = global.FormData, _AbortController = global.AbortController;
@@ -28,10 +34,6 @@ const TZ = process.env.TZ || 'Europe/Madrid';
 const fmtDateISO = d => new Intl.DateTimeFormat('sv-SE', { timeZone: TZ, dateStyle:'short' }).format(d);  // yyyy-mm-dd
 const fmtDateES  = d => new Intl.DateTimeFormat('es-ES', { timeZone: TZ, day:'2-digit', month:'2-digit', year:'numeric' }).format(d);
 const fmtTime    = d => new Intl.DateTimeFormat('es-ES', { timeZone: TZ, hour:'2-digit', minute:'2-digit', hour12:false }).format(d);
-const weekdayES  = d => {
-  const s = new Intl.DateTimeFormat('es-ES', { timeZone: TZ, weekday:'long' }).format(d);
-  return s.charAt(0).toUpperCase() + s.slice(1);
-};
 
 function isMonday(){
   return new Intl.DateTimeFormat('en-GB', { timeZone: TZ, weekday:'short' })
@@ -83,15 +85,8 @@ async function fetchWithTimeout(url, {
 }
 
 /* ---------------- Fuente: Investing widget (HTML) ----------------
-   Endpoint: https://ec.forexprostools.com/ (embed)
-   Parámetros usados:
-     - country=5              (Estados Unidos)
-     - importance=2,3         (medium/high)
-     - dateFrom=YYYY-MM-DD
-     - dateTo=YYYY-MM-DD
-     - timeZone=56            (~Europe/Madrid en el widget)
-     - lang=12                (español)
-     - columns=exc_date,exc_time,exc_event,exc_importance
+   https://ec.forexprostools.com/?country=5&importance=2,3&timeZone=56&lang=12&dateFrom=YYYY-MM-DD&dateTo=YYYY-MM-DD
+   country=5 (EE. UU.), importance 2-3, lang=12 (ES), timeZone=56 (~Madrid en el widget)
 ------------------------------------------------------------------*/
 function buildInvestingURL({dateFrom, dateTo, importance, country='5', timeZone='56', lang='12'}){
   const cols = 'exc_date,exc_time,exc_event,exc_importance';
@@ -104,80 +99,43 @@ function buildInvestingURL({dateFrom, dateTo, importance, country='5', timeZone=
 
 /* ---------------- Parseador HTML básico ---------------- */
 function parseInvestingHTML(html){
-  // El widget devuelve una tabla con <tr> por evento.
-  // Vamos a extraer con regex/DOM-lite sin dependencias externas.
   const rows = [];
-  // Romper por filas
   const trRegex = /<tr[^>]*?>([\s\S]*?)<\/tr>/gi;
   let m;
   while ((m = trRegex.exec(html)) !== null){
     const tr = m[1];
 
-    // Columna hora (ej: 14:30)
     const timeMatch = tr.match(/<td[^>]*class="first-time"[^>]*>([\s\S]*?)<\/td>/i)
                     || tr.match(/<td[^>]*data-title="Hora"[^>]*>([\s\S]*?)<\/td>/i)
                     || tr.match(/<td[^>]*class="time"[^>]*>([\s\S]*?)<\/td>/i);
     let time = sanitize(stripTags(timeMatch ? timeMatch[1] : ''));
 
-    // Fecha (día) aparece como fila separadora o en columna; capturamos si está en este <tr>
     const dateMatch = tr.match(/<td[^>]*data-title="Fecha"[^>]*>([\s\S]*?)<\/td>/i)
                    || tr.match(/<td[^>]*class="theDay"[^>]*>([\s\S]*?)<\/td>/i);
     let date = sanitize(stripTags(dateMatch ? dateMatch[1] : ''));
 
-    // Evento (texto en español si lang=12)
     const evMatch = tr.match(/<td[^>]*class="event"[^>]*>([\s\S]*?)<\/td>/i)
                   || tr.match(/<td[^>]*data-title="Evento"[^>]*>([\s\S]*?)<\/td>/i);
     let title = sanitize(stripTags(evMatch ? evMatch[1] : ''));
 
-    // Impacto: cuentan los "bullX" / estrellas. En el widget a veces son <i class="icon icon--bullish N"> o imgs.
-    // Buscamos 3 o 2 marcas:
-    let stars = '⭐️⭐️'; // por defecto medium
+    let stars = '⭐️⭐️';
     if (/bull(3|ish\s*3)|star.?3|alta/i.test(tr)) stars = '⭐️⭐️⭐️';
     else if (/bull(2|ish\s*2)|star.?2|media/i.test(tr)) stars = '⭐️⭐️';
 
-    // Filtrar filas que no son eventos (cabeceras vacías)
     if (!title || !time) continue;
-
     rows.push({ date, time, title, stars });
   }
   return rows;
 }
-
 function stripTags(s){ return String(s).replace(/<[^>]*>/g,''); }
 function sanitize(s){ return stripTags(s).replace(/\s+/g,' ').trim(); }
 
 /* ---------------- Normalización a estructura por día ---------------- */
-function groupByDay(rows){
-  // Algunas filas no traen fecha en cada <tr>; Investing mete separadores de día en filas aparte.
-  // Estrategia: recordamos el "día actual" cuando encontramos una fila que trae fecha,
-  // y lo aplicamos a las siguientes filas hasta que cambie.
-  const out = [];
-  let currentDay = null;
-
-  for (const r of rows){
-    // Si la 'date' luce como 'martes, 07 oct' o '07/10/2025', la adoptamos
-    if (r.date && r.date.length >= 6) currentDay = r.date;
-    if (!currentDay) continue; // no sabemos a qué día pertenece aún
-
-    out.push({
-      dayLabel: normalizeDayES(currentDay),   // "Martes 07/10/2025"
-      time: r.time,
-      title: decorateTitleES(r.title),
-      stars: r.stars
-    });
-  }
-  return out;
-}
-
 function normalizeDayES(s){
-  // Intentar convertir formatos tipo "martes, 07 oct" a DD/MM/YYYY si fuera posible;
-  // si no, lo dejamos capitalizado.
   const cap = s.charAt(0).toUpperCase() + s.slice(1);
-  // Si ya viene con formato dd/mm o dd/mm/aaaa, lo dejamos.
   if (/\d{1,2}\/\d{1,2}/.test(cap)) return cap;
   return cap;
 }
-
 function decorateTitleES(t){
   const x = t.toLowerCase();
   if (/ipc|cpi|inflaci|pce/.test(x)) return '📊 ' + t;
@@ -186,25 +144,38 @@ function decorateTitleES(t){
   return t;
 }
 
+function groupByDay(rows){
+  const out = [];
+  let currentDay = null;
+  for (const r of rows){
+    if (r.date && r.date.length >= 6) currentDay = r.date;
+    if (!currentDay) continue;
+    out.push({
+      dayLabel: normalizeDayES(currentDay),
+      time: r.time,
+      title: decorateTitleES(r.title),
+      stars: r.stars
+    });
+  }
+  return out;
+}
+
 /* ---------------- Construcción de mensaje ---------------- */
+function limitTelegram(txt){ return txt.length > 3900 ? (txt.slice(0, 3870) + '\n…recortado') : txt; }
+
 function buildWeeklyMessage(events){
   const { monday, sunday } = weekRangeES();
   const header = `🗓️ Calendario Económico (🇺🇸) — Semana ${monday}–${sunday} (${TZ})\nImpacto: ⭐️⭐️ (medio) · ⭐️⭐️⭐️ (alto)\n`;
   if (!events.length) return `${header}\nNo hay eventos de EE. UU. con el filtro actual.`;
 
-  // Agrupar por dayLabel manteniendo orden
   const map = new Map();
-  for (const e of events){
-    if (!map.has(e.dayLabel)) map.set(e.dayLabel, []);
-    map.get(e.dayLabel).push(e);
-  }
+  for (const e of events){ if (!map.has(e.dayLabel)) map.set(e.dayLabel, []); map.get(e.dayLabel).push(e); }
 
   const lines = [header];
   for (const [day, arr] of map){
     lines.push(day);
     const MAX = 5;
-    const slice = arr.slice(0, MAX);
-    for (const ev of slice){
+    for (const ev of arr.slice(0, MAX)){
       lines.push(`• ${ev.time} — ${ev.stars} — ${ev.title}`);
     }
     if (arr.length > MAX) lines.push(`  +${arr.length - MAX} más…`);
@@ -214,20 +185,11 @@ function buildWeeklyMessage(events){
 }
 
 function buildDailyMessage(events){
-  const today = fmtDateES(new Date());
-  const header = `🗓️ Calendario (🇺🇸) — Hoy ${today} (${TZ})\nImpacto: ⭐️⭐️ / ⭐️⭐️⭐️\n`;
+  const header = `🗓️ Calendario (🇺🇸) — Hoy ${fmtDateES(new Date())} (${TZ})\nImpacto: ⭐️⭐️ / ⭐️⭐️⭐️\n`;
   if (!events.length) return `${header}\nHoy no hay eventos de EE. UU.`;
-
-  // Suponemos que todos pertenecen al mismo día (hoy)
   const lines = [header];
-  for (const ev of events){
-    lines.push(`• ${ev.time} — ${ev.stars} — ${ev.title}`);
-  }
+  for (const ev of events) lines.push(`• ${ev.time} — ${ev.stars} — ${ev.title}`);
   return limitTelegram(lines.join('\n').trim());
-}
-
-function limitTelegram(txt){
-  return txt.length > 3900 ? (txt.slice(0, 3870) + '\n…recortado') : txt;
 }
 
 /* ---------------- Telegram ---------------- */
@@ -253,11 +215,17 @@ async function sendTelegramText(token, chatId, text){
   const token = process.env.INVESTX_TOKEN, chatId = process.env.CHAT_ID;
   if (!token || !chatId){ console.error('Faltan INVESTX_TOKEN / CHAT_ID'); process.exit(1); }
 
-  const weekly = isMonday(); // Lunes => semanal
+  const weekly = isMonday();
+
   const importance = (process.env.IMPACT_MIN||'medium').toLowerCase()==='high' ? '3' : '2,3';
 
+  // ⇣⇣⇣ MODO PRUEBA con rango forzado ⇣⇣⇣
   let dateFrom, dateTo;
-  if (weekly){
+  if (process.env.FORCE_DATE_FROM && process.env.FORCE_DATE_TO) {
+    dateFrom = process.env.FORCE_DATE_FROM;
+    dateTo   = process.env.FORCE_DATE_TO;
+    console.log(`🔧 Modo prueba activado → ${dateFrom} a ${dateTo}`);
+  } else if (weekly) {
     const { mon, sun } = weekRangeDates();
     dateFrom = fmtDateISO(mon);
     dateTo   = fmtDateISO(sun);
@@ -280,17 +248,18 @@ async function sendTelegramText(token, chatId, text){
   const rawRows = parseInvestingHTML(html);
   console.log(`Filas parseadas (crudas): ${rawRows.length}`);
 
-  // Convertir a estructura por día con títulos decorados + estrellas
   let events = groupByDay(rawRows);
 
-  // Filtro extra: si pediste solo high
   if ((process.env.IMPACT_MIN||'medium').toLowerCase()==='high'){
     events = events.filter(e => e.stars === '⭐️⭐️⭐️');
   }
 
   console.log(`Eventos tras filtros: ${events.length}`);
 
-  const msg = weekly ? buildWeeklyMessage(events) : buildDailyMessage(events);
+  const msg = (process.env.FORCE_DATE_FROM && process.env.FORCE_DATE_TO)
+              ? buildWeeklyMessage(events)  // al forzar un rango multi-día, usa formato semanal
+              : (weekly ? buildWeeklyMessage(events) : buildDailyMessage(events));
+
   await sendTelegramText(token, chatId, msg);
 
   console.log('Fin OK');
