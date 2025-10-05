@@ -4,8 +4,9 @@
    · Compatible con Render cron
    ========================================================================= */
 
-import fs from "fs";
-import fetch from "node-fetch";
+const fs = require("fs");
+const fetch = (...args) =>
+  import("node-fetch").then(({ default: fetch }) => fetch(...args));
 
 const TZ = "Europe/Madrid";
 const VERBOSE = process.env.VERBOSE === "1" || process.env.VERBOSE === "true";
