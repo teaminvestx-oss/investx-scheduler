@@ -1,17 +1,12 @@
 /* =============================================================
    InvestX – Calendario Económico (🇺🇸) vía ForexFactory
-   - JSON thisweek (+ nextweek si hace falta)
-   - USD + impacto Medium/High
-   - DeepL para traducir títulos (opcional)
-   - "Why Traders Care" desde página de SPECs (heurística de slug)
-   - Europe/Madrid, formato texto para Telegram
+   CERO dependencias (Node 18+ con fetch)
    ============================================================= */
 
 const VERBOSE = /^(1|true)$/i.test(process.env.VERBOSE || '');
 const SHOW_DESC = /^(1|true)$/i.test(process.env.SHOW_DESC || '');
-const IMPACT_MIN = (process.env.IMPACT_MIN || 'medium').toLowerCase();
+const IMPACT_MIN = (process.env.IMPACT_MIN || 'medium').toLowerCase(); // medium | high
 const TZ = process.env.TZ || 'Europe/Madrid';
-
 const BOT_TOKEN = process.env.INVESTX_TOKEN;
 const CHAT_ID = process.env.CHAT_ID;
 const DEEPL_API_KEY = process.env.DEEPL_API_KEY || '';
@@ -23,7 +18,7 @@ if (!BOT_TOKEN || !CHAT_ID) {
 
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
-/* ---------- Fechas y formato en TZ ---------- */
+/* ---------- Fechas / TZ ---------- */
 function fmtDateISO(d) {
   const p = Object.fromEntries(
     new Intl.DateTimeFormat('sv-SE', { timeZone: TZ, dateStyle: 'short' })
@@ -54,7 +49,7 @@ function weekMondayISO(dateISO){
   return fmtDateISO(mon);
 }
 
-/* ---------- Fetch con timeout y reintentos ---------- */
+/* ---------- Fetch con timeout ---------- */
 async function fetchWithTimeout(url, { timeoutMs=20000, retries=2, headers={}, method='GET', body } = {}){
   let last;
   for (let i=0;i<=retries;i++){
@@ -70,7 +65,7 @@ async function fetchWithTimeout(url, { timeoutMs=20000, retries=2, headers={}, m
   throw last || new Error('fetch failed');
 }
 
-/* ---------- ForexFactory JSON ---------- */
+/* ---------- ForexFactory feeds ---------- */
 async function fetchFFWeek(){
   const r = await fetchWithTimeout(`https://nfs.faireconomy.media/ff_calendar_thisweek.json?_=${Date.now()}`,{
     headers:{'User-Agent':'Mozilla/5.0','Accept':'application/json'}});
@@ -86,7 +81,7 @@ async function fetchFFNextWeek(){
   return j;
 }
 
-/* ---------- Impacto/horas ---------- */
+/* ---------- Impacto / hora ---------- */
 function impactToStars(impact){
   const s = (impact||'').toString().toLowerCase();
   if (s.includes('high')) return '⭐️⭐️⭐️';
@@ -95,20 +90,18 @@ function impactToStars(impact){
 }
 function isTypicalUSAtHalf(title) {
   const s = (title || '').toLowerCase();
-  return /unemployment claims|jobless claims|non-?farm|payroll|nfp|cpi|consumer price|pce|retail sales|core pce|ppi|producer price|empire state|philly fed/.test(s);
+  return /unemployment claims|jobless claims|non-?farm|payroll|nfp|cpi|consumer price|pce|retail sales|core pce|ppi|producer price/.test(s);
 }
 function fmtTimeUS(dt, title){
-  // Redondeo al minuto y “snap” a :30 si es típico
   const snapped = new Date(Math.round(dt.getTime()/60000)*60000);
-  let hhmm = fmtTimeES(snapped).split(':').map(Number);
-  let hh=hhmm[0], mm=hhmm[1];
+  let [hh,mm] = fmtTimeES(snapped).split(':').map(Number);
   if (isTypicalUSAtHalf(title)) mm = 30;
   return `${String(hh).padStart(2,'0')}:${String(mm).padStart(2,'0')}`;
 }
 
-/* ---------- DeepL (opcional) ---------- */
+/* ---------- DeepL ---------- */
 async function deeplTranslate(text, targetLang='es'){
-  if (!DEEPL_API_KEY) return text; // sin traducir
+  if (!DEEPL_API_KEY) return text;
   try{
     const url = 'https://api-free.deepl.com/v2/translate';
     const body = new URLSearchParams({ auth_key: DEEPL_API_KEY, text, target_lang: targetLang.toUpperCase() });
@@ -119,11 +112,7 @@ async function deeplTranslate(text, targetLang='es'){
   }catch(_){ return text; }
 }
 
-/* ---------- SPEC (Why Traders Care) heurístico ----------
-   Intentamos resolver un slug como:
-   /calendar/us-<slug-del-evento>
-   Ej.: "FOMC Meeting Minutes" -> /calendar/us-fomc-meeting-minutes
---------------------------------------------------------- */
+/* ---------- Why Traders Care (heurística de slug) ---------- */
 function slugifyTitle(t){
   return (t||'').toLowerCase()
     .replace(/&/g,' and ')
@@ -140,21 +129,16 @@ async function fetchWhyTradersCare(country, title){
   try{
     const r = await fetchWithTimeout(url, { timeoutMs: 12000, headers:{'User-Agent':'Mozilla/5.0'} });
     const html = await r.text();
-    // Extrae la sección "Why Traders Care" (inglés)
     const m = html.match(/Why\s+Traders\s+Care<\/[^>]+>([\s\S]*?)<\/(?:div|td|section)>/i);
     if (!m) return null;
-    const raw = m[1]
-      .replace(/<[^>]+>/g,' ')
-      .replace(/\s+/g,' ')
-      .trim();
+    const raw = m[1].replace(/<[^>]+>/g,' ').replace(/\s+/g,' ').trim();
     if (!raw) return null;
-    // Traduce al español (si hay API), si no, deja inglés
     const es = await deeplTranslate(raw, 'es');
     return es;
   }catch(_){ return null; }
 }
 
-/* ---------- Construye eventos desde JSON ---------- */
+/* ---------- Filtros ---------- */
 function inImpact(impact){
   const s=(impact||'').toLowerCase();
   if (IMPACT_MIN==='high') return s.includes('high');
@@ -167,10 +151,11 @@ function isUSD(e){
   return cc==='USD' || cc==='US' || cur==='USD' || /united\s*states|estados\s*unidos/i.test(name);
 }
 
+/* ---------- Construcción de eventos ---------- */
 async function buildEvents(fromISO, toISO){
-  // Mezcla feeds
   let raw=[];
   const thisW = await fetchFFWeek(); if(Array.isArray(thisW)) raw=raw.concat(thisW);
+
   const thisMonISO = weekMondayISO(fmtDateISO(new Date()));
   const forceMonISO= weekMondayISO(fromISO);
   const needNext = !!process.env.FORCE_DATE_FROM || ( (new Date(forceMonISO) - new Date(thisMonISO))/(86400000) >= 6 );
@@ -180,7 +165,7 @@ async function buildEvents(fromISO, toISO){
 
   if (VERBOSE){
     console.log('Total items raw:', raw.length);
-    console.log('Muestra 3 del feed:', raw.slice(0,3).map(x=>({title:x.title,country:x.country,impact:x.impact,date:x.date})));
+    console.log('Muestra 3:', raw.slice(0,3).map(x=>({title:x.title,country:x.country,impact:x.impact,date:x.date})));
   }
 
   const out=[];
@@ -188,14 +173,13 @@ async function buildEvents(fromISO, toISO){
     if (!isUSD(e)) continue;
     if (!inImpact(e.impact)) continue;
 
-    // fecha del evento
     let dt=null;
     if (e.timestamp) {
       const ts=Number(e.timestamp)||0;
       if (ts) dt=new Date(ts*1000);
     }
     if (!dt && e.date){
-      const d = new Date(String(e.date)); // trae offset, OK
+      const d = new Date(String(e.date));
       if(!isNaN(d.getTime())) dt=d;
     }
     if (!dt) continue;
@@ -204,20 +188,17 @@ async function buildEvents(fromISO, toISO){
     if (dayKey < fromISO || dayKey > toISO) continue;
 
     const timeLocal = fmtTimeUS(dt, e.title||'');
-
-    // Título traducido con DeepL (si hay API)
-    const titleES = await deeplTranslate(e.title||'', 'es');
-
-    // Why Traders Care (si SHOW_DESC=1)
+    const titleES = (await deeplTranslate(e.title||'', 'es')).trim();
     let why = null;
     if (SHOW_DESC) {
       why = await fetchWhyTradersCare(e.country||'US', e.title||'');
-      // fallback: frase corta si no hay spec
       if (!why) {
-        if (/unemployment claims|jobless claims/i.test(e.title||'')) why = 'Solicitudes semanales de paro (indicador de ciclo).';
-        else if (/non-?farm|payroll|nfp/i.test(e.title||'')) why = 'Empleo no agrícola: referencia mensual clave del mercado laboral.';
-        else if (/unemployment rate/i.test(e.title||'')) why = 'Porcentaje de parados vs fuerza laboral.';
-        else if (/average hourly earnings/i.test(e.title||'')) why = 'Crecimiento salarial (tensión inflacionaria).';
+        // fallback breve
+        const s=(e.title||'').toLowerCase();
+        if (/unemployment claims|jobless claims/.test(s)) why='Solicitudes semanales de paro (indicador de ciclo).';
+        else if (/non-?farm|payroll|nfp/.test(s))       why='Empleo no agrícola: referencia mensual clave.';
+        else if (/unemployment rate/.test(s))           why='Porcentaje de parados vs fuerza laboral.';
+        else if (/average hourly earnings/.test(s))     why='Crecimiento salarial (presión inflacionaria).';
       }
     }
 
@@ -226,7 +207,7 @@ async function buildEvents(fromISO, toISO){
       dayLabel: `${weekdayES(dt)} ${fmtDateES(dt)}`,
       time: timeLocal,
       stars: impactToStars(e.impact),
-      title: titleES ? titleES.trim() : (e.title||'').trim(),
+      title: titleES || (e.title||''),
       desc: why
     });
   }
@@ -235,7 +216,7 @@ async function buildEvents(fromISO, toISO){
   return out;
 }
 
-/* ---------- Mensaje Telegram ---------- */
+/* ---------- Mensaje ---------- */
 function limitTelegram(s){ return s.length>3900 ? s.slice(0,3870)+'\n…recortado' : s; }
 function buildMessage(events, header){
   const head=`🗓️ <b>Calendario Económico (🇺🇸)</b> — ${header} (${TZ})\nImpacto: ⭐️⭐️ (medio) · ⭐️⭐️⭐️ (alto)\n\n`;
