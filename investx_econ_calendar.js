@@ -1,12 +1,15 @@
-/* InvestX Economic Calendar — feed JSON (ForexFactory) con timeouts y reintentos
+/* InvestX Economic Calendar — estilo Investing (texto) sobre feed JSON de ForexFactory
    Requiere env: INVESTX_TOKEN, CHAT_ID
-   Opcional: VERIFY_TELEGRAM=1 (ping de prueba)
-   NUEVO: SKIP_PNG=1 para desactivar la imagen y enviar solo texto
+   Opcional:
+     - VERIFY_TELEGRAM=1           (ping de prueba)
+     - SKIP_PNG=1                  (recomendado; evita imagen)
+     - STYLE=investing|compact     (por defecto 'investing')
+     - COUNTRY=USD                 (p.ej. USD, EUR, GBP… separados por coma si varios)
+     - IMPACT_MIN=medium|high      (nivel mínimo de impacto; por defecto 'medium')
 */
 
 const fs = require('fs');
 const path = require('path');
-const PImage = require('pureimage');
 
 /* ====== Polyfills HTTP (fetch/FormData/Blob/AbortController) vía undici si faltan ====== */
 let _fetch = global.fetch;
@@ -22,9 +25,9 @@ async function ensureHTTPPolyfills(){
     _FormData = _FormData || undici.FormData;
     _Blob = _Blob || undici.Blob;
     _AbortController = _AbortController || undici.AbortController;
-    console.log('[bootstrap] Usando undici como polyfill de fetch/FormData/Blob/AbortController');
+    console.log('[bootstrap] undici activo (fetch/FormData/Blob/AbortController)');
   } catch (e) {
-    console.error('No hay fetch/FormData/Blob nativos y falló undici. Instala undici o usa Node >= 18.');
+    console.error('Falta fetch/FormData/Blob y no se pudo cargar undici. Instala undici o usa Node >= 18.');
     process.exit(1);
   }
 }
@@ -39,17 +42,19 @@ const NOW = () => {
   return `${p.year}-${p.month}-${p.day} ${p.hour}:${p.minute}`;
 };
 
-const fmtDate = d => new Intl.DateTimeFormat('sv-SE', { timeZone: TZ, dateStyle: 'short' }).format(d);
-const fmtTime = d => new Intl.DateTimeFormat('sv-SE', { timeZone: TZ, hour: '2-digit', minute: '2-digit' }).format(d);
-const isMonday = () => new Intl.DateTimeFormat('en-GB', { timeZone: TZ, weekday:'short' }).format(new Date()).toLowerCase()==='mon';
-const weekRangeISO = () => {
+const fmtDateISO = d => new Intl.DateTimeFormat('sv-SE', { timeZone: TZ, dateStyle: 'short' }).format(d); // yyyy-mm-dd
+const fmtDateES  = d => new Intl.DateTimeFormat('es-ES', { timeZone: TZ, day:'2-digit', month:'2-digit', year:'numeric' }).format(d); // dd/mm/aaaa
+const fmtTime    = d => new Intl.DateTimeFormat('es-ES', { timeZone: TZ, hour: '2-digit', minute: '2-digit', hour12: false }).format(d);
+const weekdayES  = d => new Intl.DateTimeFormat('es-ES', { timeZone: TZ, weekday:'long' }).format(d);
+const isMonday   = () => new Intl.DateTimeFormat('en-GB', { timeZone: TZ, weekday:'short' }).format(new Date()).toLowerCase()==='mon';
+const weekRangeES = () => {
   const d = new Date();
   const wd = ['sun','mon','tue','wed','thu','fri','sat']
     .indexOf(new Intl.DateTimeFormat('en-US',{timeZone:TZ,weekday:'short'}).format(d).toLowerCase());
   const diff = wd===0 ? -6 : 1-wd;
   const mon = new Date(d); mon.setDate(d.getDate()+diff);
   const sun = new Date(mon); sun.setDate(mon.getDate()+6);
-  return { monday: fmtDate(mon), sunday: fmtDate(sun) };
+  return { monday: fmtDateES(mon), sunday: fmtDateES(sun) };
 };
 
 /* ================== helper: timeout promisificado ================== */
@@ -107,106 +112,116 @@ async function fetchFFWeek() {
   return res.json();
 }
 
+/* ========= Normalización + filtros (país/impacto) ========= */
 function filterEvents(raw, onlyToday) {
-  const todayStr = fmtDate(new Date());
+  const todayStr = fmtDateISO(new Date()); // yyyy-mm-dd en TZ
+  const countries = (process.env.COUNTRY || 'USD')
+    .split(',')
+    .map(s => s.trim().toUpperCase())
+    .filter(Boolean);
+  const impactMin = (process.env.IMPACT_MIN || 'medium').toLowerCase();
+
+  const impactRank = v => /high/i.test(v) ? 2 : /medium/i.test(v) ? 1 : 0;
+  const minRank = impactMin === 'high' ? 2 : 1;
+
   return raw
-    .filter(e => (e.country||'').toUpperCase()==='USD')
-    .filter(e => /medium|high/i.test(e.impact||''))
+    .filter(e => countries.includes((e.country||'').toUpperCase()))
+    .filter(e => impactRank(e.impact||'') >= minRank)
     .map(e => {
       const ts = (Number(e.timestamp)||0)*1000;
       const dt = ts ? new Date(ts) : new Date();
       return {
-        date: fmtDate(dt),
+        dateISO: fmtDateISO(dt),  // yyyy-mm-dd
+        dateES:  fmtDateES(dt),   // dd/mm/aaaa
         time: fmtTime(dt),
+        weekday: weekdayES(dt),
         title: (e.title||'').trim(),
-        forecast: (e.forecast??'').toString().trim(),
-        previous: (e.previous??'').toString().trim(),
+        forecast: (e.forecast??'').toString().trim(),  // Prev.
+        previous: (e.previous??'').toString().trim(),  // Anterior
         impact: (e.impact||'').toLowerCase()
       };
     })
-    .filter(e => onlyToday ? e.date===todayStr : true)
-    .sort((a,b)=>(a.date+a.time).localeCompare(b.date+b.time));
+    .filter(e => onlyToday ? e.dateISO===todayStr : true)
+    .sort((a,b)=>(a.dateISO+a.time).localeCompare(b.dateISO+b.time));
 }
 
-/* ================== Imagen PNG (opcional) ================== */
-async function drawPNG(events, caption){
-  try{
-    const width=1200,rowH=56,headerH=100,shown=Math.min(events.length,22);
-    const h=headerH+rowH*shown+40;
-    const img=PImage.make(width,h); const ctx=img.getContext('2d');
+/* ================== Render estilo Investing (texto HTML con ⭐️) ================== */
+function impactToStars(impact){
+  if (/high/.test(impact)) return '⭐️⭐️⭐️';
+  return '⭐️⭐️'; // medium
+}
 
-    ctx.fillStyle='#fff'; ctx.fillRect(0,0,width,h);
-
-    const f='/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf';
-    if (fs.existsSync(f)) { const font=PImage.registerFont(f,'UI'); await font.load(); }
-
-    ctx.fillStyle='#111'; ctx.font='32pt UI, Arial';
-    ctx.fillText('Calendario económico USA (⭐️⭐️/⭐️⭐️⭐️)',28,56);
-    ctx.font='18pt UI, Arial'; ctx.fillStyle='#444'; ctx.fillText(caption,28,86);
-
-    ctx.fillStyle='#222'; ctx.font='16pt UI, Arial';
-    ctx.fillText('Fecha',28,headerH); ctx.fillText('Hora',140,headerH);
-    ctx.fillText('Evento',230,headerH); ctx.fillText('Forecast',900,headerH); ctx.fillText('Previo',1040,headerH);
-    ctx.strokeStyle='#e5e7eb'; ctx.beginPath(); ctx.moveTo(20,headerH+10); ctx.lineTo(width-20,headerH+10); ctx.stroke();
-
-    ctx.font='15pt UI, Arial';
-    let y=headerH+40;
-    for (const e of events.slice(0,shown)) {
-      ctx.fillStyle='#111'; ctx.fillText(e.date,28,y); ctx.fillText(e.time,140,y);
-      const maxW=650; let t=e.title||'';
-      while (t.length && ctx.measureText(t+'…').width>maxW) t=t.slice(0,-1);
-      if ((e.title||'').length!==t.length) t+='…';
-      ctx.fillText(t,230,y);
-      ctx.fillStyle='#2563eb'; ctx.fillText(e.forecast||'-',900,y);
-      ctx.fillStyle='#6b7280'; ctx.fillText(e.previous||'-',1040,y);
-      ctx.strokeStyle='#f3f4f6'; ctx.beginPath(); ctx.moveTo(20,y+14); ctx.lineTo(width-20,y+14); ctx.stroke();
-      y+=rowH;
+function buildInvestingStyle(events, weekly){
+  const tz = 'Europe/Madrid';
+  if(!events.length){
+    if (weekly) {
+      const {monday, sunday} = weekRangeES();
+      return `<b>🗓️ Calendario Económico (🇺🇸) — Semana ${monday}–${sunday} (${tz})</b>\n<i>No hay eventos de EE. UU. con el filtro actual.</i>`;
     }
-
-    const out = fs.createWriteStream('calendar.png');
-    await PImage.encodePNGToStream(img, out);
-    return true;
-  }catch(e){
-    console.error('PNG generation failed:', e.message);
-    return false;
+    return `<b>🗓️ Calendario Económico (🇺🇸) — Hoy ${fmtDateES(new Date())} (${tz})</b>\n<i>Hoy no hay eventos de EE. UU.</i>`;
   }
+
+  // agrupar por día (ordenado)
+  const byDay = new Map();
+  for (const e of events){
+    const key = `${e.weekday} ${e.dateES}`; // "martes 07/10/2025"
+    if(!byDay.has(key)) byDay.set(key, []);
+    byDay.get(key).push(e);
+  }
+
+  // cabecera
+  let header;
+  if (weekly) {
+    const {monday, sunday} = weekRangeES();
+    header = `<b>🗓️ Calendario Económico (🇺🇸) — Semana ${monday}–${sunday} (${tz})</b>\n<i>Impacto: ⭐️⭐️ / ⭐️⭐️⭐️</i>`;
+  } else {
+    const today = new Date();
+    header = `<b>🗓️ Calendario Económico (🇺🇸) — Hoy ${fmtDateES(today)} (${tz})</b>\n<i>Impacto: ⭐️⭐️ / ⭐️⭐️⭐️</i>`;
+  }
+
+  const lines = [header, ''];
+  for (const [day, items] of byDay){
+    lines.push(`<b>${capitalize(day)}</b>`);
+    for (const ev of items){
+      const stars = impactToStars(ev.impact);
+      const titleIcon = decorateTitle(ev.title);
+      // Línea 1
+      lines.push(`• <b>${ev.time} — ${stars} — ${titleIcon}</b>`);
+      // Línea 2 (Actual | Prev. | Anterior)
+      const fields = [];
+      // FF antes de la publicación no trae “Actual”. Mostramos guion para mantener la estética.
+      fields.push(`Actual: —`);
+      if (ev.forecast)  fields.push(`Prev.: ${escapeTxt(ev.forecast)}`);
+      else              fields.push(`Prev.: —`);
+      if (ev.previous)  fields.push(`Anterior: ${escapeTxt(ev.previous)}`);
+      else              fields.push(`Anterior: —`);
+      lines.push(`<i>${fields.join(' | ')}</i>`);
+    }
+    lines.push('');
+  }
+
+  // control de longitud (Telegram ~4096)
+  let html = lines.join('\n');
+  const LIMIT = 3900;
+  if (html.length > LIMIT){
+    html = html.slice(0, LIMIT-40) + '\n<i>…recortado por longitud</i>';
+  }
+  return html.trim();
 }
 
-/* ================== Texto resumen ================== */
-function buildSummary(events, onlyToday){
-  if(!events.length) return '';
-  const top=events.slice(0,4);
-  return "📰 <b>Resumen principales noticias</b>\n\n" + top.map(e=>{
-    const meta=[]; if(e.forecast) meta.push(`consenso ${e.forecast}`); if(e.previous) meta.push(`anterior ${e.previous}`);
-    const extra=meta.length?` — ${meta.join(', ')}`:'';
-    return `📌 <b>${e.title}</b> (${onlyToday?e.time:`${e.date} ${e.time}`})${extra}`;
-  }).join("\n\n");
+function capitalize(s){ return s.charAt(0).toUpperCase() + s.slice(1); }
+function decorateTitle(t){
+  const T = t.toLowerCase();
+  if (/(cpi|inflation|ipc|pce)/.test(T)) return '📊 ' + escapeTxt(t);
+  if (/(non-?farm|nfp|payroll)/.test(T)) return '📊 ' + escapeTxt(t);
+  if (/(fomc|powell|fed chair|fed speaks|minutes|remarks)/.test(T)) return '🗣️ ' + escapeTxt(t);
+  return escapeTxt(t);
+}
+function escapeTxt(s){
+  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
 }
 
 /* ================== Telegram helpers (con reintentos) ================== */
-async function sendTelegramPhoto(token, chatId, caption, filePath){
-  await ensureHTTPPolyfills();
-  const url=`https://api.telegram.org/bot${token}/sendPhoto`;
-
-  const form = new _FormData();
-  form.append('chat_id', chatId);
-  form.append('caption', caption);
-  form.append('parse_mode', 'HTML');
-
-  const fileBuf = fs.readFileSync(filePath);
-  form.append('photo', new _Blob([fileBuf]), path.basename(filePath));
-
-  const res = await fetchWithTimeout(url, {
-    method: 'POST',
-    body: form,
-    timeoutMs: 15000,
-    retries: 2,
-  });
-  const json = await res.json();
-  if (!json.ok) throw new Error(`sendPhoto Telegram error: ${JSON.stringify(json)}`);
-  console.log('Telegram photo OK');
-}
-
 async function sendTelegramText(token, chatId, html){
   await ensureHTTPPolyfills();
   const url=`https://api.telegram.org/bot${token}/sendMessage`;
@@ -234,7 +249,7 @@ async function verifyTelegram(token, chatId){
   await sendTelegramText(token, chatId, '✅ InvestX cron conectado (ping).');
 }
 
-/* ================== Main con watchdog y fallback ================== */
+/* ================== Main ================== */
 (async ()=>{
   // watchdog global: 3 min
   const watchdog = setTimeout(()=>{ 
@@ -249,57 +264,31 @@ async function verifyTelegram(token, chatId){
     process.exit(1); 
   }
 
-  const skipPNG = (process.env.SKIP_PNG || '').trim() === '1';
+  const style = (process.env.STYLE||'investing').toLowerCase();
+  const weekly=isMonday();
 
-  console.log(`[${NOW()}] Start. CHAT_ID=${chatId}`);
+  console.log(`[${NOW()}] Start. CHAT_ID=${chatId} STYLE=${style} weekly=${weekly}`);
   await verifyTelegram(token, chatId);
 
-  const weekly=isMonday();
   console.log('Descargando feed semanal (FF)…');
   const raw=await fetchFFWeek();
   console.log(`Items recibidos: ${raw.length}`);
 
   const events=filterEvents(raw, !weekly);
-  console.log(`Filtrados USD + medium/high: ${events.length} (onlyToday=${!weekly})`);
+  console.log(`Filtrados ${process.env.COUNTRY||'USD'} + impacto >= ${process.env.IMPACT_MIN||'medium'}: ${events.length} (onlyToday=${!weekly})`);
 
-  const {monday,sunday}=weekRangeISO();
-  const caption = weekly
-    ? `🗓️ Calendario USA (⭐️⭐️/⭐️⭐️⭐️) — Semana ${monday}–${sunday}`
-    : `🗓️ Calendario USA (⭐️⭐️/⭐️⭐️⭐️) — Hoy ${fmtDate(new Date())}`;
-
-  let sentPhoto=false;
-
-  if(!skipPNG && events.length){
-    console.log('Generando PNG…');
-    let ok=false;
-    try {
-      ok = await withTimeout(drawPNG(events, caption), 20000, 'drawPNG');
-    } catch (e) {
-      console.error('drawPNG timeout/fallo:', e.message);
-    }
-    if(ok && fs.existsSync('calendar.png')){
-      console.log('Enviando PNG…');
-      try {
-        await sendTelegramPhoto(token, chatId, caption, 'calendar.png');
-        sentPhoto=true;
-      } catch (e) {
-        console.error('Fallo enviando PNG, continúo con texto:', e.message);
-      }
-    } else {
-      console.log('PNG no generado a tiempo, continúo con texto.');
-    }
-  } else if (skipPNG) {
-    console.log('SKIP_PNG=1 → salto imagen y envío solo texto.');
+  // Render texto (investing por defecto)
+  let html = buildInvestingStyle(events, weekly);
+  if(!html){
+    const {monday,sunday} = weekRangeES();
+    const caption = weekly
+      ? `🗓️ Calendario USA — Semana ${monday}–${sunday} (${TZ})`
+      : `🗓️ Calendario USA — Hoy ${fmtDateES(new Date())} (${TZ})`;
+    html = `${caption}\n\n(No hay eventos relevantes).`;
   }
 
-  const summary=buildSummary(events, !weekly);
-  if(summary){
-    console.log('Enviando resumen…');
-    await sendTelegramText(token, chatId, summary);
-  } else if(!sentPhoto){
-    console.log('Enviando aviso sin eventos…');
-    await sendTelegramText(token, chatId, `🗓️ ${caption}\n\n(No hay eventos relevantes).`);
-  }
+  console.log('Enviando texto…');
+  await sendTelegramText(token, chatId, html);
 
   console.log('OK fin cron.');
   clearTimeout(watchdog);
