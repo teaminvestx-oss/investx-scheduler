@@ -7,6 +7,29 @@ const fs = require('fs');
 const path = require('path');
 const PImage = require('pureimage');
 
+/* ====== runtimes: fetch / FormData / Blob (fallback a undici si no existen) ====== */
+let _fetch = global.fetch;
+let _FormData = global.FormData;
+let _Blob = global.Blob;
+let _AbortController = global.AbortController;
+
+(async () => {
+  if (!_fetch || !_FormData || !_Blob || !_AbortController) {
+    try {
+      const undici = await import('undici');
+      _fetch = _fetch || undici.fetch;
+      _FormData = _FormData || undici.FormData;
+      _Blob = _Blob || undici.Blob;
+      _AbortController = _AbortController || undici.AbortController;
+      console.log('[bootstrap] Usando undici como polyfill de fetch/FormData/Blob/AbortController');
+    } catch (e) {
+      console.error('No hay fetch/FormData/Blob nativos y falló undici. Instala undici o usa Node >= 18.');
+      process.exit(1);
+    }
+  }
+})();
+
+/* ================== util: zona horaria y formatos ================== */
 const TZ = 'Europe/Madrid';
 const NOW = () => {
   const d = new Date();
@@ -29,27 +52,42 @@ const weekRangeISO = () => {
   return { monday: fmtDate(mon), sunday: fmtDate(sun) };
 };
 
-/* ------------ util: fetch con timeout y reintentos ------------ */
-async function fetchWithTimeout(url, { timeoutMs=15000, retries=2, headers={} } = {}) {
+/* ================== fetch con timeout + reintentos genérico ================== */
+async function fetchWithTimeout(url, {
+  timeoutMs = 15000,
+  retries = 2,
+  retryDelayBaseMs = 800,   // backoff: base * (intento+1)
+  method = 'GET',
+  headers = {},
+  body = undefined,
+} = {}) {
   let lastErr;
-  for (let i=0; i<=retries; i++) {
-    const ctrl = new AbortController();
-    const timer = setTimeout(()=>ctrl.abort(new Error('Timeout')), timeoutMs);
+  for (let i = 0; i <= retries; i++) {
+    const ctrl = new _AbortController();
+    const timer = setTimeout(() => ctrl.abort(new Error('Timeout')), timeoutMs);
     try {
-      const res = await fetch(url, { headers, signal: ctrl.signal });
+      const res = await _fetch(url, { method, headers, body, signal: ctrl.signal });
       clearTimeout(timer);
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      if (!res.ok) {
+        // intentar leer texto para diagnosticar
+        let txt = '';
+        try { txt = await res.text(); } catch(_){}
+        throw new Error(`HTTP ${res.status}${txt ? ` — ${txt.slice(0,200)}`:''}`);
+      }
       return res;
     } catch (e) {
       clearTimeout(timer);
       lastErr = e;
-      if (i < retries) await new Promise(r=>setTimeout(r, 800*(i+1)));
+      if (i < retries) {
+        const delay = retryDelayBaseMs * (i + 1);
+        await new Promise(r => setTimeout(r, delay));
+      }
     }
   }
   throw lastErr || new Error('fetch failed');
 }
 
-/* ------------ Datos: ForexFactory JSON (semana) ------------ */
+/* ================== Datos: ForexFactory JSON (semana) ================== */
 async function fetchFFWeek() {
   const url = `https://nfs.faireconomy.media/ff_calendar_thisweek.json?_=${Date.now()}`;
   const res = await fetchWithTimeout(url, {
@@ -72,8 +110,8 @@ function filterEvents(raw, onlyToday) {
         date: fmtDate(dt),
         time: fmtTime(dt),
         title: (e.title||'').trim(),
-        forecast: (e.forecast||'').toString().trim(),
-        previous: (e.previous||'').toString().trim(),
+        forecast: (e.forecast??'').toString().trim(),
+        previous: (e.previous??'').toString().trim(),
         impact: (e.impact||'').toLowerCase()
       };
     })
@@ -81,30 +119,39 @@ function filterEvents(raw, onlyToday) {
     .sort((a,b)=>(a.date+a.time).localeCompare(b.date+b.time));
 }
 
-/* ------------ Imagen PNG (opcional) ------------ */
+/* ================== Imagen PNG (opcional) ================== */
 async function drawPNG(events, caption){
   try{
     const width=1200,rowH=56,headerH=100,shown=Math.min(events.length,22);
     const h=headerH+rowH*shown+40;
     const img=PImage.make(width,h); const ctx=img.getContext('2d');
+
+    // fondo
     ctx.fillStyle='#fff'; ctx.fillRect(0,0,width,h);
+
+    // fuente
     const f='/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf';
     if (fs.existsSync(f)) { const font=PImage.registerFont(f,'UI'); await font.load(); }
 
+    // cabecera
     ctx.fillStyle='#111'; ctx.font='32pt UI, Arial';
     ctx.fillText('Calendario económico USA (⭐️⭐️/⭐️⭐️⭐️)',28,56);
     ctx.font='18pt UI, Arial'; ctx.fillStyle='#444'; ctx.fillText(caption,28,86);
 
+    // encabezados tabla
     ctx.fillStyle='#222'; ctx.font='16pt UI, Arial';
     ctx.fillText('Fecha',28,headerH); ctx.fillText('Hora',140,headerH);
     ctx.fillText('Evento',230,headerH); ctx.fillText('Forecast',900,headerH); ctx.fillText('Previo',1040,headerH);
     ctx.strokeStyle='#e5e7eb'; ctx.beginPath(); ctx.moveTo(20,headerH+10); ctx.lineTo(width-20,headerH+10); ctx.stroke();
 
+    // filas
     ctx.font='15pt UI, Arial';
     let y=headerH+40;
     for (const e of events.slice(0,shown)) {
       ctx.fillStyle='#111'; ctx.fillText(e.date,28,y); ctx.fillText(e.time,140,y);
-      const maxW=650; let t=e.title||''; while(t.length && ctx.measureText(t+'…').width>maxW) t=t.slice(0,-1);
+      // truncado simple por ancho
+      const maxW=650; let t=e.title||''; 
+      while (t.length && ctx.measureText(t+'…').width>maxW) t=t.slice(0,-1);
       if ((e.title||'').length!==t.length) t+='…';
       ctx.fillText(t,230,y);
       ctx.fillStyle='#2563eb'; ctx.fillText(e.forecast||'-',900,y);
@@ -112,13 +159,22 @@ async function drawPNG(events, caption){
       ctx.strokeStyle='#f3f4f6'; ctx.beginPath(); ctx.moveTo(20,y+14); ctx.lineTo(width-20,y+14); ctx.stroke();
       y+=rowH;
     }
+
+    // export
     const out=fs.createWriteStream('calendar.png');
-    await PImage.encodePNGToStream(img,out); await new Promise(r=>out.on('finish',r));
+    await PImage.encodePNGToStream(img,out); 
+    await new Promise((r,rej)=>{
+      out.on('finish',r); 
+      out.on('error',rej);
+    });
     return true;
-  }catch(e){ console.error('PNG generation failed:', e.message); return false; }
+  }catch(e){ 
+    console.error('PNG generation failed:', e.message); 
+    return false; 
+  }
 }
 
-/* ------------ Texto resumen ------------ */
+/* ================== Texto resumen ================== */
 function buildSummary(events, onlyToday){
   if(!events.length) return '';
   const top=events.slice(0,4);
@@ -129,42 +185,73 @@ function buildSummary(events, onlyToday){
   }).join("\n\n");
 }
 
-/* ------------ Telegram ------------ */
+/* ================== Telegram helpers (con reintentos) ================== */
 async function sendTelegramPhoto(token, chatId, caption, filePath){
   const url=`https://api.telegram.org/bot${token}/sendPhoto`;
-  const form=new FormData();
-  form.append('chat_id',chatId);
-  form.append('caption',caption);
-  form.append('parse_mode','HTML');
-  form.append('photo', new Blob([fs.readFileSync(filePath)]), path.basename(filePath));
-  const r=await fetchWithTimeout(url,{timeoutMs:15000},); // sin headers extra
-  // fetchWithTimeout devuelve Response, pero necesitamos POST:
-  const r2=await fetch(url,{method:'POST',body:form});
-  const txt=await r2.text();
-  if(!r2.ok) throw new Error(`sendPhoto failed: ${r2.status} ${txt}`);
+
+  // construir form-data
+  const form = new _FormData();
+  form.append('chat_id', chatId);
+  form.append('caption', caption);
+  form.append('parse_mode', 'HTML');
+
+  // Node Blob acepta Buffer
+  const fileBuf = fs.readFileSync(filePath);
+  const filename = path.basename(filePath);
+  form.append('photo', new _Blob([fileBuf]), filename);
+
+  const res = await fetchWithTimeout(url, {
+    method: 'POST',
+    body: form,
+    timeoutMs: 15000,
+    retries: 2,
+    // headers: form.getHeaders?.() — innecesario para undici/fetch: lo pone solo
+  });
+  const json = await res.json();
+  if (!json.ok) throw new Error(`sendPhoto Telegram error: ${JSON.stringify(json)}`);
   console.log('Telegram photo OK');
 }
+
 async function sendTelegramText(token, chatId, html){
   const url=`https://api.telegram.org/bot${token}/sendMessage`;
-  const body=new URLSearchParams({chat_id:chatId,text:html,parse_mode:'HTML',disable_web_page_preview:'true'});
-  const r=await fetch(url,{method:'POST',body});
-  const txt=await r.text();
-  if(!r.ok) throw new Error(`sendMessage failed: ${r.status} ${txt}`);
+  const body = new URLSearchParams({
+    chat_id: chatId,
+    text: html,
+    parse_mode: 'HTML',
+    disable_web_page_preview: 'true'
+  });
+  const res = await fetchWithTimeout(url, {
+    method: 'POST',
+    body,
+    timeoutMs: 15000,
+    retries: 2,
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' }
+  });
+  const json = await res.json();
+  if (!json.ok) throw new Error(`sendMessage Telegram error: ${JSON.stringify(json)}`);
   console.log('Telegram text OK');
 }
+
 async function verifyTelegram(token, chatId){
   if(!process.env.VERIFY_TELEGRAM) return;
   console.log('VERIFY_TELEGRAM=1 → ping de prueba…');
   await sendTelegramText(token, chatId, '✅ InvestX cron conectado (ping).');
 }
 
-/* ------------ Main con watchdog ------------ */
+/* ================== Main con watchdog ================== */
 (async ()=>{
   // watchdog global: mata proceso a los 3 min
-  const watchdog = setTimeout(()=>{ console.error('Watchdog: timeout global alcanzado, salgo.'); process.exit(1); }, 3*60*1000);
+  const watchdog = setTimeout(()=>{ 
+    console.error('Watchdog: timeout global alcanzado, salgo.'); 
+    process.exit(1); 
+  }, 3*60*1000);
 
   const token=process.env.INVESTX_TOKEN, chatId=process.env.CHAT_ID;
-  if(!token||!chatId){ console.error('Faltan INVESTX_TOKEN / CHAT_ID'); clearTimeout(watchdog); process.exit(1); }
+  if(!token||!chatId){ 
+    console.error('Faltan INVESTX_TOKEN / CHAT_ID'); 
+    clearTimeout(watchdog); 
+    process.exit(1); 
+  }
 
   console.log(`[${NOW()}] Start. CHAT_ID=${chatId}`);
   await verifyTelegram(token, chatId);
@@ -182,14 +269,18 @@ async function verifyTelegram(token, chatId){
     ? `🗓️ Calendario USA (⭐️⭐️/⭐️⭐️⭐️) — Semana ${monday}–${sunday}`
     : `🗓️ Calendario USA (⭐️⭐️/⭐️⭐️⭐️) — Hoy ${fmtDate(new Date())}`;
 
-  let sent=false;
+  let sentPhoto=false;
   if(events.length){
     console.log('Generando PNG…');
     const ok=await drawPNG(events, caption);
     if(ok && fs.existsSync('calendar.png')){
       console.log('Enviando PNG…');
-      await sendTelegramPhoto(token, chatId, caption, 'calendar.png');
-      sent=true;
+      try {
+        await sendTelegramPhoto(token, chatId, caption, 'calendar.png');
+        sentPhoto=true;
+      } catch (e) {
+        console.error('Fallo enviando PNG, continúo con texto:', e.message);
+      }
     } else {
       console.log('PNG no generado, continuaré con texto.');
     }
@@ -201,11 +292,14 @@ async function verifyTelegram(token, chatId){
   if(summary){
     console.log('Enviando resumen…');
     await sendTelegramText(token, chatId, summary);
-  } else if(!sent){
+  } else if(!sentPhoto){
     console.log('Enviando aviso sin eventos…');
     await sendTelegramText(token, chatId, `🗓️ ${caption}\n\n(No hay eventos relevantes).`);
   }
 
   console.log('OK fin cron.');
   clearTimeout(watchdog);
-})().catch(err=>{ console.error('ERROR:', err); process.exit(1); });
+})().catch(err=>{ 
+  console.error('ERROR:', err && err.stack ? err.stack : err); 
+  process.exit(1); 
+});
