@@ -1,20 +1,25 @@
 /* =========================================================================
    📅 InvestX Economic Calendar — SOLO ForexFactory (JSON)
-   CommonJS puro (sin imports), compatible con Node 18+ (fetch nativo).
+   CommonJS .cjs (sin imports), compatible con Node 18+ (fetch nativo).
    - Lunes: semanal   · Mar–Vie: diario · Finde: opcional (BLOCK_WEEKENDS=1)
    - Rango forzado: FORCE_DATE_FROM / FORCE_DATE_TO (YYYY-MM-DD)
    - Mezcla feeds thisweek + nextweek
    - Filtro USD por país/moneda + impacto (⭐️⭐️/⭐️⭐️⭐️)
-   - VERBOSE=1 para diagnóstico en logs
+   - VERBOSE=1 para ver los primeros objetos del feed y sample de eventos
    ========================================================================= */
 
+console.log('Node runtime:', process.version);
+
 const TZ = process.env.TZ || 'Europe/Madrid';
-const VERBOSE = (process.env.VERBOSE || process.env.LOG_VERBOSE || '').toString().toLowerCase() === '1' || (process.env.VERBOSE||'').toLowerCase()==='true';
+const VERBOSE = (process.env.VERBOSE || process.env.LOG_VERBOSE || '')
+  .toString().toLowerCase() === '1' || (process.env.VERBOSE||'').toLowerCase()==='true';
 
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 const fmtDateISO = (d) => {
-  // yyyy-mm-dd en TZ
-  const parts = Object.fromEntries(new Intl.DateTimeFormat('sv-SE', { timeZone: TZ, dateStyle: 'short' }).formatToParts(d).map(x=>[x.type,x.value]));
+  const parts = Object.fromEntries(
+    new Intl.DateTimeFormat('sv-SE', { timeZone: TZ, dateStyle: 'short' })
+      .formatToParts(d).map(x=>[x.type,x.value])
+  );
   return `${parts.year}-${parts.month}-${parts.day}`;
 };
 const fmtDateES = (d) => new Intl.DateTimeFormat('es-ES', { timeZone: TZ, day:'2-digit', month:'2-digit', year:'numeric' }).format(d);
@@ -51,8 +56,7 @@ async function fetchWithTimeout(url, { timeoutMs=15000, retries=2, headers={}, m
       if(!res.ok) throw new Error(`HTTP ${res.status}`);
       return res;
     }catch(e){
-      clearTimeout(t);
-      last=e;
+      clearTimeout(t); last=e;
       if(i<retries) await sleep(600*(i+1));
     }
   }
@@ -106,9 +110,10 @@ function buildEventsFromFF(raw,{fromISO,toISO,impactMin='medium'}){
 
   const out=[];
   for(const e of (raw||[])){
-    const cc = ((e.country||e.countryCode||'')+'').toUpperCase();
-    const cur= ((e.currency||'')+'').toUpperCase();
-    const isUSD = cc==='USD' || cc==='US' || cur==='USD' || /united\s*states/i.test(e.country||'');
+    const cc  = ((e.country||e.countryCode||'')+'').toUpperCase();
+    const cur = ((e.currency||'')+'').toUpperCase();
+    const name= (e.countryName||e.country||'');
+    const isUSD = cc==='USD' || cc==='US' || cur==='USD' || /united\s*states|estados\s*unidos/i.test(name);
     if(!isUSD) continue;
 
     const imp=(e.impact||'').toString().toLowerCase();
@@ -136,7 +141,6 @@ function buildEventsFromFF(raw,{fromISO,toISO,impactMin='medium'}){
 
 /* -------- formato mensaje -------- */
 function limitTelegram(s){ return s.length>3900 ? s.slice(0,3870)+'\n…recortado' : s; }
-
 function buildWeeklyMessageWithHeader(events, header){
   const head=`🗓️ <b>Calendario Económico (🇺🇸)</b> — ${header} (${TZ})\nImpacto: ⭐️⭐️ (medio) · ⭐️⭐️⭐️ (alto)\n\n`;
   if(!events.length) return `${head}No hay eventos de EE. UU. con el filtro actual.`;
