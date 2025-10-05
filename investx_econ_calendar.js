@@ -1,12 +1,11 @@
-/* InvestX Economic Calendar — Formato aprobado (ES)
-   - Lunes: Semanal por días (A)
-   - Mar–Vie: Diario simple (B)
-   - Fines de semana: opcionalmente no ejecuta (BLOCK_WEEKENDS=1)
+/* InvestX Economic Calendar — FUENTE: Investing (widget público)
+   Formato: hora — ⭐️ — evento (ES), agrupado por día
+   Lunes => semanal | Mar–Vie => diario | Fines de semana => opcionalmente no ejecuta
    Requiere env: INVESTX_TOKEN, CHAT_ID
    Opcional:
-     COUNTRY=USD                 // "USD" o "USD,EUR,GBP"
-     IMPACT_MIN=medium|high      // mínimo impacto
-     BLOCK_WEEKENDS=1            // no ejecutar sáb/dom
+     TZ=Europe/Madrid
+     IMPACT_MIN=medium|high
+     BLOCK_WEEKENDS=1
 */
 
 let _fetch = global.fetch, _FormData = global.FormData, _AbortController = global.AbortController;
@@ -18,15 +17,13 @@ async function ensureHTTP(){
     _fetch = _fetch || undici.fetch;
     _FormData = _FormData || undici.FormData;
     _AbortController = _AbortController || undici.AbortController;
-    console.log('[bootstrap] undici cargado');
   } catch {
     console.error('No hay fetch nativo y no se pudo cargar undici. Usa Node >=18 o instala undici.');
     process.exit(1);
   }
 }
 
-/* ================== Zona horaria y helpers ================== */
-const TZ = 'Europe/Madrid';
+const TZ = process.env.TZ || 'Europe/Madrid';
 
 const fmtDateISO = d => new Intl.DateTimeFormat('sv-SE', { timeZone: TZ, dateStyle:'short' }).format(d);  // yyyy-mm-dd
 const fmtDateES  = d => new Intl.DateTimeFormat('es-ES', { timeZone: TZ, day:'2-digit', month:'2-digit', year:'numeric' }).format(d);
@@ -35,7 +32,6 @@ const weekdayES  = d => {
   const s = new Intl.DateTimeFormat('es-ES', { timeZone: TZ, weekday:'long' }).format(d);
   return s.charAt(0).toUpperCase() + s.slice(1);
 };
-const weekdayShortES = d => new Intl.DateTimeFormat('es-ES', { timeZone: TZ, weekday:'short' }).format(d);
 
 function isMonday(){
   return new Intl.DateTimeFormat('en-GB', { timeZone: TZ, weekday:'short' })
@@ -46,17 +42,21 @@ function isWeekend(){
                .format(new Date()).toLowerCase();
   return wd==='sat' || wd==='sun';
 }
-function weekRangeES(){
+function weekRangeDates(){
   const d = new Date();
   const wd = ['sun','mon','tue','wed','thu','fri','sat']
     .indexOf(new Intl.DateTimeFormat('en-US',{timeZone:TZ,weekday:'short'}).format(d).toLowerCase());
   const diff = wd===0 ? -6 : 1-wd;
   const mon = new Date(d); mon.setDate(d.getDate()+diff);
   const sun = new Date(mon); sun.setDate(mon.getDate()+6);
+  return { mon, sun };
+}
+function weekRangeES(){
+  const { mon, sun } = weekRangeDates();
   return { monday: fmtDateES(mon), sunday: fmtDateES(sun) };
 }
 
-/* ================== HTTP con timeout + reintentos ================== */
+/* ---------------- HTTP con timeout + reintentos ---------------- */
 async function fetchWithTimeout(url, {
   timeoutMs=15000, retries=2, retryDelayBaseMs=800, method='GET', headers={}, body
 }={}){
@@ -82,164 +82,155 @@ async function fetchWithTimeout(url, {
   throw lastErr || new Error('fetch failed');
 }
 
-/* ================== Fuente: ForexFactory JSON (semana) ================== */
-async function fetchFFWeek(){
-  const url = `https://nfs.faireconomy.media/ff_calendar_thisweek.json?_=${Date.now()}`;
-  const res = await fetchWithTimeout(url, { headers: { 'User-Agent':'Mozilla/5.0', 'Accept':'application/json' }});
-  return res.json();
+/* ---------------- Fuente: Investing widget (HTML) ----------------
+   Endpoint: https://ec.forexprostools.com/ (embed)
+   Parámetros usados:
+     - country=5              (Estados Unidos)
+     - importance=2,3         (medium/high)
+     - dateFrom=YYYY-MM-DD
+     - dateTo=YYYY-MM-DD
+     - timeZone=56            (~Europe/Madrid en el widget)
+     - lang=12                (español)
+     - columns=exc_date,exc_time,exc_event,exc_importance
+------------------------------------------------------------------*/
+function buildInvestingURL({dateFrom, dateTo, importance, country='5', timeZone='56', lang='12'}){
+  const cols = 'exc_date,exc_time,exc_event,exc_importance';
+  const params = new URLSearchParams({
+    country, importance, timeZone, lang,
+    dateFrom, dateTo, columns: cols
+  });
+  return `https://ec.forexprostools.com/?${params.toString()}`;
 }
 
-/* ================== Parsing robusto fecha/hora ================== */
-function parseDateFromFF(e){
-  const raw = e.timestamp;
-  if (typeof raw === 'number' && isFinite(raw) && raw>0) return new Date(raw*1000);
-  if (typeof raw === 'string' && /^\d+$/.test(raw))     return new Date(Number(raw)*1000);
-  if (typeof e.datetime === 'string' && !Number.isNaN(Date.parse(e.datetime))) return new Date(e.datetime);
-  if (e.date && e.time){
-    const ts = Date.parse(`${e.date} ${e.time}`);
-    if (!Number.isNaN(ts)) return new Date(ts);
+/* ---------------- Parseador HTML básico ---------------- */
+function parseInvestingHTML(html){
+  // El widget devuelve una tabla con <tr> por evento.
+  // Vamos a extraer con regex/DOM-lite sin dependencias externas.
+  const rows = [];
+  // Romper por filas
+  const trRegex = /<tr[^>]*?>([\s\S]*?)<\/tr>/gi;
+  let m;
+  while ((m = trRegex.exec(html)) !== null){
+    const tr = m[1];
+
+    // Columna hora (ej: 14:30)
+    const timeMatch = tr.match(/<td[^>]*class="first-time"[^>]*>([\s\S]*?)<\/td>/i)
+                    || tr.match(/<td[^>]*data-title="Hora"[^>]*>([\s\S]*?)<\/td>/i)
+                    || tr.match(/<td[^>]*class="time"[^>]*>([\s\S]*?)<\/td>/i);
+    let time = sanitize(stripTags(timeMatch ? timeMatch[1] : ''));
+
+    // Fecha (día) aparece como fila separadora o en columna; capturamos si está en este <tr>
+    const dateMatch = tr.match(/<td[^>]*data-title="Fecha"[^>]*>([\s\S]*?)<\/td>/i)
+                   || tr.match(/<td[^>]*class="theDay"[^>]*>([\s\S]*?)<\/td>/i);
+    let date = sanitize(stripTags(dateMatch ? dateMatch[1] : ''));
+
+    // Evento (texto en español si lang=12)
+    const evMatch = tr.match(/<td[^>]*class="event"[^>]*>([\s\S]*?)<\/td>/i)
+                  || tr.match(/<td[^>]*data-title="Evento"[^>]*>([\s\S]*?)<\/td>/i);
+    let title = sanitize(stripTags(evMatch ? evMatch[1] : ''));
+
+    // Impacto: cuentan los "bullX" / estrellas. En el widget a veces son <i class="icon icon--bullish N"> o imgs.
+    // Buscamos 3 o 2 marcas:
+    let stars = '⭐️⭐️'; // por defecto medium
+    if (/bull(3|ish\s*3)|star.?3|alta/i.test(tr)) stars = '⭐️⭐️⭐️';
+    else if (/bull(2|ish\s*2)|star.?2|media/i.test(tr)) stars = '⭐️⭐️';
+
+    // Filtrar filas que no son eventos (cabeceras vacías)
+    if (!title || !time) continue;
+
+    rows.push({ date, time, title, stars });
   }
-  return null; // mejor omitir que inventar hora
+  return rows;
 }
 
-/* ================== Traducción / iconos ================== */
-function translateTitleES(t){
-  const s = t.trim(); const x = s.toLowerCase();
-  const repl = [
-    [/^unemployment claims\b/i, 'Peticiones de subsidio por desempleo'],
-    [/^continuing jobless claims\b/i, 'Peticiones continuadas de subsidio'],
-    [/non-?farm.*(payroll|employment)/i, 'Empleo no agrícola (NFP)'],
-    [/^unemployment rate\b/i, 'Tasa de desempleo'],
-    [/average hourly earnings.*m\/m/i, 'Salario medio por hora m/m'],
-    [/average hourly earnings.*y\/y/i, 'Salario medio por hora a/a'],
-    [/fomc.*minutes/i, 'Minutas del FOMC'],
-    [/fed chair.*speaks|powell.*speaks|remarks/i, 'Discurso de Powell (Fed)'],
-    [/^trade balance\b|^goods trade balance\b/i, 'Balanza comercial'],
-    [/^exports\b/i, 'Exportaciones'],
-    [/^imports\b/i, 'Importaciones'],
-    [/^ism.*services.*pmi/i, 'ISM de servicios'],
-    [/^ism.*manufacturing.*pmi/i, 'ISM manufacturero'],
-    [/^jolts.*openings/i, 'Vacantes JOLTS'],
-    [/core.*cpi.*m\/m/i, 'IPC subyacente m/m'],
-    [/core.*cpi.*y\/y/i, 'IPC subyacente a/a'],
-    [/^cpi.*m\/m/i, 'IPC m/m'],
-    [/^cpi.*y\/y/i, 'IPC a/a'],
-    [/core.*pce.*m\/m/i, 'Índice PCE subyacente m/m'],
-    [/^retail sales.*m\/m/i, 'Ventas minoristas m/m'],
-  ];
-  for (const [rx, es] of repl) if (rx.test(s)) return es;
-  return s;
-}
-function decorateTitle(t){
-  const x = t.toLowerCase();
-  if (/(cpi|ipc|pce|inflación)/i.test(t)) return '📊 ' + escapeTxt(t);
-  if (/(nfp|empleo no agrícola|payroll)/i.test(x)) return '📊 ' + escapeTxt(t);
-  if (/(fomc|powell|fed)/i.test(x)) return '🗣️ ' + escapeTxt(t);
-  return escapeTxt(t);
-}
-function escapeTxt(s){ return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
-function impactToStars(impact){ return /high/i.test(impact) ? '⭐️⭐️⭐️' : '⭐️⭐️'; }
+function stripTags(s){ return String(s).replace(/<[^>]*>/g,''); }
+function sanitize(s){ return stripTags(s).replace(/\s+/g,' ').trim(); }
 
-/* ================== Filtros y normalización ================== */
-function filterEvents(raw, onlyToday){
-  const todayISO = fmtDateISO(new Date());
-  const countries = (process.env.COUNTRY||'USD').split(',').map(s=>s.trim().toUpperCase()).filter(Boolean);
-  const impactMin = (process.env.IMPACT_MIN||'medium').toLowerCase();
-  const rank = v => /high/i.test(v) ? 2 : /medium/i.test(v) ? 1 : 0;
-  const minRank = impactMin==='high' ? 2 : 1;
-
-  const seenKey = new Set();
+/* ---------------- Normalización a estructura por día ---------------- */
+function groupByDay(rows){
+  // Algunas filas no traen fecha en cada <tr>; Investing mete separadores de día en filas aparte.
+  // Estrategia: recordamos el "día actual" cuando encontramos una fila que trae fecha,
+  // y lo aplicamos a las siguientes filas hasta que cambie.
   const out = [];
+  let currentDay = null;
 
-  for (const e of raw){
-    if (!countries.includes((e.country||'').toUpperCase())) continue;
-    if (rank(e.impact||'') < minRank) continue;
+  for (const r of rows){
+    // Si la 'date' luce como 'martes, 07 oct' o '07/10/2025', la adoptamos
+    if (r.date && r.date.length >= 6) currentDay = r.date;
+    if (!currentDay) continue; // no sabemos a qué día pertenece aún
 
-    const dt = parseDateFromFF(e);
-    if (!dt) continue;
-
-    const rec = {
-      ts: dt.getTime(),
-      dateISO: fmtDateISO(dt),
-      dateES: fmtDateES(dt),
-      timeES: fmtTime(dt),
-      weekdayES: weekdayES(dt),
-      titleES: translateTitleES(String(e.title||'')),
-      impactStars: impactToStars(e.impact||''),
-    };
-
-    if (onlyToday && rec.dateISO !== todayISO) continue;
-
-    // dedupe: clave por (fechaISO, horaES, título normalizado)
-    const k = `${rec.dateISO}|${rec.timeES}|${rec.titleES.toLowerCase()}`;
-    if (seenKey.has(k)) continue;
-    seenKey.add(k);
-
-    out.push(rec);
+    out.push({
+      dayLabel: normalizeDayES(currentDay),   // "Martes 07/10/2025"
+      time: r.time,
+      title: decorateTitleES(r.title),
+      stars: r.stars
+    });
   }
-
-  out.sort((a,b)=> (a.ts - b.ts) || a.titleES.localeCompare(b.titleES));
   return out;
 }
 
-/* ================== Formateadores (A y B) ================== */
-function buildWeeklyA(events){
-  const tz = 'Europe/Madrid';
-  const {monday, sunday} = weekRangeES();
-  if (!events.length){
-    return `🗓️ Calendario Económico (🇺🇸) — Semana ${monday}–${sunday} (${tz})\nNo hay eventos de EE. UU. con el filtro actual.`;
-  }
+function normalizeDayES(s){
+  // Intentar convertir formatos tipo "martes, 07 oct" a DD/MM/YYYY si fuera posible;
+  // si no, lo dejamos capitalizado.
+  const cap = s.charAt(0).toUpperCase() + s.slice(1);
+  // Si ya viene con formato dd/mm o dd/mm/aaaa, lo dejamos.
+  if (/\d{1,2}\/\d{1,2}/.test(cap)) return cap;
+  return cap;
+}
 
-  // agrupar por día
+function decorateTitleES(t){
+  const x = t.toLowerCase();
+  if (/ipc|cpi|inflaci|pce/.test(x)) return '📊 ' + t;
+  if (/nfp|no agrícola|payroll|desempleo/.test(x)) return '📊 ' + t;
+  if (/fomc|powell|fed/.test(x)) return '🗣️ ' + t;
+  return t;
+}
+
+/* ---------------- Construcción de mensaje ---------------- */
+function buildWeeklyMessage(events){
+  const { monday, sunday } = weekRangeES();
+  const header = `🗓️ Calendario Económico (🇺🇸) — Semana ${monday}–${sunday} (${TZ})\nImpacto: ⭐️⭐️ (medio) · ⭐️⭐️⭐️ (alto)\n`;
+  if (!events.length) return `${header}\nNo hay eventos de EE. UU. con el filtro actual.`;
+
+  // Agrupar por dayLabel manteniendo orden
   const map = new Map();
-  for (const ev of events){
-    const key = `${ev.weekdayES} ${ev.dateES}`;
-    if (!map.has(key)) map.set(key, []);
-    map.get(key).push(ev);
+  for (const e of events){
+    if (!map.has(e.dayLabel)) map.set(e.dayLabel, []);
+    map.get(e.dayLabel).push(e);
   }
 
-  const lines = [
-    `🗓️ Calendario Económico (🇺🇸) — Semana ${monday}–${sunday} (${tz})`,
-    `Impacto: ⭐️⭐️ (medio) · ⭐️⭐️⭐️ (alto)`,
-    ''
-  ];
-
+  const lines = [header];
   for (const [day, arr] of map){
-    lines.push(`${day}`);
-    // si hay demasiados, limita a 5 por día y añade “+n más…”
+    lines.push(day);
     const MAX = 5;
     const slice = arr.slice(0, MAX);
     for (const ev of slice){
-      lines.push(`• ${ev.timeES} — ${ev.impactStars} — ${decorateTitle(ev.titleES)}`);
+      lines.push(`• ${ev.time} — ${ev.stars} — ${ev.title}`);
     }
     if (arr.length > MAX) lines.push(`  +${arr.length - MAX} más…`);
     lines.push('');
   }
-
-  let txt = lines.join('\n').trim();
-  if (txt.length > 3900) txt = txt.slice(0, 3870) + '\n…recortado';
-  return txt;
+  return limitTelegram(lines.join('\n').trim());
 }
 
-function buildDailyB(events){
-  const tz = 'Europe/Madrid';
-  if (!events.length){
-    return `🗓️ Calendario (🇺🇸) — Hoy ${fmtDateES(new Date())} (${tz})\nHoy no hay eventos de EE. UU.`;
-  }
-  const lines = [
-    `🗓️ Calendario (🇺🇸) — Hoy ${events[0].dateES} (${tz})`,
-    `Impacto: ⭐️⭐️ / ⭐️⭐️⭐️`,
-    ''
-  ];
+function buildDailyMessage(events){
+  const today = fmtDateES(new Date());
+  const header = `🗓️ Calendario (🇺🇸) — Hoy ${today} (${TZ})\nImpacto: ⭐️⭐️ / ⭐️⭐️⭐️\n`;
+  if (!events.length) return `${header}\nHoy no hay eventos de EE. UU.`;
+
+  // Suponemos que todos pertenecen al mismo día (hoy)
+  const lines = [header];
   for (const ev of events){
-    lines.push(`• ${ev.timeES} — ${ev.impactStars} — ${decorateTitle(ev.titleES)}`);
+    lines.push(`• ${ev.time} — ${ev.stars} — ${ev.title}`);
   }
-  let txt = lines.join('\n').trim();
-  if (txt.length > 3900) txt = txt.slice(0, 3870) + '\n…recortado';
-  return txt;
+  return limitTelegram(lines.join('\n').trim());
 }
 
-/* ================== Telegram ================== */
+function limitTelegram(txt){
+  return txt.length > 3900 ? (txt.slice(0, 3870) + '\n…recortado') : txt;
+}
+
+/* ---------------- Telegram ---------------- */
 async function sendTelegramText(token, chatId, text){
   await ensureHTTP();
   const url = `https://api.telegram.org/bot${token}/sendMessage`;
@@ -252,7 +243,7 @@ async function sendTelegramText(token, chatId, text){
   console.log('Telegram OK');
 }
 
-/* ================== Main ================== */
+/* ---------------- Main ---------------- */
 (async ()=>{
   if ((process.env.BLOCK_WEEKENDS||'').trim()==='1' && isWeekend()){
     console.log('Fin de semana (Europe/Madrid) → no ejecuto.');
@@ -260,19 +251,46 @@ async function sendTelegramText(token, chatId, text){
   }
 
   const token = process.env.INVESTX_TOKEN, chatId = process.env.CHAT_ID;
-  if (!token || !chatId){
-    console.error('Faltan INVESTX_TOKEN / CHAT_ID');
-    process.exit(1);
+  if (!token || !chatId){ console.error('Faltan INVESTX_TOKEN / CHAT_ID'); process.exit(1); }
+
+  const weekly = isMonday(); // Lunes => semanal
+  const importance = (process.env.IMPACT_MIN||'medium').toLowerCase()==='high' ? '3' : '2,3';
+
+  let dateFrom, dateTo;
+  if (weekly){
+    const { mon, sun } = weekRangeDates();
+    dateFrom = fmtDateISO(mon);
+    dateTo   = fmtDateISO(sun);
+  } else {
+    const d = new Date();
+    dateFrom = fmtDateISO(d);
+    dateTo   = fmtDateISO(d);
   }
 
-  const weekly = isMonday(); // Lunes: semanal (A) — resto: diario (B)
-  console.log(`[${new Date().toISOString()}] weekly=${weekly} — descargando feed…`);
-  const raw = await fetchFFWeek();
+  const url = buildInvestingURL({ dateFrom, dateTo, importance });
+  console.log('URL Investing:', url);
 
-  const events = filterEvents(raw, !weekly);
-  console.log(`Eventos tras filtro: ${events.length}`);
+  const res = await fetchWithTimeout(url, {
+    headers: { 'User-Agent':'Mozilla/5.0', 'Accept':'text/html' },
+    timeoutMs: 20000,
+    retries: 2
+  });
+  const html = await res.text();
 
-  const msg = weekly ? buildWeeklyA(events) : buildDailyB(events);
+  const rawRows = parseInvestingHTML(html);
+  console.log(`Filas parseadas (crudas): ${rawRows.length}`);
+
+  // Convertir a estructura por día con títulos decorados + estrellas
+  let events = groupByDay(rawRows);
+
+  // Filtro extra: si pediste solo high
+  if ((process.env.IMPACT_MIN||'medium').toLowerCase()==='high'){
+    events = events.filter(e => e.stars === '⭐️⭐️⭐️');
+  }
+
+  console.log(`Eventos tras filtros: ${events.length}`);
+
+  const msg = weekly ? buildWeeklyMessage(events) : buildDailyMessage(events);
   await sendTelegramText(token, chatId, msg);
 
   console.log('Fin OK');
