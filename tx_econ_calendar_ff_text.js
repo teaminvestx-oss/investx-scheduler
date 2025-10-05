@@ -1,14 +1,12 @@
 /* =========================================================================
-   📅 InvestX Economic Calendar — SOLO ForexFactory (JSON)
-   CommonJS .cjs (sin imports), compatible con Node 18+ (fetch nativo).
-   - Lunes: semanal   · Mar–Vie: diario · Finde: opcional (BLOCK_WEEKENDS=1)
+   📅 InvestX Economic Calendar — ForexFactory (JSON)
+   CommonJS puro (Node 18+ con fetch nativo)
+   - Lunes: semanal · Mar–Vie: diario · Finde: opcional (BLOCK_WEEKENDS=1)
    - Rango forzado: FORCE_DATE_FROM / FORCE_DATE_TO (YYYY-MM-DD)
-   - Mezcla feeds thisweek + nextweek
-   - Filtro USD por país/moneda + impacto (⭐️⭐️/⭐️⭐️⭐️)
-   - VERBOSE=1 para ver los primeros objetos del feed y sample de eventos
+   - Mezcla thisweek + nextweek
+   - Filtro USD + impacto (Medium/High)
+   - VERBOSE=1 para diagnósticos
    ========================================================================= */
-
-console.log('Node runtime:', process.version);
 
 const TZ = process.env.TZ || 'Europe/Madrid';
 const VERBOSE = (process.env.VERBOSE || process.env.LOG_VERBOSE || '')
@@ -16,17 +14,17 @@ const VERBOSE = (process.env.VERBOSE || process.env.LOG_VERBOSE || '')
 
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 const fmtDateISO = (d) => {
-  const parts = Object.fromEntries(
+  const p = Object.fromEntries(
     new Intl.DateTimeFormat('sv-SE', { timeZone: TZ, dateStyle: 'short' })
       .formatToParts(d).map(x=>[x.type,x.value])
   );
-  return `${parts.year}-${parts.month}-${parts.day}`;
+  return `${p.year}-${p.month}-${p.day}`;
 };
-const fmtDateES = (d) => new Intl.DateTimeFormat('es-ES', { timeZone: TZ, day:'2-digit', month:'2-digit', year:'numeric' }).format(d);
-const fmtTime    = (d) => new Intl.DateTimeFormat('es-ES', { timeZone: TZ, hour:'2-digit', minute:'2-digit', hour12:false }).format(d);
-const weekdayES  = (d) => { const s = new Intl.DateTimeFormat('es-ES',{ timeZone:TZ, weekday:'long'}).format(d); return s.charAt(0).toUpperCase()+s.slice(1); };
-const isMonday   = () => new Intl.DateTimeFormat('en-GB',{timeZone:TZ,weekday:'short'}).format(new Date()).toLowerCase()==='mon';
-const isWeekend  = () => ['sat','sun'].includes(new Intl.DateTimeFormat('en-US',{timeZone:TZ,weekday:'short'}).format(new Date()).toLowerCase());
+const fmtDateES = (d) => new Intl.DateTimeFormat('es-ES',{timeZone:TZ,day:'2-digit',month:'2-digit',year:'numeric'}).format(d);
+const fmtTime   = (d) => new Intl.DateTimeFormat('es-ES',{timeZone:TZ,hour:'2-digit',minute:'2-digit',hour12:false}).format(d);
+const weekdayES = (d) => { const s=new Intl.DateTimeFormat('es-ES',{timeZone:TZ,weekday:'long'}).format(d); return s[0].toUpperCase()+s.slice(1); };
+const isMonday  = () => new Intl.DateTimeFormat('en-GB',{timeZone:TZ,weekday:'short'}).format(new Date()).toLowerCase()==='mon';
+const isWeekend = () => ['sat','sun'].includes(new Intl.DateTimeFormat('en-US',{timeZone:TZ,weekday:'short'}).format(new Date()).toLowerCase());
 
 function weekRangeDates(){
   const d=new Date();
@@ -44,40 +42,37 @@ function weekMondayISO(dateISO){
   return fmtDateISO(mon);
 }
 
-/* -------- fetch con timeout/reintentos -------- */
-async function fetchWithTimeout(url, { timeoutMs=15000, retries=2, headers={}, method='GET', body } = {}){
+/* ------------ fetch con timeout ------------ */
+async function fetchWithTimeout(url,{timeoutMs=15000,retries=2,headers={},method='GET',body}={}){
   let last;
   for(let i=0;i<=retries;i++){
-    const ctrl = new AbortController();
-    const t = setTimeout(()=>ctrl.abort(new Error('Timeout')), timeoutMs);
+    const ctrl=new AbortController();
+    const t=setTimeout(()=>ctrl.abort(new Error('Timeout')),timeoutMs);
     try{
-      const res = await fetch(url, { signal: ctrl.signal, headers, method, body });
+      const r=await fetch(url,{signal:ctrl.signal,headers,method,body});
       clearTimeout(t);
-      if(!res.ok) throw new Error(`HTTP ${res.status}`);
-      return res;
-    }catch(e){
-      clearTimeout(t); last=e;
-      if(i<retries) await sleep(600*(i+1));
-    }
+      if(!r.ok) throw new Error(`HTTP ${r.status}`);
+      return r;
+    }catch(e){ clearTimeout(t); last=e; if(i<retries) await sleep(600*(i+1)); }
   }
   throw last||new Error('fetch failed');
 }
 
-/* -------- feeds FF -------- */
+/* ------------ feeds FF ------------ */
 async function fetchFFWeek(){
-  const r = await fetchWithTimeout(`https://nfs.faireconomy.media/ff_calendar_thisweek.json?_=${Date.now()}`, { headers:{'User-Agent':'Mozilla/5.0','Accept':'application/json'}, timeoutMs:20000 });
-  const j = await r.json(); if(VERBOSE) console.log('thisweek items:', Array.isArray(j)?j.length:0); return j;
+  const r=await fetchWithTimeout(`https://nfs.faireconomy.media/ff_calendar_thisweek.json?_=${Date.now()}`,{headers:{'User-Agent':'Mozilla/5.0','Accept':'application/json'},timeoutMs:20000});
+  const j=await r.json(); if(VERBOSE) console.log('thisweek items:', Array.isArray(j)?j.length:0); return j;
 }
 async function fetchFFNextWeek(){
-  const r = await fetchWithTimeout(`https://nfs.faireconomy.media/ff_calendar_nextweek.json?_=${Date.now()}`, { headers:{'User-Agent':'Mozilla/5.0','Accept':'application/json'}, timeoutMs:20000 });
-  const j = await r.json(); if(VERBOSE) console.log('nextweek items:', Array.isArray(j)?j.length:0); return j;
+  const r=await fetchWithTimeout(`https://nfs.faireconomy.media/ff_calendar_nextweek.json?_=${Date.now()}`,{headers:{'User-Agent':'Mozilla/5.0','Accept':'application/json'},timeoutMs:20000});
+  const j=await r.json(); if(VERBOSE) console.log('nextweek items:', Array.isArray(j)?j.length:0); return j;
 }
 
-/* -------- helpers de texto -------- */
+/* ------------ helpers ------------ */
 function impactToStars(impact){
   const s=(impact||'').toString().toLowerCase();
-  if (s.includes('high')) return '⭐️⭐️⭐️';
-  if (s.includes('medium')) return '⭐️⭐️';
+  if(s.includes('high')) return '⭐️⭐️⭐️';
+  if(s.includes('medium')) return '⭐️⭐️';
   return '⭐️';
 }
 function translateTitleES(t){
@@ -102,29 +97,45 @@ function translateTitleES(t){
 }
 function decorateTitleES(t){ const x=t.toLowerCase(); if(/ipc|cpi|inflaci|pce/.test(x)) return '📊 '+t; if(/nfp|no agrícola|payroll|desempleo/.test(x)) return '📊 '+t; if(/fomc|powell|fed/.test(x)) return '🗣️ '+t; return t; }
 
-/* -------- construir eventos -------- */
+/* ------------ construir eventos ------------ */
 function buildEventsFromFF(raw,{fromISO,toISO,impactMin='medium'}){
   const wantHighOnly = (impactMin||'medium').toLowerCase()==='high';
-  const start = new Date(fromISO+'T00:00:00');
-  const end   = new Date(toISO  +'T23:59:59');
+  const start=new Date(fromISO+'T00:00:00');
+  const end  =new Date(toISO  +'T23:59:59');
+
+  let cntUSD=0, cntImpact=0, cntRange=0;
 
   const out=[];
   for(const e of (raw||[])){
-    const cc  = ((e.country||e.countryCode||'')+'').toUpperCase();
+    // 1) USD por cualquiera de estos campos:
+    const cc  = ((e.country||e.countryCode||'')+'').toUpperCase();  // a veces 'USD' (!)
     const cur = ((e.currency||'')+'').toUpperCase();
     const name= (e.countryName||e.country||'');
     const isUSD = cc==='USD' || cc==='US' || cur==='USD' || /united\s*states|estados\s*unidos/i.test(name);
     if(!isUSD) continue;
+    cntUSD++;
 
+    // 2) Impacto: Medium/High
     const imp=(e.impact||'').toString().toLowerCase();
     const rank = imp.includes('high') ? 2 : imp.includes('medium') ? 1 : 0;
     if (rank===0) continue;
     if (wantHighOnly && rank<2) continue;
+    cntImpact++;
 
-    const ts = Number(e.timestamp)||0;
-    if(!ts) continue;
-    const dt=new Date(ts*1000);
+    // 3) Fecha/hora: usar timestamp si existe, si no e.date (ISO con offset)
+    let dt=null;
+    if (e.timestamp) {
+      const ts=Number(e.timestamp)||0;
+      if (ts) dt=new Date(ts*1000);
+    }
+    if (!dt && e.date){
+      // ej: '2025-10-06T03:00:00-04:00'
+      const d = new Date(String(e.date));
+      if(!isNaN(d.getTime())) dt=d;
+    }
+    if (!dt) continue;
     if (dt<start || dt>end) continue;
+    cntRange++;
 
     out.push({
       dayKey: fmtDateISO(dt),
@@ -135,11 +146,16 @@ function buildEventsFromFF(raw,{fromISO,toISO,impactMin='medium'}){
       id: e.id || e.newsId || e.newsid || null
     });
   }
+
+  if (VERBOSE) {
+    console.log(`DBG · USD: ${cntUSD} | impacto>=min: ${cntImpact} | en rango: ${cntRange}`);
+  }
+
   out.sort((a,b)=> a.dayKey.localeCompare(b.dayKey) || a.time.localeCompare(b.time));
   return out;
 }
 
-/* -------- formato mensaje -------- */
+/* ------------ formato mensaje ------------ */
 function limitTelegram(s){ return s.length>3900 ? s.slice(0,3870)+'\n…recortado' : s; }
 function buildWeeklyMessageWithHeader(events, header){
   const head=`🗓️ <b>Calendario Económico (🇺🇸)</b> — ${header} (${TZ})\nImpacto: ⭐️⭐️ (medio) · ⭐️⭐️⭐️ (alto)\n\n`;
@@ -156,7 +172,7 @@ function buildWeeklyMessageWithHeader(events, header){
   return limitTelegram(lines.join('\n').trim());
 }
 
-/* -------- Telegram -------- */
+/* ------------ Telegram ------------ */
 async function sendTelegramText(token, chatId, html){
   const url=`https://api.telegram.org/bot${token}/sendMessage`;
   const body=new URLSearchParams({chat_id:chatId,text:html,parse_mode:'HTML',disable_web_page_preview:'true'});
@@ -191,7 +207,7 @@ async function sendTelegramText(token, chatId, html){
       console.log('CFG:', { daily:true, fromISO, toISO, impact: process.env.IMPACT_MIN||'medium', tz: TZ, verbose: VERBOSE });
     }
 
-    // Descarga feeds (siempre thisweek; nextweek si rango pisa la siguiente semana o hay forzado)
+    // Descarga feeds (thisweek + nextweek si hace falta)
     let raw=[];
     const thisW = await fetchFFWeek(); if(Array.isArray(thisW)) raw=raw.concat(thisW);
     const thisMonISO = weekMondayISO(fmtDateISO(new Date()));
@@ -202,25 +218,28 @@ async function sendTelegramText(token, chatId, html){
     }
     console.log('Total items raw (this+next):', raw.length);
 
-    // DEBUG: muestra primeros elementos del JSON
+    // DEBUG: muestra primeros objetos
     if(VERBOSE && raw.length){
       console.log('--- Primeros elementos del feed ForexFactory ---');
-      for (const e of raw.slice(0,5)){
+      for(const e of raw.slice(0,5)){
         console.log({
           id: e.id || e.newsId || e.newsid,
-          title: e.title, country: e.country, countryCode: e.countryCode,
-          currency: e.currency, impact: e.impact, timestamp: e.timestamp, date: e.date
+          title: e.title,
+          country: e.country,
+          countryCode: e.countryCode,
+          currency: e.currency,
+          impact: e.impact,
+          timestamp: e.timestamp,
+          date: e.date
         });
       }
       console.log('-----------------------------------------------');
     }
 
-    // Construir eventos
     const events = buildEventsFromFF(raw,{fromISO,toISO,impactMin:(process.env.IMPACT_MIN||'medium')});
     console.log('Eventos FF dentro de rango:', events.length);
     if(VERBOSE) console.log('sample events:', events.slice(0,3));
 
-    // Mensaje + envío
     const msg = buildWeeklyMessageWithHeader(events, headerLabel);
     await sendTelegramText(token, chatId, msg);
     console.log('Telegram OK · Fin');
