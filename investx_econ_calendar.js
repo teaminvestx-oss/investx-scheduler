@@ -1,7 +1,7 @@
 /* InvestX Economic Calendar — SOLO ForexFactory (JSON) + descripción opcional (ES)
    Formato: hora — ⭐️ — evento (ES), agrupado por día.
    Lunes => semanal | Mar–Vie => diario | Sáb/Dom => opcionalmente no ejecuta.
-   PRUEBA rango: FORCE_DATE_FROM / FORCE_DATE_TO (YYYY-MM-DD).
+   PRUEBA rango: FORCE_DATE_FROM / FORCE_DATE_TO (YYYY-MM-DD) o flags CLI --from/--to.
 
    ENV requeridos:
      INVESTX_TOKEN, CHAT_ID
@@ -29,6 +29,11 @@ function isMonday(){return new Intl.DateTimeFormat('en-GB',{timeZone:TZ,weekday:
 function isWeekend(){const w=new Intl.DateTimeFormat('en-US',{timeZone:TZ,weekday:'short'}).format(new Date()).toLowerCase(); return w==='sat'||w==='sun';}
 function weekRangeDates(){const d=new Date();const wd=['sun','mon','tue','wed','thu','fri','sat'].indexOf(new Intl.DateTimeFormat('en-US',{timeZone:TZ,weekday:'short'}).format(d).toLowerCase());const diff=wd===0?-6:1-wd;const mon=new Date(d);mon.setDate(d.getDate()+diff);const sun=new Date(mon);sun.setDate(mon.getDate()+6);return{mon,sun};}
 function weekRangeES(){const {mon,sun}=weekRangeDates();return{monday:fmtDateES(mon),sunday:fmtDateES(sun)};}
+function parseArgs(){ // lee --from=YYYY-MM-DD --to=YYYY-MM-DD
+  const out={}; for(const a of process.argv.slice(2)){ const m=a.match(/^--(from|to)=(\d{4}-\d{2}-\d{2})$/); if(m) out[m[1]]=m[2]; }
+  return out;
+}
+function isISODate(s){ return /^\d{4}-\d{2}-\d{2}$/.test(s||''); }
 
 /* ---------- HTTP con timeout y reintentos ---------- */
 async function fetchWithTimeout(url,{timeoutMs=15000,retries=2,method='GET',headers={},body}={}){
@@ -46,7 +51,7 @@ async function fetchWithTimeout(url,{timeoutMs=15000,retries=2,method='GET',head
   throw lastErr || new Error('fetch failed');
 }
 
-/* ---------- Fuente: ForexFactory JSON (esta semana / próxima) ---------- */
+/* ---------- ForexFactory JSON (esta semana / próxima) ---------- */
 async function fetchFFWeek(){
   const url=`https://nfs.faireconomy.media/ff_calendar_thisweek.json?_=${Date.now()}`;
   const res=await fetchWithTimeout(url,{headers:{'User-Agent':'Mozilla/5.0','Accept':'application/json'}});
@@ -66,7 +71,7 @@ function weekMonday(dateISO){
   return fmtDateISO(mon); // yyyy-mm-dd
 }
 
-/* ---------- Traducción + decoración de títulos ---------- */
+/* ---------- Traducción + decoración ---------- */
 function impactToStars(impact){ return /high/i.test(impact)?'⭐️⭐️⭐️':'⭐️⭐️'; }
 function translateTitleES(t){
   const s=t.trim();
@@ -90,7 +95,7 @@ function translateTitleES(t){
 }
 function decorateTitleES(t){ const x=t.toLowerCase(); if(/ipc|cpi|inflaci|pce/.test(x)) return '📊 '+t; if(/nfp|no agrícola|payroll|desempleo/.test(x)) return '📊 '+t; if(/fomc|powell|fed/.test(x)) return '🗣️ '+t; return t; }
 
-/* ---------- Enriquecimiento: descripción desde ficha FF + DeepL ---------- */
+/* ---------- Enriquecimiento: descripción FF + DeepL ---------- */
 async function fetchFFDescription(newsId){
   const urls = [
     `https://www.forexfactory.com/calendar?newsid=${newsId}`,
@@ -129,7 +134,7 @@ async function translateWithDeepL(text){
 }
 function stripTags(s){ return String(s).replace(/<[^>]*>/g,''); }
 
-/* ---------- Construir eventos desde FF ---------- */
+/* ---------- Construcción de eventos ---------- */
 function buildEventsFromFF(ff,{fromISO,toISO,impactMin='medium'}){
   const minRank=impactMin==='high'?2:1; const rank=v=>/high/i.test(v)?2:/medium/i.test(v)?1:0;
   const out=[];
@@ -217,36 +222,43 @@ async function sendTelegramText(token,chatId,text){
 
   const weekly=isMonday();
 
-  // Fechas (rango forzado o normal) + etiqueta de header para rangos forzados
+  // ==== Lectura robusta de rango forzado ====
+  const args = parseArgs();
+  const envFrom = (process.env.FORCE_DATE_FROM||'').trim();
+  const envTo   = (process.env.FORCE_DATE_TO||'').trim();
+  const forceFrom = isISODate(args.from) ? args.from : (isISODate(envFrom) ? envFrom : null);
+  const forceTo   = isISODate(args.to)   ? args.to   : (isISODate(envTo)   ? envTo   : null);
+
+  console.log('CFG:', {
+    script: 'ff_text',
+    weekly,
+    forceFrom, forceTo,
+    impact: process.env.IMPACT_MIN || 'medium',
+    includeDetails: process.env.INCLUDE_DETAILS || '0',
+    tz: TZ
+  });
+
+  // Fechas (rango forzado o normal) + etiqueta header
   let fromISO,toISO, headerRangeLabel=null;
-  if(process.env.FORCE_DATE_FROM && process.env.FORCE_DATE_TO){
-    fromISO=process.env.FORCE_DATE_FROM.trim();
-    toISO=process.env.FORCE_DATE_TO.trim();
+  if(forceFrom && forceTo){
+    fromISO=forceFrom; toISO=forceTo;
     headerRangeLabel = `${fmtDateES(new Date(fromISO+'T00:00:00'))}–${fmtDateES(new Date(toISO+'T00:00:00'))}`;
-    console.log(`🔧 Prueba: ${fromISO}→${toISO}`);
+    console.log(`🔧 Prueba ACTIVADA: ${fromISO}→${toISO}`);
   } else if(weekly){
     const {mon,sun}=weekRangeDates(); fromISO=fmtDateISO(mon); toISO=fmtDateISO(sun);
   } else {
     const d=new Date(); fromISO=fmtDateISO(d); toISO=fmtDateISO(d);
   }
 
-  // Descargar thisweek y, si corresponde, nextweek y mezclar
+  // Descargar thisweek y, si hay forzado, también nextweek (siempre mezclamos en forzado)
   let raw = [];
   try {
     const thisW = await fetchFFWeek(); raw = raw.concat(thisW||[]);
-    const thisMonISO = weekMonday(fmtDateISO(new Date()));   // lunes semana actual
-    const forceMonISO = weekMonday(fromISO);                 // lunes del rango pedido
-    const oneWeekAhead = (a,b) => {
-      const A = new Date(a+'T00:00:00').getTime();
-      const B = new Date(b+'T00:00:00').getTime();
-      const diffDays = Math.round((A-B)/86400000);
-      return diffDays >= 6 && diffDays <= 8; // ~7 ±1 por TZ
-    };
-    if (process.env.FORCE_DATE_FROM && oneWeekAhead(forceMonISO, thisMonISO)) {
+    if (forceFrom && forceTo){
       try{
         const nextW = await fetchFFNextWeek();
         raw = raw.concat(nextW||[]);
-        console.log(`FF nextweek añadido: ${nextW?.length||0} items`);
+        console.log(`FF nextweek añadido (forzado): ${nextW?.length||0} items`);
       }catch(e){ console.warn('Aviso: no pude cargar ff_calendar_nextweek.json:', e.message); }
     }
   } catch(e){
@@ -276,7 +288,7 @@ async function sendTelegramText(token,chatId,text){
   }
 
   // Mensaje
-  const msg = (process.env.FORCE_DATE_FROM && process.env.FORCE_DATE_TO)
+  const msg = (forceFrom && forceTo)
     ? buildWeeklyMessageWithCustomHeader(events, headerRangeLabel)
     : (weekly ? buildWeeklyMessage(events) : buildDailyMessage(events));
 
