@@ -240,7 +240,7 @@ async function buildEvents(fromISO, toISO) {
 function limitTelegram(s) { return s.length > 3900 ? s.slice(0, 3870) + '\n…recortado' : s; }
 function buildMessage(events, header) {
   const head = `🗓️ <b>Calendario Económico (🇺🇸)</b> — ${header} (${TZ})\nImpacto: ⭐️⭐️ (medio) · ⭐️⭐️⭐️ (alto)\n\n`;
-  if (!events.length) return `${head}No hay eventos de EE. UU. con el filtro actual.`;
+  if (!events.length) return `${head}No hay eventos de EE. UU. en el día de hoy.`;
   const map = new Map(); for (const e of events) { if (!map.has(e.dayLabel)) map.set(e.dayLabel, []); map.get(e.dayLabel).push(e); }
   const lines = [head];
   for (const [day, arr] of map) {
