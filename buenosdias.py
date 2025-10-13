@@ -1,5 +1,5 @@
-# buenosdias.py – InvestX (saludo + snapshot pre-market + macro + sesgo)
-# Corrige % de acciones en premarket (sin usar regular_market_change_percent)
+# buenosdias.py – InvestX (saludo + snapshot pre-market + macro + sesgo + debug)
+# v1.5: premarket % robusto (prioriza .info -> fast_info -> history), modo DEBUG_SOURCES
 # Requiere: requests, python-dateutil, yfinance, pandas, numpy, lxml
 
 import os, argparse, datetime, logging, math
@@ -9,7 +9,9 @@ import yfinance as yf
 from requests.adapters import HTTPAdapter, Retry
 from dateutil import tz
 
-VERSION = "InvestX buenosdias v1.4"
+VERSION = "InvestX buenosdias v1.5"
+
+DEBUG_SOURCES = os.environ.get("DEBUG_SOURCES", "0") in ("1", "true", "TRUE")
 
 # ------------------------- Utilidades -------------------------
 def get_env(name, *aliases) -> str:
@@ -76,54 +78,80 @@ def fmt_price(x, suffix: str = ""):
     s = f"{x:.2f}" if abs(x) < 1000 else f"{x:,.0f}".replace(",", ".")
     return s + suffix
 
-def fetch_quote(ticker: str, prefer_premarket: bool) -> tuple[float|None, float|None, float|None, str]:
+def fetch_quote(ticker: str, *, prefer_premarket: bool) -> tuple[float|None, float|None, float|None, str]:
     """
-    Devuelve (price, previous_close, change_percent, source).
-    - prefer_premarket=True (acciones/ETFs antes de la apertura): usa pre_market_change_percent si existe; si no, calcula (precio_pre vs prev_close). No usa regular_market_change_percent.
-    - prefer_premarket=False (futuros, macro, cripto): calcula con (price vs prev).
+    Devuelve (price, previous_close, change_percent, source_tag).
+    Prioridad:
+      1) tk.info: preMarketPrice / preMarketChangePercent / regularMarketPreviousClose
+      2) tk.fast_info
+      3) history() 1m/1d
+    - prefer_premarket=True: NUNCA usamos regular_market_change_percent (evita falsos rojos).
     """
     try:
         tk = yf.Ticker(ticker)
         src = []
 
+        # ---------- 1) info ----------
+        info = {}
+        try:
+            info = tk.get_info() or {}
+        except Exception as e:
+            logging.info(f"[info] {ticker} error: {e}")
+
+        pre_i   = info.get("preMarketPrice")
+        prev_i  = info.get("regularMarketPreviousClose")
+        pre_cp_i= info.get("preMarketChangePercent")  # ya va en %
+
+        # ---------- 2) fast_info ----------
         fi = getattr(tk, "fast_info", {}) or {}
-        pre   = fi.get("pre_market_price")
-        post  = fi.get("post_market_price")
-        last  = fi.get("last_price")
-        prev  = fi.get("previous_close")
-        pre_cp = fi.get("pre_market_change_percent")  # 0.0123 => 1.23%
+        pre_f   = fi.get("pre_market_price")
+        last_f  = fi.get("last_price")
+        post_f  = fi.get("post_market_price")
+        prev_f  = fi.get("previous_close")
+        pre_cp_f= fi.get("pre_market_change_percent")  # fracción (0.0123 -> 1.23%)
 
-        # precio
-        price = pre if pre not in (None, 0) else (last if last not in (None, 0) else post)
-        if price is not None: src.append("fast_info")
+        # precio preferido (premarket > last > post)
+        price = None
+        if pre_i not in (None, 0): price, src_price = pre_i, "info.pre"
+        elif pre_f not in (None, 0): price, src_price = pre_f, "fast.pre"
+        elif last_f not in (None, 0): price, src_price = last_f, "fast.last"
+        elif post_f not in (None, 0): price, src_price = post_f, "fast.post"
+        else: price, src_price = None, "none"
 
-        # fallbacks de precio
+        prev = prev_i if prev_i not in (None, 0) else prev_f
+        src_prev = "info.prev" if prev_i not in (None, 0) else ("fast.prev" if prev_f not in (None, 0) else "none")
+
+        # % premarket preferido (solo si prefer_premarket)
+        change_pct = None
+        if prefer_premarket and pre_cp_i not in (None,):
+            change_pct, src_pct = float(pre_cp_i), "info.pre_cp"
+        elif prefer_premarket and pre_cp_f not in (None,):
+            change_pct, src_pct = float(pre_cp_f)*100.0, "fast.pre_cp"
+        else:
+            # Fallback cálculo manual (para futuros, macro, cripto o si no hay pre_cp)
+            src_pct = "manual"
+
+        # fallbacks de precio si aún no hay
         if price is None:
             h1m = tk.history(period="1d", interval="1m", prepost=True)
             if isinstance(h1m, pd.DataFrame) and not h1m.empty:
-                price = float(h1m["Close"].dropna().iloc[-1]); src.append("1m")
+                price = float(h1m["Close"].dropna().iloc[-1]); src_price = "hist.1m"
         if prev is None:
             h1d = tk.history(period="5d", interval="1d", prepost=True)
             if isinstance(h1d, pd.DataFrame) and len(h1d.dropna()) >= 2:
-                prev = float(h1d["Close"].dropna().iloc[-2]); src.append("1d_prev")
+                prev = float(h1d["Close"].dropna().iloc[-2]); src_prev = "hist.1dprev"
+
+        # cripto: si sigue sin precio, usa 1m sin prepost
         if price is None and ticker.endswith("-USD"):
             h1m2 = tk.history(period="1d", interval="1m")
             if isinstance(h1m2, pd.DataFrame) and not h1m2.empty:
-                price = float(h1m2["Close"].dropna().iloc[-1]); src.append("1m_crypto")
+                price = float(h1m2["Close"].dropna().iloc[-1]); src_price = "hist.1m.crypto"
 
-        # % cambio
-        change_pct = None
-        if ticker.endswith("-USD"):
+        if change_pct is None:
             change_pct = pct(price, prev) if (price is not None and prev is not None) else None
-        elif prefer_premarket:
-            if pre_cp is not None:
-                change_pct = float(pre_cp) * 100.0; src.append("pre_cp")
-            else:
-                change_pct = pct(price, prev) if (price is not None and prev is not None) else None; src.append("manual_pre")
-        else:
-            change_pct = pct(price, prev) if (price is not None and prev is not None) else None; src.append("manual")
 
-        return price, prev, change_pct, "+".join(src) or "none"
+        src_tag = f"{src_price}|{src_prev}|{src_pct}"
+        return price, prev, change_pct, src_tag
     except Exception as e:
         logging.info(f"[yfinance] {ticker} error: {e}")
         return None, None, None, "error"
@@ -132,32 +160,35 @@ def fetch_many(tickers: list[str], *, prefer_premarket: bool) -> dict[str, tuple
     return {t: fetch_quote(t, prefer_premarket=prefer_premarket) for t in tickers}
 
 # ------------------------- Bloques -------------------------
-DEFAULT_FUTURES   = ["ES=F","NQ=F","YM=F"]                              # E-mini S&P / Nasdaq / Dow
+DEFAULT_FUTURES   = ["ES=F","NQ=F","YM=F"]
 DEFAULT_WATCHLIST = ["SPY","QQQ","AAPL","MSFT","NVDA","AMZN","META","TSLA","BTC-USD","ETH-USD"]
-DEFAULT_MACRO     = ["^VIX","^TNX","DX-Y.NYB","BZ=F"]                   # VIX / US10Y / DXY / Brent
+DEFAULT_MACRO     = ["^VIX","^TNX","DX-Y.NYB","BZ=F"]
 
 def macro_suffix(t: str) -> str:
     return "%" if t == "^TNX" else ""
+
+def maybe_src(tag: str) -> str:
+    return f" <i>({tag})</i>" if DEBUG_SOURCES else ""
 
 def build_premarket_block() -> tuple[str, dict]:
     futs = [s.strip() for s in os.environ.get("FUTURES","").split(",") if s.strip()] or DEFAULT_FUTURES
     wl   = [s.strip() for s in os.environ.get("WATCHLIST","").split(",") if s.strip()] or DEFAULT_WATCHLIST
 
-    snap_fut = fetch_many(futs, prefer_premarket=False)   # futuros: manual vs prev
-    snap_wl  = fetch_many(wl,   prefer_premarket=True)    # acciones/ETF: prioriza premarket
+    snap_fut = fetch_many(futs, prefer_premarket=False)
+    snap_wl  = fetch_many(wl,   prefer_premarket=True)
 
     lines = []
     lines.append("<b>📈 Pre-Market (UTC) / Futuros</b>")
     for t in futs:
-        price, _prev, chg, _ = snap_fut.get(t, (None, None, None, ""))
-        lines.append(f"<code>{t:<6}</code>  {fmt_price(price):>8}  {fmt_pct(chg)}")
+        price, _prev, chg, src = snap_fut.get(t, (None, None, None, ""))
+        lines.append(f"<code>{t:<6}</code>  {fmt_price(price):>8}  {fmt_pct(chg)}{maybe_src(src)}")
 
     lines.append("")
     lines.append("<b>🏷️ Acciones & Cripto</b>")
     for t in wl:
         label = "Spot" if t.endswith("-USD") else "Pre"
-        price, _prev, chg, _ = snap_wl.get(t, (None, None, None, ""))
-        lines.append(f"<code>{t:<8}</code> {fmt_price(price):>10}  {fmt_pct(chg)}  <i>{label}</i>")
+        price, _prev, chg, src = snap_wl.get(t, (None, None, None, ""))
+        lines.append(f"<code>{t:<8}</code> {fmt_price(price):>10}  {fmt_pct(chg)}  <i>{label}</i>{maybe_src(src)}")
 
     return "\n".join(lines), {"futures": snap_fut, "watch": snap_wl}
 
@@ -166,33 +197,27 @@ def build_macro_block() -> tuple[str, dict]:
     snap  = fetch_many(macro, prefer_premarket=False)
     lines = ["", "<b>📊 Macro</b>"]
     for t in macro:
-        price, _prev, chg, _ = snap.get(t, (None, None, None, ""))
-        lines.append(f"<code>{t:<8}</code> {fmt_price(price, macro_suffix(t)):>10}  {fmt_pct(chg)}")
+        price, _prev, chg, src = snap.get(t, (None, None, None, ""))
+        lines.append(f"<code>{t:<8}</code> {fmt_price(price, macro_suffix(t)):>10}  {fmt_pct(chg)}{maybe_src(src)}")
     return "\n".join(lines), snap
 
-# ------------------------- Sesgo macro (heurístico ligero) -------------------------
+# ------------------------- Sesgo macro -------------------------
 def macro_bias(snap_fut: dict, snap_macro: dict) -> str:
-    # coge % de ES=F, y de macro: ^VIX, ^TNX, DX-Y.NYB
-    def get_chg(d: dict, k: str):
-        tup = d.get(k)
-        return tup[2] if tup else None
+    def chg(d, k):
+        tup = d.get(k); return tup[2] if tup else None
 
-    es = get_chg(snap_fut, "ES=F")
-    vix = get_chg(snap_macro, "^VIX")
-    tnx = get_chg(snap_macro, "^TNX")
-    dxy = get_chg(snap_macro, "DX-Y.NYB")
+    es  = chg(snap_fut, "ES=F")
+    vix = chg(snap_macro, "^VIX")
+    tnx = chg(snap_macro, "^TNX")
+    dxy = chg(snap_macro, "DX-Y.NYB")
 
     score = 0.0
-    if es is not None:
-        score += 1.0 if es > 0.3 else (-1.0 if es < -0.3 else 0.0)
-    if vix is not None:
-        score += 1.0 if vix < -3 else (-1.0 if vix > 3 else 0.0)
-    if tnx is not None:
-        score += 0.5 if tnx < 0 else (-0.5 if tnx > 0 else 0.0)
-    if dxy is not None:
-        score += 0.5 if dxy < 0 else (-0.5 if dxy > 0 else 0.0)
+    if es is not None:  score += 1.0 if es > 0.3 else (-1.0 if es < -0.3 else 0.0)
+    if vix is not None: score += 1.0 if vix < -3  else (-1.0 if vix > 3  else 0.0)
+    if tnx is not None: score += 0.5 if tnx < 0   else (-0.5 if tnx > 0  else 0.0)
+    if dxy is not None: score += 0.5 if dxy < 0   else (-0.5 if dxy > 0  else 0.0)
 
-    if score >= 1.0: return "📊 Sesgo macro: <b>Alcista</b> 🟢"
+    if score >= 1.0:  return "📊 Sesgo macro: <b>Alcista</b> 🟢"
     if score <= -1.0: return "📊 Sesgo macro: <b>Defensivo</b> 🔴"
     return "📊 Sesgo macro: <b>Neutral</b> ⚪"
 
@@ -213,7 +238,7 @@ def main():
     now_utc = datetime.datetime.utcnow().replace(tzinfo=tz.UTC)
     local_tz = tz.gettz(args.tz)
     now_local = now_utc.astimezone(local_tz)
-    wd = now_local.weekday()  # 0=lunes … 6=domingo
+    wd = now_local.weekday()
 
     if not args.force and not args.allow_weekend and wd > 4:
         logging.info("Fin de semana: no se envía (use --allow-weekend o --force).")
@@ -246,4 +271,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
