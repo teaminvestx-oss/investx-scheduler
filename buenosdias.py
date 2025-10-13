@@ -1,5 +1,6 @@
-# buenosdias.py – InvestX (saludo + snapshot pre-market + macro + sesgo + debug)
-# v1.5: premarket % robusto (prioriza .info -> fast_info -> history), modo DEBUG_SOURCES
+# buenosdias.py – InvestX v1.6
+# - Acciones/ETFs: % premarket ESTRICTO = last(1m, prepost=True) vs last close (1d, prepost=False)
+# - Futuros/Macro/Cripto: cálculo robusto como antes
 # Requiere: requests, python-dateutil, yfinance, pandas, numpy, lxml
 
 import os, argparse, datetime, logging, math
@@ -9,16 +10,14 @@ import yfinance as yf
 from requests.adapters import HTTPAdapter, Retry
 from dateutil import tz
 
-VERSION = "InvestX buenosdias v1.5"
-
-DEBUG_SOURCES = os.environ.get("DEBUG_SOURCES", "0") in ("1", "true", "TRUE")
+VERSION = "InvestX buenosdias v1.6"
+DEBUG_SOURCES = os.environ.get("DEBUG_SOURCES", "0") in ("1","true","TRUE")
 
 # ------------------------- Utilidades -------------------------
 def get_env(name, *aliases) -> str:
     for k in (name, *aliases):
         v = os.environ.get(k)
-        if v:
-            return v
+        if v: return v
     alias_txt = (", alias: " + ", ".join(aliases)) if aliases else ""
     raise RuntimeError(f"Falta la variable de entorno: {name}{alias_txt}")
 
@@ -38,7 +37,7 @@ def telegram_send(text: str, *, token: str, chat_id: str, session: requests.Sess
     r = session.post(url, data=payload, timeout=session.request_timeout)
     r.raise_for_status()
 
-# ------------------------- Mensajes -------------------------
+# ------------------------- Saludo -------------------------
 MENSAJES = [
     "🌞 Buenos días equipo, arrancamos este {dia} con InvestX. Mercados listos, foco y disciplina.",
     "📊 ¡Buenos días traders! Hoy es {dia}. En InvestX seguimos marcando niveles clave.",
@@ -52,13 +51,11 @@ MENSAJES = [
 DIAS = ["lunes","martes","miércoles","jueves","viernes","sábado","domingo"]
 
 def stable_index(dt: datetime.datetime, n: int) -> int:
-    bucket = dt.hour // 3
-    return (dt.toordinal()*17 + dt.isocalendar().week*7 + bucket) % n
+    return (dt.toordinal()*17 + dt.isocalendar().week*7 + dt.hour//3) % n
 
 def build_greeting(dt_local: datetime.datetime, *, override_text: str | None = None) -> str:
     if override_text: return override_text
-    d = DIAS[dt_local.weekday()]
-    return MENSAJES[stable_index(dt_local, len(MENSAJES))].format(dia=d)
+    return MENSAJES[stable_index(dt_local, len(MENSAJES))].format(dia=DIAS[dt_local.weekday()])
 
 # ------------------------- Helpers precios -------------------------
 def pct(a, b):
@@ -78,86 +75,72 @@ def fmt_price(x, suffix: str = ""):
     s = f"{x:.2f}" if abs(x) < 1000 else f"{x:,.0f}".replace(",", ".")
     return s + suffix
 
-def fetch_quote(ticker: str, *, prefer_premarket: bool) -> tuple[float|None, float|None, float|None, str]:
-    """
-    Devuelve (price, previous_close, change_percent, source_tag).
-    Prioridad:
-      1) tk.info: preMarketPrice / preMarketChangePercent / regularMarketPreviousClose
-      2) tk.fast_info
-      3) history() 1m/1d
-    - prefer_premarket=True: NUNCA usamos regular_market_change_percent (evita falsos rojos).
-    """
+# --------- Núcleo: obtención de precios ---------
+def last_extended_price_1m(tk: yf.Ticker) -> float | None:
+    """Último precio de 1m incluyendo pre/after (usa prepost=True)."""
+    h = tk.history(period="1d", interval="1m", prepost=True)
+    if isinstance(h, pd.DataFrame) and not h.empty:
+        s = h["Close"].dropna()
+        return float(s.iloc[-1]) if not s.empty else None
+    return None
+
+def last_regular_close(tk: yf.Ticker) -> float | None:
+    """Último cierre regular fiable (no extendido)."""
+    h = tk.history(period="5d", interval="1d", prepost=False)
+    if isinstance(h, pd.DataFrame):
+        s = h["Close"].dropna()
+        if len(s) >= 1:
+            return float(s.iloc[-1])  # último cierre completo
+    return None
+
+def fetch_equity_etf_strict_premarket(ticker: str) -> tuple[float|None, float|None, float|None, str]:
+    """Para acciones/ETFs: % premarket estricto (1m prepost vs último close regular)."""
     try:
         tk = yf.Ticker(ticker)
-        src = []
+        price = last_extended_price_1m(tk)                                  # pre/after
+        prev  = last_regular_close(tk)                                      # cierre REGULAR
+        chg   = pct(price, prev) if (price is not None and prev is not None) else None
+        tag   = "strict(1m_prepost_vs_lastClose)"
+        return price, prev, chg, tag
+    except Exception as e:
+        logging.info(f"[strict] {ticker} error: {e}")
+        return None, None, None, "strict_error"
 
-        # ---------- 1) info ----------
-        info = {}
-        try:
-            info = tk.get_info() or {}
-        except Exception as e:
-            logging.info(f"[info] {ticker} error: {e}")
-
-        pre_i   = info.get("preMarketPrice")
-        prev_i  = info.get("regularMarketPreviousClose")
-        pre_cp_i= info.get("preMarketChangePercent")  # ya va en %
-
-        # ---------- 2) fast_info ----------
+def fetch_generic(ticker: str) -> tuple[float|None, float|None, float|None, str]:
+    """Futuros, macro, cripto: usa fast_info/info y cae a history."""
+    try:
+        tk = yf.Ticker(ticker)
         fi = getattr(tk, "fast_info", {}) or {}
-        pre_f   = fi.get("pre_market_price")
-        last_f  = fi.get("last_price")
-        post_f  = fi.get("post_market_price")
-        prev_f  = fi.get("previous_close")
-        pre_cp_f= fi.get("pre_market_change_percent")  # fracción (0.0123 -> 1.23%)
+        pre  = fi.get("pre_market_price")
+        last = fi.get("last_price")
+        post = fi.get("post_market_price")
+        prev = fi.get("previous_close")
 
-        # precio preferido (premarket > last > post)
-        price = None
-        if pre_i not in (None, 0): price, src_price = pre_i, "info.pre"
-        elif pre_f not in (None, 0): price, src_price = pre_f, "fast.pre"
-        elif last_f not in (None, 0): price, src_price = last_f, "fast.last"
-        elif post_f not in (None, 0): price, src_price = post_f, "fast.post"
-        else: price, src_price = None, "none"
+        price = pre if pre not in (None, 0) else (last if last not in (None, 0) else post)
+        src = "fast.pre" if pre not in (None, 0) else ("fast.last" if last not in (None, 0) else ("fast.post" if post not in (None, 0) else "none"))
 
-        prev = prev_i if prev_i not in (None, 0) else prev_f
-        src_prev = "info.prev" if prev_i not in (None, 0) else ("fast.prev" if prev_f not in (None, 0) else "none")
-
-        # % premarket preferido (solo si prefer_premarket)
-        change_pct = None
-        if prefer_premarket and pre_cp_i not in (None,):
-            change_pct, src_pct = float(pre_cp_i), "info.pre_cp"
-        elif prefer_premarket and pre_cp_f not in (None,):
-            change_pct, src_pct = float(pre_cp_f)*100.0, "fast.pre_cp"
-        else:
-            # Fallback cálculo manual (para futuros, macro, cripto o si no hay pre_cp)
-            src_pct = "manual"
-
-        # fallbacks de precio si aún no hay
         if price is None:
-            h1m = tk.history(period="1d", interval="1m", prepost=True)
-            if isinstance(h1m, pd.DataFrame) and not h1m.empty:
-                price = float(h1m["Close"].dropna().iloc[-1]); src_price = "hist.1m"
+            price = last_extended_price_1m(tk); src = "hist.1m"
         if prev is None:
-            h1d = tk.history(period="5d", interval="1d", prepost=True)
-            if isinstance(h1d, pd.DataFrame) and len(h1d.dropna()) >= 2:
-                prev = float(h1d["Close"].dropna().iloc[-2]); src_prev = "hist.1dprev"
+            prev  = last_regular_close(tk);      src += "+lastClose"
 
-        # cripto: si sigue sin precio, usa 1m sin prepost
+        # cripto: si aún no hay precio, usa 1m sin prepost
         if price is None and ticker.endswith("-USD"):
             h1m2 = tk.history(period="1d", interval="1m")
             if isinstance(h1m2, pd.DataFrame) and not h1m2.empty:
-                price = float(h1m2["Close"].dropna().iloc[-1]); src_price = "hist.1m.crypto"
+                price = float(h1m2["Close"].dropna().iloc[-1]); src = "hist.1m.crypto"
 
-        if change_pct is None:
-            change_pct = pct(price, prev) if (price is not None and prev is not None) else None
-
-        src_tag = f"{src_price}|{src_prev}|{src_pct}"
-        return price, prev, change_pct, src_tag
+        chg = pct(price, prev) if (price is not None and prev is not None) else None
+        return price, prev, chg, src
     except Exception as e:
-        logging.info(f"[yfinance] {ticker} error: {e}")
-        return None, None, None, "error"
+        logging.info(f"[generic] {ticker} error: {e}")
+        return None, None, None, "generic_error"
 
-def fetch_many(tickers: list[str], *, prefer_premarket: bool) -> dict[str, tuple[float|None, float|None, float|None, str]]:
-    return {t: fetch_quote(t, prefer_premarket=prefer_premarket) for t in tickers}
+def fetch_many_equities_strict(tickers: list[str]) -> dict[str, tuple[float|None, float|None, float|None, str]]:
+    return {t: fetch_equity_etf_strict_premarket(t) if not t.endswith("-USD") else fetch_generic(t) for t in tickers}
+
+def fetch_many_generic(tickers: list[str]) -> dict[str, tuple[float|None, float|None, float|None, str]]:
+    return {t: fetch_generic(t) for t in tickers}
 
 # ------------------------- Bloques -------------------------
 DEFAULT_FUTURES   = ["ES=F","NQ=F","YM=F"]
@@ -174,8 +157,8 @@ def build_premarket_block() -> tuple[str, dict]:
     futs = [s.strip() for s in os.environ.get("FUTURES","").split(",") if s.strip()] or DEFAULT_FUTURES
     wl   = [s.strip() for s in os.environ.get("WATCHLIST","").split(",") if s.strip()] or DEFAULT_WATCHLIST
 
-    snap_fut = fetch_many(futs, prefer_premarket=False)
-    snap_wl  = fetch_many(wl,   prefer_premarket=True)
+    snap_fut = fetch_many_generic(futs)
+    snap_wl  = fetch_many_equities_strict(wl)
 
     lines = []
     lines.append("<b>📈 Pre-Market (UTC) / Futuros</b>")
@@ -194,7 +177,7 @@ def build_premarket_block() -> tuple[str, dict]:
 
 def build_macro_block() -> tuple[str, dict]:
     macro = [s.strip() for s in os.environ.get("MACRO","").split(",") if s.strip()] or DEFAULT_MACRO
-    snap  = fetch_many(macro, prefer_premarket=False)
+    snap  = fetch_many_generic(macro)
     lines = ["", "<b>📊 Macro</b>"]
     for t in macro:
         price, _prev, chg, src = snap.get(t, (None, None, None, ""))
@@ -205,21 +188,18 @@ def build_macro_block() -> tuple[str, dict]:
 def macro_bias(snap_fut: dict, snap_macro: dict) -> str:
     def chg(d, k):
         tup = d.get(k); return tup[2] if tup else None
-
     es  = chg(snap_fut, "ES=F")
     vix = chg(snap_macro, "^VIX")
     tnx = chg(snap_macro, "^TNX")
     dxy = chg(snap_macro, "DX-Y.NYB")
-
     score = 0.0
     if es is not None:  score += 1.0 if es > 0.3 else (-1.0 if es < -0.3 else 0.0)
     if vix is not None: score += 1.0 if vix < -3  else (-1.0 if vix > 3  else 0.0)
     if tnx is not None: score += 0.5 if tnx < 0   else (-0.5 if tnx > 0  else 0.0)
     if dxy is not None: score += 0.5 if dxy < 0   else (-0.5 if dxy > 0  else 0.0)
-
-    if score >= 1.0:  return "📊 Sesgo macro: <b>Alcista</b> 🟢"
-    if score <= -1.0: return "📊 Sesgo macro: <b>Defensivo</b> 🔴"
-    return "📊 Sesgo macro: <b>Neutral</b> ⚪"
+    if score >= 1.0:  return "📈 Sesgo macro: <b>Alcista</b> 🟢"
+    if score <= -1.0: return "🛡️ Sesgo macro: <b>Defensivo</b> 🔴"
+    return "⚖️ Sesgo macro: <b>Neutral</b> ⚪"
 
 # ------------------------- Main -------------------------
 def main():
