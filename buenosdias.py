@@ -1,4 +1,5 @@
-# buenosdias.py – versión completa (saludo + snapshot pre-market con fallback robusto)
+# buenosdias.py – InvestX (saludo + snapshot pre-market + macro)
+# Compatible con Render (cron) y Telegram HTML
 
 import os, argparse, datetime, logging, math
 import requests
@@ -7,9 +8,8 @@ import yfinance as yf
 from requests.adapters import HTTPAdapter, Retry
 from dateutil import tz
 
-# ------------------------- Utilidades -------------------------
+# ------------------------- Utilidades básicas -------------------------
 def get_env(name, *aliases) -> str:
-    """Lee variable de entorno con posibles alias."""
     for k in (name, *aliases):
         v = os.environ.get(k)
         if v:
@@ -18,7 +18,6 @@ def get_env(name, *aliases) -> str:
     raise RuntimeError(f"Falta la variable de entorno: {name}{alias_txt}")
 
 def make_session(timeout=20) -> requests.Session:
-    """Sesión con reintentos automáticos."""
     s = requests.Session()
     retries = Retry(
         total=3,
@@ -31,7 +30,6 @@ def make_session(timeout=20) -> requests.Session:
     return s
 
 def telegram_send(text: str, *, token: str, chat_id: str, session: requests.Session, disable_preview=True) -> None:
-    """Envía el mensaje a Telegram."""
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     payload = {
         "chat_id": chat_id,
@@ -56,19 +54,16 @@ MENSAJES = [
 DIAS = ["lunes","martes","miércoles","jueves","viernes","sábado","domingo"]
 
 def stable_index(dt: datetime.datetime, n: int) -> int:
-    """Índice determinista (evita repeticiones)."""
     bucket = dt.hour // 3
-    base = (dt.toordinal() * 17 + dt.isocalendar().week * 7 + bucket) % n
-    return base
+    return (dt.toordinal() * 17 + dt.isocalendar().week * 7 + bucket) % n
 
 def build_greeting(dt_local: datetime.datetime, *, override_text: str | None = None) -> str:
     if override_text:
         return override_text
     d = DIAS[dt_local.weekday()]
-    idx = stable_index(dt_local, len(MENSAJES))
-    return MENSAJES[idx].format(dia=d)
+    return MENSAJES[stable_index(dt_local, len(MENSAJES))].format(dia=d)
 
-# ------------------------- Premarket robusto -------------------------
+# ------------------------- Helpers de precios -------------------------
 def pct(a, b):
     if a is None or b is None or b == 0 or (isinstance(a,float) and math.isnan(a)) or (isinstance(b,float) and math.isnan(b)):
         return None
@@ -77,23 +72,36 @@ def pct(a, b):
 def fmt_pct(x):
     if x is None:
         return "—"
-    return ("▲" if x >= 0 else "▼") + f"{abs(x):.2f}%"
+    if x > 0:
+        return f"🟢▲{abs(x):.2f}%"
+    elif x < 0:
+        return f"🔴▼{abs(x):.2f}%"
+    else:
+        return "⚪0.00%"
 
-def fmt_price(x):
+def fmt_price(x, suffix: str = ""):
     if x is None or (isinstance(x,float) and math.isnan(x)):
         return "—"
-    return f"{x:.2f}" if x < 1000 else f"{x:,.0f}".replace(",", ".")
+    s = f"{x:.2f}" if abs(x) < 1000 else f"{x:,.0f}".replace(",", ".")
+    return s + suffix
 
 def fetch_price_prev(t: str) -> tuple[float|None, float|None, str]:
-    """Obtiene (precio, cierre previo, fuente) con varios fallbacks."""
+    """
+    Devuelve (precio, previous_close, source).
+    Estrategia: fast_info -> history(1m) -> history(1d). Maneja futuros/acciones/cripto.
+    """
     try:
         tk = yf.Ticker(t)
         src = []
+
         fi = getattr(tk, "fast_info", {}) or {}
-        pre = fi.get("pre_market_price"); post = fi.get("post_market_price")
-        last = fi.get("last_price"); prev = fi.get("previous_close")
+        pre  = fi.get("pre_market_price")
+        post = fi.get("post_market_price")
+        last = fi.get("last_price")
+        prev = fi.get("previous_close")
+
         price = pre or last or post
-        if price: src.append("fast_info")
+        if price is not None: src.append("fast_info")
 
         if price is None:
             h1m = tk.history(period="1d", interval="1m", prepost=True)
@@ -103,7 +111,7 @@ def fetch_price_prev(t: str) -> tuple[float|None, float|None, str]:
 
         if prev is None:
             h1d = tk.history(period="5d", interval="1d", prepost=True)
-            if isinstance(h1d, pd.DataFrame) and len(h1d) >= 2:
+            if isinstance(h1d, pd.DataFrame) and len(h1d.dropna()) >= 2:
                 prev = float(h1d["Close"].dropna().iloc[-2])
                 src.append("1d_prev")
 
@@ -115,38 +123,53 @@ def fetch_price_prev(t: str) -> tuple[float|None, float|None, str]:
 
         return price, prev, "+".join(src) or "none"
     except Exception as e:
-        import logging; logging.info(f"[yfinance] {t} error: {e}")
+        logging.info(f"[yfinance] {t} error: {e}")
         return None, None, "error"
 
-def fetch_many(tickers: list[str]) -> dict:
-    out = {}
-    for t in tickers:
-        p, prev, source = fetch_price_prev(t)
-        out[t] = (p, prev, source)
-    return out
+def fetch_many(tickers: list[str]) -> dict[str, tuple[float|None, float|None, str]]:
+    return {t: fetch_price_prev(t) for t in tickers}
+
+# ------------------------- Bloques (futuros / watchlist / macro) -------------------------
+DEFAULT_FUTURES   = ["ES=F","NQ=F","YM=F"]                              # S&P / Nasdaq / Dow (E-mini)
+DEFAULT_WATCHLIST = ["SPY","QQQ","AAPL","MSFT","NVDA","AMZN","META","TSLA","BTC-USD","ETH-USD"]
+DEFAULT_MACRO     = ["^VIX","^TNX","DX-Y.NYB","BZ=F"]                   # VIX / US10Y / DXY / Brent
+
+def macro_suffix(ticker: str) -> str:
+    # Añadimos sufijos útiles en macro (e.g., % para ^TNX)
+    if ticker == "^TNX":
+        return "%"   # 10Y yield en %
+    return ""        # el resto sin sufijo
 
 def build_premarket_block() -> str:
-    futs = os.environ.get("FUTURES", "")
-    wl   = os.environ.get("WATCHLIST", "")
-    fut_list = [s.strip() for s in futs.split(",") if s.strip()] or ["ES=F","NQ=F","YM=F"]
-    wl_list  = [s.strip() for s in wl.split(",") if s.strip()]  or ["SPY","QQQ","AAPL","MSFT","NVDA","AMZN","META","TSLA","BTC-USD","ETH-USD"]
+    futs = [s.strip() for s in os.environ.get("FUTURES", "").split(",") if s.strip()] or DEFAULT_FUTURES
+    wl   = [s.strip() for s in os.environ.get("WATCHLIST","").split(",") if s.strip()] or DEFAULT_WATCHLIST
 
-    snap_fut = fetch_many(fut_list)
-    snap_wl  = fetch_many(wl_list)
+    snap_fut = fetch_many(futs)
+    snap_wl  = fetch_many(wl)
 
     lines = []
     lines.append("<b>📈 Pre-Market (UTC) / Futuros</b>")
-    for t in fut_list:
-        price, prev, _src = snap_fut.get(t, (None, None, ""))
+    for t in futs:
+        price, prev, _ = snap_fut.get(t, (None, None, ""))
         lines.append(f"<code>{t:<6}</code>  {fmt_price(price):>8}  {fmt_pct(pct(price, prev))}")
 
     lines.append("")
     lines.append("<b>🏷️ Acciones & Cripto</b>")
-    for t in wl_list:
+    for t in wl:
         label = "Spot" if t.endswith("-USD") else "Pre"
-        price, prev, _src = snap_wl.get(t, (None, None, ""))
+        price, prev, _ = snap_wl.get(t, (None, None, ""))
         lines.append(f"<code>{t:<8}</code> {fmt_price(price):>10}  {fmt_pct(pct(price, prev))}  <i>{label}</i>")
 
+    return "\n".join(lines)
+
+def build_macro_block() -> str:
+    macro = [s.strip() for s in os.environ.get("MACRO","").split(",") if s.strip()] or DEFAULT_MACRO
+    snap  = fetch_many(macro)
+    lines = ["", "<b>📊 Macro</b>"]
+    for t in macro:
+        price, prev, _ = snap.get(t, (None, None, ""))
+        suf = macro_suffix(t)
+        lines.append(f"<code>{t:<8}</code> {fmt_price(price, suf):>10}  {fmt_pct(pct(price, prev))}")
     return "\n".join(lines)
 
 # ------------------------- Main -------------------------
@@ -171,10 +194,12 @@ def main():
         logging.info("Fin de semana: no se envía (use --allow-weekend o --force).")
         return
 
-    greeting = build_greeting(now_local, override_text=args.message)
-    pre_block = build_premarket_block()
+    greeting   = build_greeting(now_local, override_text=args.message)
+    pre_block  = build_premarket_block()
+    macro_block= build_macro_block()
+
     hora_local = now_local.strftime("%H:%M")
-    msg = f"{greeting}\n\n{pre_block}\n\n🕒 Datos actualizados a las {hora_local} (Europe/Madrid)"
+    msg = f"{greeting}\n\n{pre_block}\n{macro_block}\n\n🕒 Datos actualizados a las {hora_local} (Europe/Madrid)"
 
     logging.info("✅ Pre-market snapshot generado correctamente.")
 
@@ -189,7 +214,7 @@ def main():
     telegram_send(msg, token=token, chat_id=chat_id, session=session)
     logging.info("Mensaje enviado correctamente.")
 
-
 if __name__ == "__main__":
     main()
+
 
