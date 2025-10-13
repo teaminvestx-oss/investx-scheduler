@@ -72,13 +72,14 @@ def pct(a, b):
 def fmt_pct(x):
     if x is None:
         return "—"
+    val = f"{abs(x):.2f}%"
     if x > 0:
-        return f"🟢▲{abs(x):.2f}%"
+        return f"🟢▲{val}"
     elif x < 0:
-        return f"🔴▼{abs(x):.2f}%"
+        return f"🔴▼{val}"
     else:
         return "⚪0.00%"
-
+        
 def fmt_price(x, suffix: str = ""):
     if x is None or (isinstance(x,float) and math.isnan(x)):
         return "—"
