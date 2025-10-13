@@ -1,5 +1,5 @@
 # buenosdias.py – InvestX (saludo + snapshot pre-market + macro)
-# Compatible con Render (cron) y Telegram HTML
+# Compatible con Render (cron) y Telegram HTML (usa emojis para color)
 
 import os, argparse, datetime, logging, math
 import requests
@@ -8,7 +8,9 @@ import yfinance as yf
 from requests.adapters import HTTPAdapter, Retry
 from dateutil import tz
 
-# ------------------------- Utilidades básicas -------------------------
+VERSION = "InvestX buenosdias v1.3"
+
+# ------------------------- Utilidades -------------------------
 def get_env(name, *aliases) -> str:
     for k in (name, *aliases):
         v = os.environ.get(k)
@@ -79,98 +81,119 @@ def fmt_pct(x):
         return f"🔴▼{val}"
     else:
         return "⚪0.00%"
-        
+
 def fmt_price(x, suffix: str = ""):
     if x is None or (isinstance(x,float) and math.isnan(x)):
         return "—"
     s = f"{x:.2f}" if abs(x) < 1000 else f"{x:,.0f}".replace(",", ".")
     return s + suffix
 
-def fetch_price_prev(t: str) -> tuple[float|None, float|None, str]:
+def fetch_price_prev(t: str) -> tuple[float|None, float|None, float|None, str]:
     """
-    Devuelve (precio, previous_close, source).
-    Estrategia: fast_info -> history(1m) -> history(1d). Maneja futuros/acciones/cripto.
+    Devuelve (price, previous_close, change_percent, source)
+    Prioriza % nativos de Yahoo: pre_market_change_percent / regular_market_change_percent.
+    Fallback: cálculo manual con history().
     """
     try:
         tk = yf.Ticker(t)
         src = []
 
         fi = getattr(tk, "fast_info", {}) or {}
-        pre  = fi.get("pre_market_price")
-        post = fi.get("post_market_price")
-        last = fi.get("last_price")
-        prev = fi.get("previous_close")
+        pre   = fi.get("pre_market_price")
+        post  = fi.get("post_market_price")
+        last  = fi.get("last_price")
+        prev  = fi.get("previous_close")
 
-        price = pre or last or post
+        pre_cp = fi.get("pre_market_change_percent")
+        reg_cp = fi.get("regular_market_change_percent")
+
+        # Precio preferido
+        price = pre if pre not in (None, 0) else (last if last not in (None, 0) else post)
         if price is not None: src.append("fast_info")
 
+        # Fallback precio por velas 1m
         if price is None:
             h1m = tk.history(period="1d", interval="1m", prepost=True)
             if isinstance(h1m, pd.DataFrame) and not h1m.empty:
                 price = float(h1m["Close"].dropna().iloc[-1])
                 src.append("1m")
 
+        # Fallback previous close por 1d
         if prev is None:
             h1d = tk.history(period="5d", interval="1d", prepost=True)
             if isinstance(h1d, pd.DataFrame) and len(h1d.dropna()) >= 2:
                 prev = float(h1d["Close"].dropna().iloc[-2])
                 src.append("1d_prev")
 
+        # Cripto: si aún no hay precio, 1m sin prepost
         if price is None and t.endswith("-USD"):
             h1m2 = tk.history(period="1d", interval="1m")
             if isinstance(h1m2, pd.DataFrame) and not h1m2.empty:
                 price = float(h1m2["Close"].dropna().iloc[-1])
                 src.append("1m_crypto")
 
-        return price, prev, "+".join(src) or "none"
+        # % de cambio priorizado
+        change_pct = None
+        if t.endswith("-USD"):
+            change_pct = pct(price, prev) if (price is not None and prev is not None) else None
+        else:
+            if pre_cp is not None:
+                change_pct = float(pre_cp) * 100.0
+                src.append("pre_cp")
+            elif reg_cp is not None:
+                change_pct = float(reg_cp) * 100.0
+                src.append("reg_cp")
+            else:
+                change_pct = pct(price, prev) if (price is not None and prev is not None) else None
+                src.append("manual_cp")
+
+        return price, prev, change_pct, "+".join(src) or "none"
     except Exception as e:
         logging.info(f"[yfinance] {t} error: {e}")
-        return None, None, "error"
+        return None, None, None, "error"
 
-def fetch_many(tickers: list[str]) -> dict[str, tuple[float|None, float|None, str]]:
+def fetch_many(tickers: list[str]) -> dict[str, tuple[float|None, float|None, float|None, str]]:
     return {t: fetch_price_prev(t) for t in tickers}
 
-# ------------------------- Bloques (futuros / watchlist / macro) -------------------------
+# ------------------------- Bloques -------------------------
 DEFAULT_FUTURES   = ["ES=F","NQ=F","YM=F"]                              # S&P / Nasdaq / Dow (E-mini)
 DEFAULT_WATCHLIST = ["SPY","QQQ","AAPL","MSFT","NVDA","AMZN","META","TSLA","BTC-USD","ETH-USD"]
 DEFAULT_MACRO     = ["^VIX","^TNX","DX-Y.NYB","BZ=F"]                   # VIX / US10Y / DXY / Brent
 
 def macro_suffix(ticker: str) -> str:
-    # Añadimos sufijos útiles en macro (e.g., % para ^TNX)
     if ticker == "^TNX":
-        return "%"   # 10Y yield en %
-    return ""        # el resto sin sufijo
+        return "%"   # rendimiento 10Y en %
+    return ""
 
 def build_premarket_block() -> str:
-    futs = [s.strip() for s in os.environ.get("FUTURES", "").split(",") if s.strip()] or DEFAULT_FUTURES
-    wl   = [s.strip() for s in os.environ.get("WATCHLIST","").split(",") if s.strip()] or DEFAULT_WATCHLIST
+    fut_list = [s.strip() for s in os.environ.get("FUTURES", "").split(",") if s.strip()] or DEFAULT_FUTURES
+    wl_list  = [s.strip() for s in os.environ.get("WATCHLIST","").split(",") if s.strip()] or DEFAULT_WATCHLIST
 
-    snap_fut = fetch_many(futs)
-    snap_wl  = fetch_many(wl)
+    snap_fut = fetch_many(fut_list)
+    snap_wl  = fetch_many(wl_list)
 
     lines = []
     lines.append("<b>📈 Pre-Market (UTC) / Futuros</b>")
-    for t in futs:
-        price, prev, _ = snap_fut.get(t, (None, None, ""))
-        lines.append(f"<code>{t:<6}</code>  {fmt_price(price):>8}  {fmt_pct(pct(price, prev))}")
+    for t in fut_list:
+        price, _prev, chg, _ = snap_fut.get(t, (None, None, None, ""))
+        lines.append(f"<code>{t:<6}</code>  {fmt_price(price):>8}  {fmt_pct(chg)}")
 
     lines.append("")
     lines.append("<b>🏷️ Acciones & Cripto</b>")
-    for t in wl:
+    for t in wl_list:
         label = "Spot" if t.endswith("-USD") else "Pre"
-        price, prev, _ = snap_wl.get(t, (None, None, ""))
-        lines.append(f"<code>{t:<8}</code> {fmt_price(price):>10}  {fmt_pct(pct(price, prev))}  <i>{label}</i>")
+        price, _prev, chg, _ = snap_wl.get(t, (None, None, None, ""))
+        lines.append(f"<code>{t:<8}</code> {fmt_price(price):>10}  {fmt_pct(chg)}  <i>{label}</i>")
 
     return "\n".join(lines)
 
 def build_macro_block() -> str:
-    macro = [s.strip() for s in os.environ.get("MACRO","").split(",") if s.strip()] or DEFAULT_MACRO
-    snap  = fetch_many(macro)
+    macro_list = [s.strip() for s in os.environ.get("MACRO","").split(",") if s.strip()] or DEFAULT_MACRO
+    snap  = fetch_many(macro_list)
     lines = ["", "<b>📊 Macro</b>"]
-    for t in macro:
-        price, prev, _ = snap.get(t, (None, None, ""))
-        suf = macro_suffix(t)
-        lines.append(f"<code>{t:<8}</code> {fmt_price(price, suf):>10}  {fmt_pct(pct(price, prev))}")
+    for t in macro_list:
+        price, _prev, chg, _ = snap.get(t, (None, None, None, ""))
+        lines.append(f"<code>{t:<8}</code> {fmt_price(price, macro_suffix(t)):>10}  {fmt_pct(chg)}")
     return "\n".join(lines)
 
 # ------------------------- Main -------------------------
@@ -195,9 +218,9 @@ def main():
         logging.info("Fin de semana: no se envía (use --allow-weekend o --force).")
         return
 
-    greeting   = build_greeting(now_local, override_text=args.message)
-    pre_block  = build_premarket_block()
-    macro_block= build_macro_block()
+    greeting    = build_greeting(now_local, override_text=args.message)
+    pre_block   = build_premarket_block()
+    macro_block = build_macro_block()
 
     hora_local = now_local.strftime("%H:%M")
     msg = f"{greeting}\n\n{pre_block}\n{macro_block}\n\n🕒 Datos actualizados a las {hora_local} (Europe/Madrid)"
@@ -205,14 +228,14 @@ def main():
     logging.info("✅ Pre-market snapshot generado correctamente.")
 
     if args.dry_run:
-        print(msg)
+        print(f"{VERSION}\n{msg}")
         return
 
     token  = get_env("INVESTX_TOKEN", "TELEGRAM_BOT_TOKEN")
     chat_id = get_env("CHAT_ID", "TELEGRAM_CHAT_ID")
 
     session = make_session()
-    telegram_send(msg, token=token, chat_id=chat_id, session=session)
+    telegram_send(f"{VERSION}\n{msg}", token=token, chat_id=chat_id, session=session)
     logging.info("Mensaje enviado correctamente.")
 
 if __name__ == "__main__":
