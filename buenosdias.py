@@ -177,7 +177,7 @@ def main():
 
     logging.info("✅ Pre-market snapshot generado correctamente.")
 
-    if args.dry-run:
+    if args.dry_run:
         print(msg)
         return
 
