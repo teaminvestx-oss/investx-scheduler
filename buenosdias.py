@@ -173,7 +173,8 @@ def main():
 
     greeting = build_greeting(now_local, override_text=args.message)
     pre_block = build_premarket_block()
-    msg = f"{greeting}\n\n{pre_block}"
+    hora_local = now_local.strftime("%H:%M")
+    msg = f"{greeting}\n\n{pre_block}\n\n🕒 Datos actualizados a las {hora_local} (Europe/Madrid)"
 
     logging.info("✅ Pre-market snapshot generado correctamente.")
 
@@ -187,6 +188,7 @@ def main():
     session = make_session()
     telegram_send(msg, token=token, chat_id=chat_id, session=session)
     logging.info("Mensaje enviado correctamente.")
+
 
 if __name__ == "__main__":
     main()
