@@ -10,7 +10,7 @@ import yfinance as yf
 from requests.adapters import HTTPAdapter, Retry
 from dateutil import tz
 
-VERSION = "InvestX buenosdias v1.6"
+VERSION = "InvestX buenosdias"
 DEBUG_SOURCES = os.environ.get("DEBUG_SOURCES", "0") in ("1","true","TRUE")
 
 # ------------------------- Utilidades -------------------------
