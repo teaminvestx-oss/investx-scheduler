@@ -1,15 +1,15 @@
-# buenosdias.py (greeting + premarket snapshot)
-import os, argparse, datetime, logging
-import math
+# buenosdias.py – versión completa (saludo + snapshot pre-market con fallback robusto)
+
+import os, argparse, datetime, logging, math
 import requests
+import pandas as pd
+import yfinance as yf
 from requests.adapters import HTTPAdapter, Retry
 from dateutil import tz
 
-# ---- NUEVO: yfinance para precios ----
-import yfinance as yf
-
 # ------------------------- Utilidades -------------------------
 def get_env(name, *aliases) -> str:
+    """Lee variable de entorno con posibles alias."""
     for k in (name, *aliases):
         v = os.environ.get(k)
         if v:
@@ -18,6 +18,7 @@ def get_env(name, *aliases) -> str:
     raise RuntimeError(f"Falta la variable de entorno: {name}{alias_txt}")
 
 def make_session(timeout=20) -> requests.Session:
+    """Sesión con reintentos automáticos."""
     s = requests.Session()
     retries = Retry(
         total=3,
@@ -30,6 +31,7 @@ def make_session(timeout=20) -> requests.Session:
     return s
 
 def telegram_send(text: str, *, token: str, chat_id: str, session: requests.Session, disable_preview=True) -> None:
+    """Envía el mensaje a Telegram."""
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     payload = {
         "chat_id": chat_id,
@@ -54,6 +56,7 @@ MENSAJES = [
 DIAS = ["lunes","martes","miércoles","jueves","viernes","sábado","domingo"]
 
 def stable_index(dt: datetime.datetime, n: int) -> int:
+    """Índice determinista (evita repeticiones)."""
     bucket = dt.hour // 3
     base = (dt.toordinal() * 17 + dt.isocalendar().week * 7 + bucket) % n
     return base
@@ -65,75 +68,83 @@ def build_greeting(dt_local: datetime.datetime, *, override_text: str | None = N
     idx = stable_index(dt_local, len(MENSAJES))
     return MENSAJES[idx].format(dia=d)
 
-# ------------------------- Premarket -------------------------
-DEFAULT_FUTURES = ["ES=F","NQ=F","YM=F"]  # S&P, Nasdaq 100, Dow
-DEFAULT_WATCHLIST = ["SPY","QQQ","AAPL","MSFT","NVDA","AMZN","META","TSLA","BTC-USD","ETH-USD"]
-
+# ------------------------- Premarket robusto -------------------------
 def pct(a, b):
-    if b in (None, 0) or a is None or math.isnan(b) or math.isnan(a):
+    if a is None or b is None or b == 0 or (isinstance(a,float) and math.isnan(a)) or (isinstance(b,float) and math.isnan(b)):
         return None
-    try:
-        return (a - b) / b * 100.0
-    except Exception:
-        return None
+    return (a - b) / b * 100.0
 
 def fmt_pct(x):
     if x is None:
         return "—"
-    sign = "▲" if x >= 0 else "▼"
-    return f"{sign}{abs(x):.2f}%"
+    return ("▲" if x >= 0 else "▼") + f"{abs(x):.2f}%"
 
 def fmt_price(x):
-    if x is None or math.isnan(x):
+    if x is None or (isinstance(x,float) and math.isnan(x)):
         return "—"
-    # precios enteros si son grandes, 2 decimales si no
     return f"{x:.2f}" if x < 1000 else f"{x:,.0f}".replace(",", ".")
 
-def fetch_snapshot(tickers: list[str]) -> dict:
-    """Devuelve dict {ticker: (price, prev_close)} usando yfinance."""
-    data = {}
-    if not tickers:
-        return data
-    yfs = yf.Tickers(" ".join(tickers))
-    for t, tk in yfs.tickers.items():
-        try:
-            fi = getattr(tk, "fast_info", {})
-            # Algunos campos pueden faltar -> defensivo
-            pre = fi.get("pre_market_price", None)
-            post = fi.get("post_market_price", None)
-            last = fi.get("last_price", None)
-            prev = fi.get("previous_close", None)
+def fetch_price_prev(t: str) -> tuple[float|None, float|None, str]:
+    """Obtiene (precio, cierre previo, fuente) con varios fallbacks."""
+    try:
+        tk = yf.Ticker(t)
+        src = []
+        fi = getattr(tk, "fast_info", {}) or {}
+        pre = fi.get("pre_market_price"); post = fi.get("post_market_price")
+        last = fi.get("last_price"); prev = fi.get("previous_close")
+        price = pre or last or post
+        if price: src.append("fast_info")
 
-            # prioriza premarket, si no hay toma last o post
-            price = pre if pre not in (None, 0) else (last if last not in (None, 0) else post)
-            data[t] = (price, prev)
-        except Exception:
-            data[t] = (None, None)
-    return data
+        if price is None:
+            h1m = tk.history(period="1d", interval="1m", prepost=True)
+            if isinstance(h1m, pd.DataFrame) and not h1m.empty:
+                price = float(h1m["Close"].dropna().iloc[-1])
+                src.append("1m")
+
+        if prev is None:
+            h1d = tk.history(period="5d", interval="1d", prepost=True)
+            if isinstance(h1d, pd.DataFrame) and len(h1d) >= 2:
+                prev = float(h1d["Close"].dropna().iloc[-2])
+                src.append("1d_prev")
+
+        if price is None and t.endswith("-USD"):
+            h1m2 = tk.history(period="1d", interval="1m")
+            if isinstance(h1m2, pd.DataFrame) and not h1m2.empty:
+                price = float(h1m2["Close"].dropna().iloc[-1])
+                src.append("1m_crypto")
+
+        return price, prev, "+".join(src) or "none"
+    except Exception as e:
+        import logging; logging.info(f"[yfinance] {t} error: {e}")
+        return None, None, "error"
+
+def fetch_many(tickers: list[str]) -> dict:
+    out = {}
+    for t in tickers:
+        p, prev, source = fetch_price_prev(t)
+        out[t] = (p, prev, source)
+    return out
 
 def build_premarket_block() -> str:
-    # Lee envs o usa defaults
     futs = os.environ.get("FUTURES", "")
-    wl = os.environ.get("WATCHLIST", "")
+    wl   = os.environ.get("WATCHLIST", "")
+    fut_list = [s.strip() for s in futs.split(",") if s.strip()] or ["ES=F","NQ=F","YM=F"]
+    wl_list  = [s.strip() for s in wl.split(",") if s.strip()]  or ["SPY","QQQ","AAPL","MSFT","NVDA","AMZN","META","TSLA","BTC-USD","ETH-USD"]
 
-    fut_list = [s.strip() for s in futs.split(",") if s.strip()] or DEFAULT_FUTURES
-    wl_list  = [s.strip() for s in wl.split(",") if s.strip()] or DEFAULT_WATCHLIST
+    snap_fut = fetch_many(fut_list)
+    snap_wl  = fetch_many(wl_list)
 
-    snap_fut = fetch_snapshot(fut_list)
-    snap_wl  = fetch_snapshot(wl_list)
-
-    # Cabeceras
     lines = []
     lines.append("<b>📈 Pre-Market (UTC) / Futuros</b>")
     for t in fut_list:
-        price, prev = snap_fut.get(t, (None, None))
+        price, prev, _src = snap_fut.get(t, (None, None, ""))
         lines.append(f"<code>{t:<6}</code>  {fmt_price(price):>8}  {fmt_pct(pct(price, prev))}")
 
     lines.append("")
     lines.append("<b>🏷️ Acciones & Cripto</b>")
     for t in wl_list:
         label = "Spot" if t.endswith("-USD") else "Pre"
-        price, prev = snap_wl.get(t, (None, None))
+        price, prev, _src = snap_wl.get(t, (None, None, ""))
         lines.append(f"<code>{t:<8}</code> {fmt_price(price):>10}  {fmt_pct(pct(price, prev))}  <i>{label}</i>")
 
     return "\n".join(lines)
@@ -141,7 +152,7 @@ def build_premarket_block() -> str:
 # ------------------------- Main -------------------------
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--tz", default="Europe/Madrid", help="Zona horaria local (p.ej. Europe/Madrid)")
+    ap.add_argument("--tz", default="Europe/Madrid", help="Zona horaria local")
     ap.add_argument("--allow-weekend", action="store_true", help="Permite enviar también Sábado y Domingo")
     ap.add_argument("--force", action="store_true", help="Fuerza envío aunque no sea L–V")
     ap.add_argument("--dry-run", action="store_true", help="No envía, solo imprime el mensaje")
@@ -157,14 +168,16 @@ def main():
     wd = now_local.weekday()  # 0=lunes … 6=domingo
 
     if not args.force and not args.allow_weekend and wd > 4:
-        logging.info("Fin de semana: no se envía (use --allow-weekend o --force para enviar).")
+        logging.info("Fin de semana: no se envía (use --allow-weekend o --force).")
         return
 
     greeting = build_greeting(now_local, override_text=args.message)
     pre_block = build_premarket_block()
     msg = f"{greeting}\n\n{pre_block}"
 
-    if args.dry_run:
+    logging.info("✅ Pre-market snapshot generado correctamente.")
+
+    if args.dry-run:
         print(msg)
         return
 
@@ -177,3 +190,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
