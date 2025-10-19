@@ -1,32 +1,27 @@
-# Ejecuta SIEMPRE las noticias y, si procede (lunes ~13h local), el earnings preview.
-# Comando cron en Render:  python runner.py
+# Runner (raíz del repo)
+# - Ejecuta noticias siempre (news.py)
+# - Ejecuta earnings_weekly.py siempre (él decide si publicar según día/hora)
 
 import os, sys, subprocess
-from zoneinfo import ZoneInfo
-from datetime import datetime
-
-LOCAL_TZ = ZoneInfo(os.getenv("LOCAL_TZ", "Europe/Madrid"))
-H1 = int(os.getenv("EARNINGS_MORNING_FROM_H", "12"))  # por defecto 12–14
-H2 = int(os.getenv("EARNINGS_MORNING_TO_H",   "14"))
-
-def should_run_earnings(now_local):
-    return now_local.weekday() == 0 and (H1 <= now_local.hour <= H2)
 
 def run(cmd: list[str]) -> int:
     print("+", " ".join(cmd), flush=True)
     return subprocess.call(cmd)
 
 def main():
-    # 1) Noticias (tu script actual está en raíz)
+    # 1) Noticias
     news_path = "news.py"
-    if not os.path.exists(news_path):
-        print("No se encuentra news.py", flush=True)
-    else:
+    if os.path.exists(news_path):
         run([sys.executable, news_path])
+    else:
+        print("Aviso: no se encontró news.py en la raíz", flush=True)
 
-    # 2) Earnings preview si toca
-    if should_run_earnings(datetime.now(LOCAL_TZ)):
-        run([sys.executable, "earnings_weekly.py"])
+    # 2) Earnings (decide internamente si publicar)
+    earnings_path = "earnings_weekly.py"
+    if os.path.exists(earnings_path):
+        run([sys.executable, earnings_path])
+    else:
+        print("Aviso: no se encontró earnings_weekly.py en la raíz", flush=True)
 
 if __name__ == "__main__":
     main()
