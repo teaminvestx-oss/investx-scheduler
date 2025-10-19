@@ -20,7 +20,8 @@ WATCHLIST_SECONDARY = [s.strip().upper() for s in (os.getenv("WATCHLIST_SECONDAR
 # Solo lunes y ventana ~13h local (cámbialo con EARNINGS_MORNING_FROM_H/TO_H)
 MORNING_WINDOW_LOCAL_H1 = int(os.getenv("EARNINGS_MORNING_FROM_H", "12"))
 MORNING_WINDOW_LOCAL_H2 = int(os.getenv("EARNINGS_MORNING_TO_H",   "14"))  # inclusivo
-FMP_URL = "https://financialmodelingprep.com/api/v3/earning_calendar"
+FMP_URL = "https://financialmodelingprep.com/api/v4/earning_calendar"
+
 
 def is_run_window(now_local: datetime) -> bool:
     # 0 = lunes
