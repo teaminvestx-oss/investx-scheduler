@@ -1,6 +1,6 @@
 # Runner (raíz del repo)
 # - Ejecuta noticias siempre (news.py)
-# - Ejecuta earnings_weekly.py siempre (él decide si publicar según día/hora)
+# - Ejecuta earnings_weekly.py siempre; él decide si publicar (ventana/flags)
 
 import os, sys, subprocess
 
