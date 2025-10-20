@@ -1,27 +1,24 @@
-# Runner (raíz del repo)
-# - Ejecuta noticias siempre (news.py)
-# - Ejecuta earnings_weekly.py siempre; él decide si publicar (ventana/flags)
-
-import os, sys, subprocess
+# runner.py (raíz)
+import os, sys, subprocess, datetime
 
 def run(cmd: list[str]) -> int:
-    print("+", " ".join(cmd), flush=True)
+    print(f"[runner] {datetime.datetime.utcnow().isoformat()}Z ->", " ".join(cmd), flush=True)
     return subprocess.call(cmd)
 
 def main():
-    # 1) Noticias
+    # Noticias
     news_path = "news.py"
     if os.path.exists(news_path):
         run([sys.executable, news_path])
     else:
-        print("Aviso: no se encontró news.py en la raíz", flush=True)
+        print("[runner] news.py no encontrado", flush=True)
 
-    # 2) Earnings (decide internamente si publicar)
+    # Earnings (decide internamente si publica)
     earnings_path = "earnings_weekly.py"
     if os.path.exists(earnings_path):
         run([sys.executable, earnings_path])
     else:
-        print("Aviso: no se encontró earnings_weekly.py en la raíz", flush=True)
+        print("[runner] earnings_weekly.py no encontrado", flush=True)
 
 if __name__ == "__main__":
     main()
