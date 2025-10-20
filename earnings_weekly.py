@@ -1,3 +1,4 @@
+# earnings_weekly.py (raíz)
 import os
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -13,27 +14,24 @@ WATCHLIST_PRIORITY  = [s.strip().upper() for s in (os.getenv("WATCHLIST_PRIORITY
 WATCHLIST_SECONDARY = [s.strip().upper() for s in (os.getenv("WATCHLIST_SECONDARY") or "").replace(";", ",").split(",") if s.strip()]
 
 H1 = int(os.getenv("EARNINGS_MORNING_FROM_H", "12"))
-H2 = int(os.getenv("EARNINGS_MORNING_TO_H",   "14"))
+H2 = int(os.getenv("EARNINGS_MORNING_TO_H",   "14"))  # inclusivo
 HARD_FILTER = os.getenv("EARNINGS_HARD_FILTER", "0").lower() in {"1","true","yes","y"}
 FORCE       = os.getenv("EARNINGS_FORCE",        "0").lower() in {"1","true","yes","y"}
 DEBUG       = os.getenv("EARNINGS_DEBUG",        "0").lower() in {"1","true","yes","y"}
 
 FMP_URL = "https://financialmodelingprep.com/api/v4/earning_calendar"
 
-def log(msg: str):
-    print(msg, flush=True)
-    if DEBUG and BOT_TOKEN and CHAT_ID:
-        try:
-            requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-                          json={"chat_id": CHAT_ID, "text": f"[earnings] {msg}", "parse_mode": "HTML",
-                                "disable_web_page_preview": True}, timeout=30).raise_for_status()
-        except Exception:
-            pass
+def _post(text: str):
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    requests.post(url, json={
+        "chat_id": CHAT_ID, "text": text,
+        "parse_mode": "HTML", "disable_web_page_preview": True}, timeout=30).raise_for_status()
 
-def post_html(text: str):
-    requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-                  json={"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML",
-                        "disable_web_page_preview": True}, timeout=30).raise_for_status()
+def _log(msg: str):
+    print(f"[earnings] {msg}", flush=True)
+    if DEBUG and BOT_TOKEN and CHAT_ID:
+        try: _post(f"[earnings] {msg}")
+        except Exception: pass
 
 def is_run_window(now_local: datetime) -> bool:
     return (now_local.weekday() == 0) and (H1 <= now_local.hour <= H2)
@@ -96,7 +94,6 @@ def build_message(grouped: Dict[str, List[Dict]], pri: list, sec: list, start: s
             exp=f" | expEPS: {e:.2f}" if isinstance(e,(int,float)) else ""
             return f"{badge(sym,pri,sec)} {emj} <b>{sym}</b> — {name} ({sess}{exp})"
         for it in pr_items: lines.append("• " + render(it))
-        # No “otros” si hard filter
         if not HARD_FILTER:
             for it in other[:8]: lines.append("• " + render(it))
             if len(other)>8: lines.append(f"… (+{len(other)-8} más)")
@@ -110,55 +107,54 @@ def no_relevant_msg(start: str, end: str) -> str:
             "Actualizaremos si surge algún cambio.")
 
 def main():
-    log(f"Start earnings | FORCE={FORCE} DEBUG={DEBUG} HARD={HARD_FILTER}")
+    _log(f"start | FORCE={FORCE} DEBUG={DEBUG} HARD={HARD_FILTER}")
+
     if not FMP_API_KEY:
-        log("Falta FMP_API_KEY"); return
+        _log("FALTA FMP_API_KEY"); return
     if not (BOT_TOKEN and CHAT_ID):
-        log("Falta INVESTX_TOKEN o CHAT_ID"); return
+        _log("FALTA INVESTX_TOKEN o CHAT_ID"); return
 
     now_local = datetime.now(LOCAL_TZ)
-    log(f"Now local: {now_local.isoformat()} | weekday={now_local.weekday()} hour={now_local.hour}")
+    _log(f"now={now_local.isoformat()} weekday={now_local.weekday()} hour={now_local.hour}")
+
     if not (FORCE or is_run_window(now_local)):
-        log("Fuera de ventana (no lunes o fuera de horas)"); return
+        _log("fuera de ventana (no lunes o fuera de horas)"); return
 
     start, end = monday_to_friday_range(now_local)
-    log(f"Range: {start} -> {end}")
+    _log(f"range {start}->{end}")
 
     try:
         data = fetch_earnings(start, end)
-        log(f"Fetched rows: {len(data)}")
+        _log(f"fmp rows={len(data)}")
     except Exception as e:
-        log(f"Error API FMP: {type(e).__name__}"); return
+        _log(f"ERROR FMP: {type(e).__name__}"); return
 
     if HARD_FILTER:
         wl = set(WATCHLIST_PRIORITY + WATCHLIST_SECONDARY)
         before = len(data)
         data = [d for d in data if (d.get('symbol','').upper() in wl)]
-        log(f"Hard filter: {before} -> {len(data)}")
+        _log(f"hard filter {before}->{len(data)}")
 
     grouped = group_by_day(data)
-    days = len(grouped)
-    log(f"Días con eventos: {days}")
+    _log(f"días con eventos={len(grouped)}")
 
     pri, sec = set(WATCHLIST_PRIORITY), set(WATCHLIST_SECONDARY)
     relevant = any((it.get("symbol","").upper() in pri or it.get("symbol","").upper() in sec)
                    for items in grouped.values() for it in items)
 
     if not grouped or not relevant:
-        log("No relevantes: enviar aviso")
+        _log("no relevantes -> enviar aviso")
         try:
-            post_html(no_relevant_msg(start, end))
-            log("Aviso enviado")
+            _post(no_relevant_msg(start, end)); _log("aviso OK")
         except Exception as e:
-            log(f"Error enviando aviso Telegram: {type(e).__name__}")
+            _log(f"ERROR Telegram aviso: {type(e).__name__}")
         return
 
     msg = build_message(grouped, WATCHLIST_PRIORITY, WATCHLIST_SECONDARY, start, end)
     try:
-        post_html(msg)
-        log("Preview enviado")
+        _post(msg); _log("preview OK")
     except Exception as e:
-        log(f"Error enviando preview Telegram: {type(e).__name__}")
+        _log(f"ERROR Telegram preview: {type(e).__name__}")
 
 if __name__ == "__main__":
     main()
