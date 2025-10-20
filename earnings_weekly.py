@@ -19,7 +19,7 @@ HARD_FILTER = os.getenv("EARNINGS_HARD_FILTER", "0").lower() in {"1","true","yes
 FORCE       = os.getenv("EARNINGS_FORCE",        "0").lower() in {"1","true","yes","y"}
 DEBUG       = os.getenv("EARNINGS_DEBUG",        "0").lower() in {"1","true","yes","y"}
 
-FMP_URL = "https://financialmodelingprep.com/api/v4/earning_calendar"
+FMP_URL = "https://financialmodelingprep.com/api/v3/earning_calendar"
 
 def _post(text: str):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
