@@ -1,9 +1,8 @@
-# earnings_weekly.py — InvestX (formato limpio)
-# Publica un único mensaje con la agenda de earnings por día.
-# - Fuente: FMP /stable/earnings-calendar
-# - Lunes en ventana [EARNINGS_MORNING_FROM_H..TO_H] (hora LOCAL_TZ)
-# - EARNINGS_FORCE=1 => ignora ventana (para pruebas)
-# - EARNINGS_HARD_FILTER=1 => limita a WATCHLIST_* (si no, publica todo)
+# earnings_weekly.py — InvestX (mensaje limpio)
+# Fuente: FMP /stable/earnings-calendar
+# Publica SOLO los lunes dentro de [EARNINGS_MORNING_FROM_H..TO_H] (hora LOCAL_TZ)
+# EARNINGS_FORCE=1 -> ignora la ventana (para pruebas)
+# EARNINGS_HARD_FILTER=1 -> limita a WATCHLIST_*; si no, muestra toda la agenda
 
 import os
 from datetime import datetime, timedelta
@@ -15,11 +14,10 @@ import requests
 CHAT_ID    = os.getenv("CHAT_ID", "").strip()
 BOT_TOKEN  = os.getenv("INVESTX_TOKEN", "").strip()
 
-# Sanitizamos la key por si hubiera espacios o saltos ocultos
+# Sanitizar posible whitespace / caracteres raros en la API key
 _raw_key = (os.getenv("FMP_API_KEY") or "").strip()
 FMP_API_KEY = "".join(ch for ch in _raw_key if ch.isalnum())
-
-FMP_URL   = "https://financialmodelingprep.com/stable/earnings-calendar"
+FMP_URL     = "https://financialmodelingprep.com/stable/earnings-calendar"
 
 LOCAL_TZ  = ZoneInfo(os.getenv("LOCAL_TZ", "Europe/Madrid"))
 
@@ -32,17 +30,20 @@ H2 = int(os.getenv("EARNINGS_MORNING_TO_H",   "14"))  # inclusivo
 HARD_FILTER = os.getenv("EARNINGS_HARD_FILTER", "0").lower() in {"1","true","yes","y"}
 FORCE       = os.getenv("EARNINGS_FORCE",        "0").lower() in {"1","true","yes","y"}
 
-# ========= UTIL =========
+# ========= TELEGRAM =========
 def _post(text: str):
-    if not (BOT_TOKEN and CHAT_ID): return
+    if not (BOT_TOKEN and CHAT_ID):
+        return
     requests.post(
         f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
         json={"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True},
         timeout=30
     ).raise_for_status()
 
+# ========= TIEMPO / RANGO =========
 def is_run_window(now_local: datetime) -> bool:
-    return (now_local.weekday() == 0) and (H1 <= now_local.hour <= H2)  # 0 = lunes
+    # 0 = Lunes
+    return (now_local.weekday() == 0) and (H1 <= now_local.hour <= H2)
 
 def monday_to_friday_range(today_local: datetime) -> Tuple[str, str]:
     d = today_local.date()
@@ -59,24 +60,42 @@ def fetch_earnings(start: str, end: str) -> List[Dict]:
     try:
         r.raise_for_status()
     except requests.HTTPError:
-        # si la key fuese inválida o sin permisos, no publicamos nada
-        return []
+        return []  # si 401/403/etc., no publicamos nada
     data = r.json()
     if not isinstance(data, list):
         return []
-    # normalizar campos mínimos
+    # Normalizar campos
     out = []
     for d in data:
+        sym = (d.get("symbol") or "").upper()
+        # intentar distintas claves de nombre según endpoint
+        name = (
+            d.get("company")
+            or d.get("companyName")
+            or d.get("name")
+            or sym
+        )
         out.append({
-            "symbol": (d.get("symbol") or "").upper(),
-            "company": d.get("company") or d.get("name") or "",
+            "symbol": sym,
+            "company": name,
             "date": d.get("date") or d.get("dateCalendar") or "",
             "time": (d.get("time") or d.get("hour") or "").lower(),  # bmo/amc/tbd
-            "epsEstimated": d.get("epsEstimated") or d.get("epsEstimate"),
         })
     return out
 
-# ========= RENDER =========
+# ========= FORMATO =========
+def classify_session(t: str | None) -> str:
+    """Convierte el 'time' en etiqueta legible con emoji."""
+    if not t:
+        return "⏰ TBD"
+    t = t.strip().lower()
+    # variantes conocidas
+    if t in {"bmo", "pre", "premarket", "pre-market", "before"}:
+        return "🕖 Pre-Market"
+    if t in {"amc", "post", "postmarket", "after-market", "after"}:
+        return "🌙 After-Market"
+    return "⏰ TBD"
+
 def group_by_day(rows: List[Dict]) -> Dict[str, List[Dict]]:
     g: Dict[str, List[Dict]] = {}
     for r in rows:
@@ -84,35 +103,32 @@ def group_by_day(rows: List[Dict]) -> Dict[str, List[Dict]]:
         if not d:
             continue
         g.setdefault(d, []).append(r)
+    # ordenar cada día por símbolo; luego por fecha ascendente
     for d, lst in g.items():
-        lst.sort(key=lambda x: (str(x.get("time") or "tbd"), (x.get("symbol") or "").upper()))
-    # ordenar por fecha asc
+        lst.sort(key=lambda x: (x.get("symbol") or ""))
     return dict(sorted(g.items(), key=lambda kv: kv[0]))
 
-def build_message_clean(grouped: Dict[str, List[Dict]], start: str, end: str) -> str:
+def build_message(grouped: Dict[str, List[Dict]], start: str, end: str) -> str:
     lines = []
+    # Encabezado (solo título + semana)
     lines.append("📅 <b>EARNINGS WEEKLY PREVIEW | InvestX</b>")
-    lines.append(f"Semana: {start} → {end}\n")
+    lines.append(f"Semana 📆 {start} → {end}\n")
     lines.append("<b>Agenda por día</b>:")
 
     DIAS_ES = ["Lun", "Mar", "Mié", "Jue", "Vie", "Sáb", "Dom"]
-
     for d, items in grouped.items():
         dt = datetime.fromisoformat(d)
         lines.append(f"\n<u>{DIAS_ES[dt.weekday()]} {d}</u>")
-        # ordenar por ticker para consistencia
-        items.sort(key=lambda it: (it.get("symbol") or ""))
         for it in items:
             sym  = (it.get("symbol") or "").upper()
-            name = it.get("company") or it.get("name") or sym
-            e    = it.get("epsEstimated")
-            exp  = f" | expEPS: {e:.2f}" if isinstance(e, (int, float)) else ""
-            lines.append(f"• <b>{sym}</b> — {name}{exp}")
+            name = it.get("company") or sym
+            sess = classify_session(it.get("time"))
+            lines.append(f"• <b>{sym}</b> — <i>{name}</i>  {sess}")
     return "\n".join(lines)
 
 def no_relevant_msg(start: str, end: str) -> str:
     return ("📅 <b>EARNINGS WEEKLY PREVIEW | InvestX</b>\n"
-            f"Semana: {start} → {end}\n\n"
+            f"Semana 📆 {start} → {end}\n\n"
             "⚠️ No hay resultados relevantes esta semana.")
 
 # ========= MAIN =========
@@ -133,12 +149,11 @@ def main():
         data = [d for d in data if (d.get("symbol", "").upper() in wl)]
 
     grouped = group_by_day(data)
-
     if not grouped:
         _post(no_relevant_msg(start, end))
         return
 
-    _post(build_message_clean(grouped, start, end))
+    _post(build_message(grouped, start, end))
 
 if __name__ == "__main__":
     main()
