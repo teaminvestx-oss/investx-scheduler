@@ -20,11 +20,7 @@ FORCE       = os.getenv("EARNINGS_FORCE",        "0").lower() in {"1","true","ye
 DEBUG       = os.getenv("EARNINGS_DEBUG",        "0").lower() in {"1","true","yes","y"}
 
 # probamos ambos paths (algunas API keys nuevas solo soportan /v3)
-FMP_URLS = [
-    "https://financialmodelingprep.com/api/v3/earning_calendar",
-    "https://financialmodelingprep.com/api/v4/earning_calendar",
-]
-
+FMP_URLS = ["https://financialmodelingprep.com/stable/earnings-calendar"]
 
 # === FUNCIONES AUXILIARES ===
 def _post(text: str):
