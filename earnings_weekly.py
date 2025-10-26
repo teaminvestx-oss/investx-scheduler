@@ -1,8 +1,9 @@
-# earnings_weekly.py — InvestX (mensaje limpio)
-# Fuente: FMP /stable/earnings-calendar
-# Publica SOLO los lunes dentro de [EARNINGS_MORNING_FROM_H..TO_H] (hora LOCAL_TZ)
-# EARNINGS_FORCE=1 -> ignora la ventana (para pruebas)
-# EARNINGS_HARD_FILTER=1 -> limita a WATCHLIST_*; si no, muestra toda la agenda
+# earnings_weekly.py — InvestX (solo 1 vez por semana, lunes primera pasada)
+# - Fuente: FMP /stable/earnings-calendar
+# - Publica SOLO los lunes dentro de [EARNINGS_MORNING_FROM_H..TO_H] (hora LOCAL_TZ)
+# - EARNINGS_FORCE=1 -> ignora ventana y candado (para pruebas)
+# - EARNINGS_HARD_FILTER=1 -> limita a WATCHLIST_*; si no, muestra toda la agenda
+# - Lock semanal en /tmp para NO repetir en la misma semana
 
 import os
 from datetime import datetime, timedelta
@@ -14,7 +15,7 @@ import requests
 CHAT_ID    = os.getenv("CHAT_ID", "").strip()
 BOT_TOKEN  = os.getenv("INVESTX_TOKEN", "").strip()
 
-# Sanitizar posible whitespace / caracteres raros en la API key
+# Sanitizar posible whitespace en la API key
 _raw_key = (os.getenv("FMP_API_KEY") or "").strip()
 FMP_API_KEY = "".join(ch for ch in _raw_key if ch.isalnum())
 FMP_URL     = "https://financialmodelingprep.com/stable/earnings-calendar"
@@ -29,6 +30,9 @@ H2 = int(os.getenv("EARNINGS_MORNING_TO_H",   "14"))  # inclusivo
 
 HARD_FILTER = os.getenv("EARNINGS_HARD_FILTER", "0").lower() in {"1","true","yes","y"}
 FORCE       = os.getenv("EARNINGS_FORCE",        "0").lower() in {"1","true","yes","y"}
+
+# Candado semanal (archivo temporal)
+LOCK_PATH = os.getenv("EARNINGS_LOCK_PATH", "/tmp/investx_earnings.lock")
 
 # ========= TELEGRAM =========
 def _post(text: str):
@@ -51,6 +55,25 @@ def monday_to_friday_range(today_local: datetime) -> Tuple[str, str]:
     friday = monday + timedelta(days=4)
     return monday.isoformat(), friday.isoformat()
 
+def current_iso_week_tag(now_local: datetime) -> str:
+    # Ej: "2025-W43"
+    y, w, _ = now_local.isocalendar()
+    return f"{y}-W{w:02d}"
+
+def read_lock() -> str | None:
+    try:
+        with open(LOCK_PATH, "r", encoding="utf-8") as f:
+            return (f.read() or "").strip()
+    except Exception:
+        return None
+
+def write_lock(tag: str) -> None:
+    try:
+        with open(LOCK_PATH, "w", encoding="utf-8") as f:
+            f.write(tag)
+    except Exception:
+        pass
+
 # ========= FETCH =========
 def fetch_earnings(start: str, end: str) -> List[Dict]:
     if not FMP_API_KEY:
@@ -65,16 +88,10 @@ def fetch_earnings(start: str, end: str) -> List[Dict]:
     if not isinstance(data, list):
         return []
     # Normalizar campos
-    out = []
+    out: List[Dict] = []
     for d in data:
         sym = (d.get("symbol") or "").upper()
-        # intentar distintas claves de nombre según endpoint
-        name = (
-            d.get("company")
-            or d.get("companyName")
-            or d.get("name")
-            or sym
-        )
+        name = d.get("company") or d.get("companyName") or d.get("name") or sym
         out.append({
             "symbol": sym,
             "company": name,
@@ -89,7 +106,6 @@ def classify_session(t: str | None) -> str:
     if not t:
         return "⏰ TBD"
     t = t.strip().lower()
-    # variantes conocidas
     if t in {"bmo", "pre", "premarket", "pre-market", "before"}:
         return "🕖 Pre-Market"
     if t in {"amc", "post", "postmarket", "after-market", "after"}:
@@ -103,14 +119,13 @@ def group_by_day(rows: List[Dict]) -> Dict[str, List[Dict]]:
         if not d:
             continue
         g.setdefault(d, []).append(r)
-    # ordenar cada día por símbolo; luego por fecha ascendente
+    # ordenar por símbolo dentro de cada día y por fecha ascendente
     for d, lst in g.items():
         lst.sort(key=lambda x: (x.get("symbol") or ""))
     return dict(sorted(g.items(), key=lambda kv: kv[0]))
 
 def build_message(grouped: Dict[str, List[Dict]], start: str, end: str) -> str:
-    lines = []
-    # Encabezado (solo título + semana)
+    lines: list[str] = []
     lines.append("📅 <b>EARNINGS WEEKLY PREVIEW | InvestX</b>")
     lines.append(f"Semana 📆 {start} → {end}\n")
     lines.append("<b>Agenda por día</b>:")
@@ -137,13 +152,19 @@ def main():
         return
 
     now_local = datetime.now(LOCAL_TZ)
-    if not (FORCE or is_run_window(now_local)):
-        return
+
+    # Si no forzamos, solo publicar lunes dentro de la ventana Y si no hay lock de esta semana
+    if not FORCE:
+        if not is_run_window(now_local):
+            return
+        week_tag = current_iso_week_tag(now_local)
+        if read_lock() == week_tag:
+            # Ya publicado esta semana
+            return
 
     start, end = monday_to_friday_range(now_local)
     data = fetch_earnings(start, end)
 
-    # Filtrado por watchlist si se desea
     if HARD_FILTER:
         wl = set(WATCHLIST_PRIORITY + WATCHLIST_SECONDARY)
         data = [d for d in data if (d.get("symbol", "").upper() in wl)]
@@ -151,9 +172,16 @@ def main():
     grouped = group_by_day(data)
     if not grouped:
         _post(no_relevant_msg(start, end))
+        # Si no hubo relevantes, igualmente marcamos lock para no repetir spam en el mismo lunes
+        if not FORCE and now_local.weekday() == 0:
+            write_lock(current_iso_week_tag(now_local))
         return
 
     _post(build_message(grouped, start, end))
+
+    # Crear lock tras publicar (solo si no estamos en modo FORCE)
+    if not FORCE and now_local.weekday() == 0:
+        write_lock(current_iso_week_tag(now_local))
 
 if __name__ == "__main__":
     main()
