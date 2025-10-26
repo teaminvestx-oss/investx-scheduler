@@ -1,18 +1,10 @@
-# earnings_weekly.py — InvestX
-# Agenda semanal completa + ⭐ watchlist + nombre empresa (stable) + hora ES (si existe, sin "TBD")
-# - Base: /stable/earnings-calendar (1 llamada/semana)
-# - Nombre: /stable/search-symbol (fallback: /stable/search-name, v3/profile, COMPANY_MAP)
-# - Hora:   /api/v3/earning_calendar?symbol=...&from=MON&to=FRI  (si no hay -> no se muestra)
-# - Conversión ET -> Europe/Madrid
-# - Publica 1 vez el lunes (ventana + lock). EARNINGS_FORCE=1 ignora ventana/lock.
-
+# earnings_weekly.py — InvestX (fix selección de símbolos + nombre estable)
 import os, re, time
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from typing import List, Dict, Tuple
 import requests
 
-# ========= ENV =========
 CHAT_ID    = os.getenv("CHAT_ID", "").strip()
 BOT_TOKEN  = os.getenv("INVESTX_TOKEN", "").strip()
 _raw_key   = (os.getenv("FMP_API_KEY") or "").strip()
@@ -35,14 +27,13 @@ WL_SET = set(WATCHLIST_PRIORITY + WATCHLIST_SECONDARY)
 
 LOCK_PATH = os.getenv("EARNINGS_LOCK_PATH", "/tmp/investx_earnings.lock")
 
-# Endpoints FMP (stable gratuitos + v3 para hora)
-FMP_STABLE_CAL     = "https://financialmodelingprep.com/stable/earnings-calendar"
-FMP_STABLE_SYM     = "https://financialmodelingprep.com/stable/search-symbol"
-FMP_STABLE_NAME    = "https://financialmodelingprep.com/stable/search-name"
-FMP_V3_PROFILE     = "https://financialmodelingprep.com/api/v3/profile"
-FMP_V3_ECAL        = "https://financialmodelingprep.com/api/v3/earning_calendar"
+# Endpoints
+FMP_STABLE_CAL  = "https://financialmodelingprep.com/stable/earnings-calendar"
+FMP_STABLE_SYM  = "https://financialmodelingprep.com/stable/search-symbol"
+FMP_STABLE_NAME = "https://financialmodelingprep.com/stable/search-name"
+FMP_V3_PROFILE  = "https://financialmodelingprep.com/api/v3/profile"
+FMP_V3_ECAL     = "https://financialmodelingprep.com/api/v3/earning_calendar"
 
-# ========= Helpers =========
 def _post(text: str):
     if not (BOT_TOKEN and CHAT_ID): return
     requests.post(
@@ -54,7 +45,7 @@ def _post(text: str):
 def is_run_window(now_local: datetime) -> bool:
     return (now_local.weekday() == 0) and (H1 <= now_local.hour <= H2)
 
-def monday_to_friday_range(today_local: datetime) -> Tuple[str, str]:
+def monday_to_friday_range(today_local: datetime):
     d = today_local.date()
     monday = d - timedelta(days=d.weekday())
     friday = monday + timedelta(days=4)
@@ -64,42 +55,26 @@ def current_iso_week_tag(now_local: datetime) -> str:
     y, w, _ = now_local.isocalendar()
     return f"{y}-W{w:02d}"
 
-def read_lock() -> str | None:
+def read_lock():
     try:
         with open(LOCK_PATH, "r", encoding="utf-8") as f:
             return (f.read() or "").strip()
     except Exception:
         return None
 
-def write_lock(tag: str) -> None:
+def write_lock(tag: str):
     try:
         with open(LOCK_PATH, "w", encoding="utf-8") as f:
             f.write(tag)
     except Exception:
         pass
 
-# ========= COMPANY MAP (manual, opcional) =========
-def parse_company_map(env_val: str | None) -> dict[str, str]:
-    out = {}
-    if not env_val: return out
-    parts = [p.strip() for p in env_val.split(";") if p.strip()]
-    for p in parts:
-        if "=" in p:
-            k, v = p.split("=", 1)
-            k = k.strip().upper(); v = v.strip()
-            if k and v: out[k] = v
-    return out
-
-COMPANY_MAP = parse_company_map(os.getenv("COMPANY_MAP"))
-
-# ========= Base (stable) =========
 def normalize_time_raw(raw: str) -> str:
     if not raw: return ""
     t = raw.strip()
     t = re.sub(r"\b(edt|est|et|eastern|time|zone)\b", "", t, flags=re.I)
     t = t.replace("-", " ").replace("_", " ").lower()
-    t = " ".join(t.split())
-    return t
+    return " ".join(t.split())
 
 def fetch_base(start: str, end: str) -> List[Dict]:
     if not FMP_API_KEY: return []
@@ -111,38 +86,35 @@ def fetch_base(start: str, end: str) -> List[Dict]:
     out=[]
     for d in js:
         out.append({
-            "symbol": (d.get("symbol") or "").upper(),
+            "symbol": (d.get("symbol") or "").strip().upper(),
             "company": (d.get("company") or d.get("companyName") or d.get("name") or "").strip(),
-            "date": d.get("date") or d.get("dateCalendar") or "",
+            "date": (d.get("date") or d.get("dateCalendar") or "").strip(),
             "time_raw": normalize_time_raw(d.get("time") or d.get("hour") or ""),
         })
     return out
 
-# ========= Nombre (stable primero) =========
+def parse_company_map(env_val: str | None) -> dict[str, str]:
+    out = {}
+    if not env_val: return out
+    for p in [x.strip() for x in env_val.split(";") if x.strip()]:
+        if "=" in p:
+            k, v = p.split("=", 1)
+            k = k.strip().upper(); v = v.strip()
+            if k and v: out[k] = v
+    return out
+
+COMPANY_MAP = parse_company_map(os.getenv("COMPANY_MAP"))
+
+# ===== Nombre (estable primero) =====
 _name_cache: Dict[str, str] = {}
 
 def enrich_symbol_name(sym: str) -> str | None:
-    # 0) mapa manual (sin llamadas)
     if sym in COMPANY_MAP: return COMPANY_MAP[sym]
     if sym in _name_cache: return _name_cache[sym] or None
 
     # 1) stable/search-symbol
     try:
-        r = requests.get(FMP_STABLE_SYM, params={"query": sym, "limit": 1, "apikey": FMP_API_KEY}, timeout=30)
-        r.raise_for_status()
-        js = r.json()
-        if isinstance(js, list) and js:
-            # campos típicos: symbol, name, exchange
-            name = (js[0].get("name") or js[0].get("companyName") or "").strip()
-            if name: 
-                _name_cache[sym] = name
-                return name
-    except Exception:
-        pass
-
-    # 2) stable/search-name (por si 'search-symbol' no devuelve nada)
-    try:
-        r = requests.get(FMP_STABLE_NAME, params={"query": sym, "limit": 1, "apikey": FMP_API_KEY}, timeout=30)
+        r = requests.get(FMP_STABLE_SYM, params={"query": sym, "limit": 1}, timeout=30)
         r.raise_for_status()
         js = r.json()
         if isinstance(js, list) and js:
@@ -153,7 +125,20 @@ def enrich_symbol_name(sym: str) -> str | None:
     except Exception:
         pass
 
-    # 3) v3/profile fallback
+    # 2) stable/search-name
+    try:
+        r = requests.get(FMP_STABLE_NAME, params={"query": sym, "limit": 1}, timeout=30)
+        r.raise_for_status()
+        js = r.json()
+        if isinstance(js, list) and js:
+            name = (js[0].get("name") or js[0].get("companyName") or "").strip()
+            if name:
+                _name_cache[sym] = name
+                return name
+    except Exception:
+        pass
+
+    # 3) v3/profile (fallback)
     try:
         r = requests.get(f"{FMP_V3_PROFILE}/{sym}", params={"apikey": FMP_API_KEY}, timeout=30)
         r.raise_for_status()
@@ -169,13 +154,13 @@ def enrich_symbol_name(sym: str) -> str | None:
     _name_cache[sym] = ""
     return None
 
-# ========= Hora semanal (v3) =========
-_time_cache: Dict[Tuple[str,str,str], Dict[str,str]] = {}  # (sym,start,end) -> {date: time_raw}
+# ===== Hora semanal =====
+_time_cache: Dict[Tuple[str,str,str], Dict[str,str]] = {}
 
 def enrich_symbol_times_for_week(sym: str, start: str, end: str) -> Dict[str, str]:
     key = (sym, start, end)
     if key in _time_cache: return _time_cache[key]
-    out: Dict[str, str] = {}
+    out={}
     try:
         r = requests.get(FMP_V3_ECAL, params={"symbol": sym, "from": start, "to": end, "apikey": FMP_API_KEY}, timeout=30)
         r.raise_for_status()
@@ -191,9 +176,8 @@ def enrich_symbol_times_for_week(sym: str, start: str, end: str) -> Dict[str, st
     _time_cache[key] = out
     return out
 
-# ========= ET -> Madrid =========
+# ===== Horario ET->Madrid =====
 _time_re = re.compile(r"\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\b", re.I)
-
 def parse_et_time_to_local(date_str: str, time_raw: str) -> str | None:
     m = _time_re.search(time_raw or "")
     if not (date_str and m): return None
@@ -221,7 +205,7 @@ def fallback_session_time_to_local(date_str: str, time_raw: str) -> str | None:
 def best_local_time(date_str: str, time_raw: str) -> str | None:
     return parse_et_time_to_local(date_str, time_raw) or fallback_session_time_to_local(date_str, time_raw)
 
-# ========= Dedup/Agrupar =========
+# ===== Dedup/Agrupar =====
 def score_time(date_str: str, time_raw: str) -> int:
     if not time_raw: return 0
     if _time_re.search(time_raw): return 2
@@ -233,13 +217,14 @@ def group_by_day(rows: List[Dict]) -> Dict[str, List[Dict]]:
     for r in rows:
         d = r.get("date") or ""
         if not d: continue
-        sym = r.get("symbol") or ""
+        sym = (r.get("symbol") or "").strip().upper()
         bucket = per_day.setdefault(d, {})
         if sym in bucket:
             old = bucket[sym]
             if score_time(d, r.get("time_raw") or "") > score_time(d, old.get("time_raw") or ""):
                 bucket[sym] = r
         else:
+            r["symbol"] = sym  # normaliza
             bucket[sym] = r
     grouped = {}
     for d, bysym in per_day.items():
@@ -248,26 +233,23 @@ def group_by_day(rows: List[Dict]) -> Dict[str, List[Dict]]:
         grouped[d] = items
     return dict(sorted(grouped.items(), key=lambda kv: kv[0]))
 
-# ========= Presentación =========
+# ===== Presentación =====
 def build_message(grouped: Dict[str, List[Dict]], start: str, end: str) -> str:
     lines = []
     lines.append("🗓️ <b>EARNINGS WEEKLY PREVIEW | InvestX</b>")
     lines.append(f"Semana 📆 {start} → {end}\n")
     lines.append("<b>Agenda por día</b>:")
-
     DIAS_ES = ["Lun", "Mar", "Mié", "Jue", "Vie", "Sáb", "Dom"]
+
     for d, items in grouped.items():
         dt = datetime.fromisoformat(d)
         lines.append(f"\n<u>{DIAS_ES[dt.weekday()]} {d}</u>")
         for it in items:
             sym  = (it.get("symbol") or "").upper()
-            name = it.get("company") or ""
+            name = (it.get("company") or "").strip()
             tloc = best_local_time(d, it.get("time_raw") or "")
             mark = "⭐" if sym in WL_SET else "•"
-            if name and name.upper() != sym:
-                base = f"{mark} <b>{name}</b> ({sym})"
-            else:
-                base = f"{mark} <b>{sym}</b>"
+            base = f"{mark} <b>{name}</b> ({sym})" if name and name.upper()!=sym else f"{mark} <b>{sym}</b>"
             lines.append(f"{base}  🕓 {tloc}" if tloc else base)
     return "\n".join(lines)
 
@@ -276,7 +258,7 @@ def no_relevant_msg(start: str, end: str) -> str:
             f"Semana 📆 {start} → {end}\n\n"
             "⚠️ No hay resultados en el calendario para esta semana.")
 
-# ========= MAIN =========
+# ===== MAIN =====
 def main():
     if not (BOT_TOKEN and CHAT_ID and FMP_API_KEY): return
     now_local = datetime.now(LOCAL_TZ)
@@ -286,37 +268,41 @@ def main():
         if read_lock() == current_iso_week_tag(now_local): return
 
     start, end = monday_to_friday_range(now_local)
-
     data = fetch_base(start, end)
     if not data:
         _post(no_relevant_msg(start, end))
-        if not FORCE and now_local.weekday() == 0:
+        if not FORCE and now_local.weekday()==0:
             write_lock(current_iso_week_tag(now_local))
         return
 
-    # ===== Enriquecer =====
-    symbols = {r["symbol"] for r in data} if not ENRICH_WATCHLIST_ONLY else ({r["symbol"] for r in data} & WL_SET)
+    # === selección de símbolos a enriquecer ===
+    all_syms = { (r["symbol"] or "").strip().upper() for r in data }
+    wl_syms  = all_syms & WL_SET
+    symbols  = wl_syms if ENRICH_WATCHLIST_ONLY else all_syms
+    if not symbols:
+        # fallback: si la intersección quedó vacía, enriquece todos
+        symbols = all_syms
 
-    # Nombres: sobreescribe si vacío/igual a ticker/muy corto
+    # NOMBRES
     n_fixed = 0
     for sym in sorted(symbols):
         nm = enrich_symbol_name(sym)
         if nm:
             for r in data:
-                if r["symbol"] == sym:
+                if (r["symbol"] or "").upper() == sym:
                     cur = (r.get("company") or "")
-                    if (not cur) or (cur.upper() == sym) or (len(cur) <= 3):
+                    if (not cur) or (cur.upper()==sym) or (len(cur)<=3):
                         r["company"] = nm
                         n_fixed += 1
         time.sleep(ENRICH_SLOWDOWN_MS/1000.0)
 
-    # Horas: mapa (fecha -> time_raw) por símbolo una sola vez
+    # HORAS (por semana, 1 llamada/símbolo)
     t_fixed = 0
     for sym in sorted(symbols):
         times_map = enrich_symbol_times_for_week(sym, start, end)
         if times_map:
             for r in data:
-                if r["symbol"] == sym and r["date"] in times_map and not r.get("time_raw"):
+                if (r["symbol"] or "").upper()==sym and r["date"] in times_map and not r.get("time_raw"):
                     r["time_raw"] = times_map[r["date"]]
                     t_fixed += 1
         time.sleep(ENRICH_SLOWDOWN_MS/1000.0)
@@ -325,9 +311,9 @@ def main():
     _post(build_message(grouped, start, end))
 
     if DEBUG:
-        _post(f"[earnings] enriched: names={n_fixed} times={t_fixed} | wl_only={ENRICH_WATCHLIST_ONLY}")
+        _post(f"[earnings] symbols={len(symbols)} | names={n_fixed} times={t_fixed} | wl_only={ENRICH_WATCHLIST_ONLY}")
 
-    if not FORCE and now_local.weekday() == 0:
+    if not FORCE and now_local.weekday()==0:
         write_lock(current_iso_week_tag(now_local))
 
 if __name__ == "__main__":
