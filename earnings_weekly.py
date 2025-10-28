@@ -1,89 +1,23 @@
-# scripts/earnings_weekly.py
-import os, json, time, html
-from datetime import datetime, timedelta, timezone
+# earnings_weekly.py  — v2.1 (semana cerrada + nombre + estrella)
+import os, json, html
+from datetime import datetime, timedelta, timezone, date
 from zoneinfo import ZoneInfo
 import requests
 
-# ================== CONFIG BÁSICA ==================
+# ===== Entorno =====
 BOT_TOKEN = os.getenv("INVESTX_TOKEN")
 CHAT_ID   = os.getenv("CHAT_ID")
 FMP_KEY   = os.getenv("FMP_API_KEY")
 LOCAL_TZ  = ZoneInfo(os.getenv("LOCAL_TZ", "Europe/Madrid"))
 EARNINGS_FORCE = os.getenv("EARNINGS_FORCE", "0").lower() in {"1","true","yes"}
 WATCHLIST = [t.strip().upper() for t in os.getenv("WATCHLIST","").split(",") if t.strip()]
+
+# Icono de watchlist embebido en código (no variable)
 WL_ICON = "⭐"
-PAD_DAYS = 0
-CACHE_PATH = "/tmp/investx_company_cache.json"
-LOCK_PATH  = "/tmp/investx_earnings_week.lock"
 
-# ================== Fallback de nombres ampliado (≈250 tickers) ==================
-LOCAL_NAME_MAP = {
-    # --- Tech majors ---
-    "AAPL":"Apple Inc.", "MSFT":"Microsoft Corporation", "GOOGL":"Alphabet Inc.", "GOOG":"Alphabet Inc.",
-    "AMZN":"Amazon.com, Inc.", "META":"Meta Platforms, Inc.", "NVDA":"NVIDIA Corporation",
-    "TSLA":"Tesla, Inc.", "NFLX":"Netflix, Inc.", "ADBE":"Adobe Inc.", "INTC":"Intel Corporation",
-    "AMD":"Advanced Micro Devices, Inc.", "CSCO":"Cisco Systems, Inc.", "ORCL":"Oracle Corporation",
-    "CRM":"Salesforce, Inc.", "IBM":"International Business Machines Corporation", "SAP":"SAP SE",
-    "SHOP":"Shopify Inc.", "UBER":"Uber Technologies, Inc.", "LYFT":"Lyft, Inc.",
-    "SNOW":"Snowflake Inc.", "PANW":"Palo Alto Networks, Inc.", "CRWD":"CrowdStrike Holdings, Inc.",
-    "ZS":"Zscaler, Inc.", "NOW":"ServiceNow, Inc.", "DDOG":"Datadog, Inc.", "DOCU":"DocuSign, Inc.",
-    "TEAM":"Atlassian Corporation Plc", "OKTA":"Okta, Inc.", "MDB":"MongoDB, Inc.", "NET":"Cloudflare, Inc.",
-    "TWLO":"Twilio Inc.", "PLTR":"Palantir Technologies Inc.", "AFRM":"Affirm Holdings, Inc.",
-    "SQ":"Block, Inc.", "PYPL":"PayPal Holdings, Inc.", "COIN":"Coinbase Global, Inc.",
-    "HOOD":"Robinhood Markets, Inc.", "RBLX":"Roblox Corporation", "ROKU":"Roku, Inc.",
-    "SPOT":"Spotify Technology S.A.", "SNAP":"Snap Inc.", "PINS":"Pinterest, Inc.", "ETSY":"Etsy, Inc.",
-    "ZM":"Zoom Video Communications, Inc.", "DOCS":"Doximity, Inc.", "ABNB":"Airbnb, Inc.",
-    "MELI":"MercadoLibre, Inc.", "RDDT":"Reddit, Inc.", "DUOL":"Duolingo, Inc.",
-    "AI":"C3.ai, Inc.", "PATH":"UiPath Inc.", "INTU":"Intuit Inc.", "ADSK":"Autodesk, Inc.",
-    "WDAY":"Workday, Inc.", "CRM":"Salesforce, Inc.", "VEEV":"Veeva Systems Inc.",
-    # --- Semiconductors ---
-    "QCOM":"QUALCOMM Incorporated", "TXN":"Texas Instruments Incorporated", "AVGO":"Broadcom Inc.",
-    "MU":"Micron Technology, Inc.", "NXPI":"NXP Semiconductors N.V.", "LRCX":"Lam Research Corporation",
-    "AMAT":"Applied Materials, Inc.", "TSM":"Taiwan Semiconductor Manufacturing Company Limited",
-    "ASML":"ASML Holding N.V.", "KLAC":"KLA Corporation", "ON":"ON Semiconductor Corporation",
-    "SWKS":"Skyworks Solutions, Inc.", "ADI":"Analog Devices, Inc.", "WDC":"Western Digital Corporation",
-    # --- Financials ---
-    "JPM":"JPMorgan Chase & Co.", "BAC":"Bank of America Corporation", "C":"Citigroup Inc.",
-    "GS":"The Goldman Sachs Group, Inc.", "MS":"Morgan Stanley", "WFC":"Wells Fargo & Company",
-    "AXP":"American Express Company", "V":"Visa Inc.", "MA":"Mastercard Incorporated",
-    "SOFI":"SoFi Technologies, Inc.", "SCHW":"Charles Schwab Corporation", "HOOD":"Robinhood Markets, Inc.",
-    "BLK":"BlackRock, Inc.", "TROW":"T. Rowe Price Group, Inc.", "COF":"Capital One Financial Corporation",
-    # --- Healthcare / Pharma ---
-    "UNH":"UnitedHealth Group Incorporated", "JNJ":"Johnson & Johnson", "PFE":"Pfizer Inc.",
-    "MRK":"Merck & Co., Inc.", "ABBV":"AbbVie Inc.", "LLY":"Eli Lilly and Company", "BMY":"Bristol-Myers Squibb Company",
-    "GILD":"Gilead Sciences, Inc.", "AMGN":"Amgen Inc.", "CVS":"CVS Health Corporation", "HCA":"HCA Healthcare, Inc.",
-    # --- Energy / Industrials ---
-    "XOM":"Exxon Mobil Corporation", "CVX":"Chevron Corporation", "COP":"ConocoPhillips",
-    "BP":"BP p.l.c.", "SHEL":"Shell plc", "TTE":"TotalEnergies SE",
-    "GE":"General Electric Company", "HON":"Honeywell International Inc.", "BA":"The Boeing Company",
-    "CAT":"Caterpillar Inc.", "DE":"Deere & Company", "MMM":"3M Company", "RTX":"RTX Corporation",
-    "NOC":"Northrop Grumman Corporation", "LMT":"Lockheed Martin Corporation", "F":"Ford Motor Company",
-    "GM":"General Motors Company", "TSLA":"Tesla, Inc.", "RIVN":"Rivian Automotive, Inc.",
-    # --- Consumer / Retail ---
-    "PG":"Procter & Gamble Company", "KO":"Coca-Cola Company", "PEP":"PepsiCo, Inc.",
-    "MCD":"McDonald's Corporation", "SBUX":"Starbucks Corporation", "COST":"Costco Wholesale Corporation",
-    "TGT":"Target Corporation", "WMT":"Walmart Inc.", "HD":"The Home Depot, Inc.",
-    "LOW":"Lowe's Companies, Inc.", "NKE":"NIKE, Inc.", "ADIDAS":"adidas AG", "DIS":"The Walt Disney Company",
-    "PARA":"Paramount Global", "CMCSA":"Comcast Corporation", "NFLX":"Netflix, Inc.",
-    "T":"AT&T Inc.", "VZ":"Verizon Communications Inc.", "TMUS":"T-Mobile US, Inc.",
-    # --- Airlines / Travel ---
-    "AAL":"American Airlines Group Inc.", "DAL":"Delta Air Lines, Inc.", "UAL":"United Airlines Holdings, Inc.",
-    "LUV":"Southwest Airlines Co.", "CCL":"Carnival Corporation & plc", "RCL":"Royal Caribbean Group",
-    # --- Commodities / Materials ---
-    "NEM":"Newmont Corporation", "FCX":"Freeport-McMoRan Inc.", "BHP":"BHP Group Limited",
-    "RIO":"Rio Tinto Group", "VALE":"Vale S.A.", "AA":"Alcoa Corporation",
-    # --- Utilities / Infrastructure ---
-    "NEE":"NextEra Energy, Inc.", "DUK":"Duke Energy Corporation", "SO":"The Southern Company",
-    "D":"Dominion Energy, Inc.", "XEL":"Xcel Energy Inc.",
-    # --- Misc & new tech ---
-    "RKT":"Rocket Companies, Inc.", "RIOT":"Riot Platforms, Inc.", "MARA":"Marathon Digital Holdings, Inc.",
-    "BTBT":"Bit Digital, Inc.", "CLSK":"CleanSpark, Inc.",
-    "UBS":"UBS Group AG", "GS":"The Goldman Sachs Group, Inc.",
-}
-
-# ================== HTTP ==================
+# ===== Sesión HTTP =====
 S = requests.Session()
-S.headers.update({"User-Agent":"InvestX-EarningsBot/1.7"})
+S.headers.update({"User-Agent":"InvestX-EarningsBot/2.1"})
 
 def fmp_get(url, params):
     q = dict(params or {})
@@ -94,16 +28,11 @@ def fmp_get(url, params):
     r.raise_for_status()
     return r.json()
 
-# ================== UTILIDADES ==================
+# ===== Utilidades =====
 def esc(s): return html.escape(s or "", quote=False)
 
-def send(text):
-    if not BOT_TOKEN or not CHAT_ID: return
-    S.post(
-        f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-        data={"chat_id":CHAT_ID, "parse_mode":"HTML", "disable_web_page_preview":True, "text":text},
-        timeout=20
-    )
+CACHE_PATH = "/tmp/investx_company_cache.json"
+LOCK_PATH  = "/tmp/investx_earnings_week.lock"
 
 def load_cache():
     try:
@@ -115,10 +44,19 @@ def save_cache(d):
         with open(CACHE_PATH,"w") as f: json.dump(d,f)
     except: pass
 
-def current_week_key():
-    return datetime.now(LOCAL_TZ).strftime("%G-W%V")
+def week_window_local(today: date):
+    """Lunes 00:00 a Domingo 23:59 de la semana del 'today' en TZ local."""
+    monday = (datetime.combine(today, datetime.min.time(), LOCAL_TZ)
+              - timedelta(days=today.weekday()))
+    sunday = monday + timedelta(days=6)
+    return monday.date(), sunday.date()
 
-def is_already_sent_this_week():
+def current_week_key():
+    d = datetime.now(LOCAL_TZ).date()
+    iso_year, iso_week, _ = d.isocalendar()
+    return f"{iso_year}-W{iso_week:02d}"
+
+def already_sent_this_week():
     try:
         with open(LOCK_PATH,"r") as f:
             return f.read().strip() == current_week_key()
@@ -126,105 +64,152 @@ def is_already_sent_this_week():
 
 def mark_sent_this_week():
     try:
-        with open(LOCK_PATH,"w") as f:
-            f.write(current_week_key())
+        with open(LOCK_PATH,"w") as f: f.write(current_week_key())
     except: pass
 
-def monday_sunday_local():
-    now = datetime.now(LOCAL_TZ)
-    monday = (now - timedelta(days=now.weekday())).replace(hour=0, minute=0, second=0)
-    sunday = monday + timedelta(days=6)
-    return monday.date(), sunday.date()
+def send(text: str):
+    if not (BOT_TOKEN and CHAT_ID): return
+    S.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+           data={"chat_id":CHAT_ID,"text":text,"parse_mode":"HTML","disable_web_page_preview":True},
+           timeout=20)
 
-# ================== FMP: CALENDARIO ==================
+# ===== Mapa local de nombres (extracto, añade los tuyos si quieres) =====
+LOCAL_NAME_MAP = {
+    "AAPL":"Apple Inc.", "MSFT":"Microsoft Corporation", "GOOGL":"Alphabet Inc.",
+    "GOOG":"Alphabet Inc.", "AMZN":"Amazon.com, Inc.", "META":"Meta Platforms, Inc.",
+    "NVDA":"NVIDIA Corporation", "TSLA":"Tesla, Inc.", "NFLX":"Netflix, Inc.",
+    "ADBE":"Adobe Inc.", "INTC":"Intel Corporation", "AMD":"Advanced Micro Devices, Inc.",
+    "ORCL":"Oracle Corporation", "CRM":"Salesforce, Inc.", "IBM":"International Business Machines Corporation",
+    "SAP":"SAP SE", "SNOW":"Snowflake Inc.", "PANW":"Palo Alto Networks, Inc.",
+    "CRWD":"CrowdStrike Holdings, Inc.", "ZS":"Zscaler, Inc.", "NOW":"ServiceNow, Inc.",
+    "PLTR":"Palantir Technologies Inc.", "ABNB":"Airbnb, Inc.", "MELI":"MercadoLibre, Inc.",
+    "RDDT":"Reddit, Inc.", "DUOL":"Duolingo, Inc.", "COIN":"Coinbase Global, Inc.",
+    "PYPL":"PayPal Holdings, Inc.", "RBLX":"Roblox Corporation", "ROKU":"Roku, Inc.",
+    "SPOT":"Spotify Technology S.A.", "ETSY":"Etsy, Inc.", "MSFT":"Microsoft Corporation",
+    "GE":"General Electric Company", "GM":"General Motors Company", "F":"Ford Motor Company",
+    "LMT":"Lockheed Martin Corporation", "BA":"The Boeing Company", "T":"AT&T Inc.",
+    "VZ":"Verizon Communications Inc.", "SBUX":"Starbucks Corporation", "KO":"Coca-Cola Company",
+    "PEP":"PepsiCo, Inc.", "WMT":"Walmart Inc.", "HD":"The Home Depot, Inc.",
+    "NKE":"NIKE, Inc.", "ABBV":"AbbVie Inc.", "CVX":"Chevron Corporation", "XOM":"Exxon Mobil Corporation",
+    "MSFT":"Microsoft Corporation", "AAL":"American Airlines Group Inc.", "MGM":"MGM Resorts International",
+    # añade más si quieres...
+}
+
+# ===== FMP: calendario semanal =====
 def fetch_week_calendar():
-    start, end = monday_sunday_local()
+    today_local = datetime.now(LOCAL_TZ).date()
+    start, end = week_window_local(today_local)
     js = fmp_get("https://financialmodelingprep.com/stable/earnings-calendar",
                  {"from": str(start), "to": str(end)})
+    # Filtro duro: solo fechas dentro [start, end]
     rows = []
     for it in js:
         sym = (it.get("symbol") or "").upper().strip()
-        dt  = (it.get("date") or "").strip()
-        if not sym or not dt: continue
-        rows.append({"symbol": sym, "date": dt})
+        ds  = (it.get("date") or "").strip()
+        if not sym or not ds: continue
+        try:
+            d = datetime.strptime(ds, "%Y-%m-%d").date()
+        except ValueError:
+            continue
+        if not (start <= d <= end):  # evita que se cuele el lunes siguiente
+            continue
+        rows.append({"symbol": sym, "date": d})
+    # dedup
     seen=set(); out=[]
     for r in rows:
-        k=(r["symbol"],r["date"])
+        k=(r["symbol"], r["date"])
         if k in seen: continue
         seen.add(k); out.append(r)
-    return out
+    return out, start, end
 
-# ================== NOMBRES ==================
-def get_company_name(sym):
+# ===== Resolver nombres con caché y fallback =====
+def get_company_name(sym: str):
     cache = load_cache()
     if sym in cache: return cache[sym]
-    name = None
-    try:
-        js = fmp_get("https://financialmodelingprep.com/stable/search", {"query": sym, "limit": 5})
-        for row in js or []:
-            if (row.get("symbol") or "").upper() == sym:
-                name = row.get("name"); break
-        if not name and js: name = js[0].get("name")
-        if not name:
-            js2 = fmp_get("https://financialmodelingprep.com/stable/search-symbol", {"query": sym, "limit": 5})
-            for row in js2 or []:
+    name = LOCAL_NAME_MAP.get(sym)  # primero mapa local (rápido y gratis)
+    if not name:
+        try:
+            # 1) /stable/search intenta por símbolo exacto
+            js = fmp_get("https://financialmodelingprep.com/stable/search",
+                         {"query": sym, "limit": 5})
+            for row in js or []:
                 if (row.get("symbol") or "").upper() == sym:
                     name = row.get("name"); break
-            if not name and js2: name = js2[0].get("name")
-    except Exception as e:
-        print("[get_company_name]", sym, e)
-    if not name: name = LOCAL_NAME_MAP.get(sym)
+            if not name and js:
+                name = js[0].get("name")
+            # 2) /stable/search-symbol como segundo intento
+            if not name:
+                js2 = fmp_get("https://financialmodelingprep.com/stable/search-symbol",
+                              {"query": sym, "limit": 5})
+                for row in js2 or []:
+                    if (row.get("symbol") or "").upper() == sym:
+                        name = row.get("name"); break
+                if not name and js2:
+                    name = js2[0].get("name")
+        except Exception:
+            pass
     if name:
-        cache[sym]=name; save_cache(cache)
+        cache[sym] = name
+        save_cache(cache)
     return name
 
-def enrich_all_names(rows):
+def enrich_names(rows):
+    uniq = sorted({r["symbol"] for r in rows})
     names={}
-    for sym in sorted({r["symbol"] for r in rows}):
-        nm=get_company_name(sym)
-        if nm: names[sym]=nm
+    for s in uniq:
+        nm = get_company_name(s)
+        if nm: names[s]=nm
     return names
 
-# ================== MENSAJE ==================
-DIAS_ES=["Lun","Mar","Mié","Jue","Vie","Sáb","Dom"]
-def day_es(dt): return f"{DIAS_ES[dt.weekday()]} {dt:%Y-%m-%d}"
+# ===== Mensaje =====
+DIAS_ES = ["Lun","Mar","Mié","Jue","Vie","Sáb","Dom"]
+def day_es(d: date):  # d es date (local ya)
+    wd = DIAS_ES[d.weekday()]
+    return f"{wd} {d:%Y-%m-%d}"
 
-def build_text(rows,names):
-    day_map={}
-    for r in rows: day_map.setdefault(r["date"],[]).append(r["symbol"])
-    days=sorted(day_map.keys())
-    start,end=monday_sunday_local()
-    head=(f"📅 <b>EARNINGS WEEKLY PREVIEW | InvestX</b>\n"
-          f"Semana: <b>{start}</b> → <b>{end}</b>\n\n<b>Agenda por día:</b>\n")
-    out=[head]
-    for d in days:
-        dt=datetime.strptime(d,"%Y-%m-%d").replace(tzinfo=timezone.utc).astimezone(LOCAL_TZ)
-        out.append(f"\n<u>{esc(day_es(dt))}</u>")
-        for sym in sorted(day_map[d]):
-            mark = WL_ICON if sym in WATCHLIST else "•"
+def build_message(rows, names, start, end):
+    by_day={}
+    for r in rows:
+        by_day.setdefault(r["date"], []).append(r["symbol"])
+    parts = []
+    header = (
+        "🗓️ <b>EARNINGS WEEKLY PREVIEW | InvestX</b>\n"
+        f"Semana: <b>{start}</b> → <b>{end}</b>\n\n"
+        "<b>Agenda por día:</b>\n"
+    )
+    parts.append(header)
+    for d in sorted(by_day.keys()):
+        parts.append(f"\n<u>{day_es(d)}</u>")
+        for sym in sorted(by_day[d]):
+            star = WL_ICON if sym in WATCHLIST else "•"
             nm = names.get(sym, "")
             tail = f" — {esc(nm)}" if nm else ""
-            out.append(f"{mark} <b>{esc(sym)}</b>{tail}")
-    return "\n".join(out).strip()
+            parts.append(f"{star} <b>{esc(sym)}</b>{tail}")
+    return "\n".join(parts).strip()
 
-# ================== MAIN ==================
+# ===== Main =====
 def main():
     if not FMP_KEY: raise SystemExit("Falta FMP_API_KEY")
-    if not BOT_TOKEN or not CHAT_ID: raise SystemExit("Faltan INVESTX_TOKEN/CHAT_ID")
-    now=datetime.now(LOCAL_TZ)
-    if not EARNINGS_FORCE and now.weekday()!=0:
-        print("[earnings] skip no es lunes"); return
-    if not EARNINGS_FORCE and is_already_sent_this_week():
-        print("[earnings] ya enviado esta semana"); return
-    rows=fetch_week_calendar()
-    if not rows:
-        send("📅 <b>EARNINGS WEEKLY PREVIEW</b>\nNo hay publicaciones en la semana.")
-        mark_sent_this_week(); return
-    names=enrich_all_names(rows)
-    text=build_text(rows,names)
-    send(text)
-    mark_sent_this_week()
-    print(f"[earnings] OK | {len(rows)} tickers | {len(names)} nombres")
+    if not (BOT_TOKEN and CHAT_ID): raise SystemExit("Faltan INVESTX_TOKEN/CHAT_ID")
 
-if __name__=="__main__":
+    now = datetime.now(LOCAL_TZ)
+    if not EARNINGS_FORCE:
+        if now.weekday() != 0:  # solo lunes
+            print("[earnings] skip: no es lunes"); return
+        if already_sent_this_week():
+            print("[earnings] ya enviado esta semana"); return
+
+    rows, start, end = fetch_week_calendar()
+    if not rows:
+        send("🗓️ <b>EARNINGS WEEKLY PREVIEW</b>\nNo hay publicaciones esta semana.")
+        if not EARNINGS_FORCE: mark_sent_this_week()
+        return
+
+    names = enrich_names(rows)
+    msg = build_message(rows, names, start, end)
+    send(msg)
+    if not EARNINGS_FORCE: mark_sent_this_week()
+    print(f"[earnings] enviado | rows={len(rows)} | names={len(names)}")
+
+if __name__ == "__main__":
     main()
