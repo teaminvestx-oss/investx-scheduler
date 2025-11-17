@@ -6,3 +6,5 @@ lxml
 yfinance
 pandas
 numpy
+openai
+investpy
