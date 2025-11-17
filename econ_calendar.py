@@ -22,10 +22,8 @@ if not OPENAI_API_KEY:
     missing.append("OPENAI_API_KEY")
 
 if missing:
-    # Esto es lo que estás viendo ahora en los logs
     raise RuntimeError("Faltan env vars: " + ", ".join(missing))
 
-# Cliente OpenAI (usa OPENAI_API_KEY)
 client = OpenAI(api_key=OPENAI_API_KEY)
 
 
@@ -34,17 +32,13 @@ client = OpenAI(api_key=OPENAI_API_KEY)
 # ======================================================
 
 def send_telegram_message(text: str):
-    """Envía un mensaje de texto simple al canal de Telegram."""
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
         "text": text,
         "parse_mode": "Markdown"
     }
-    resp = requests.post(url, json=payload)
-    # No levantamos excepción si falla, pero lo puedes descomentar si quieres:
-    # resp.raise_for_status()
-    return resp
+    requests.post(url, json=payload)
 
 
 # ======================================================
@@ -53,14 +47,9 @@ def send_telegram_message(text: str):
 
 def fetch_investing_calendar(start_date: dt.date, end_date: dt.date):
     """
-    Usa investpy.economic_calendar (Investing.com) para obtener eventos
-    entre start_date y end_date.
-
-    Filtraremos después por:
-    - País: United States
-    - Importancia: medium / high  (≈ 2–3⭐)
+    Obtiene calendario económico de Investing (vía investpy) para USA,
+    filtrando después por importancia media/alta (≈ 2–3⭐).
     """
-
     from_str = start_date.strftime("%d/%m/%Y")
     to_str = end_date.strftime("%d/%m/%Y")
 
@@ -73,35 +62,30 @@ def fetch_investing_calendar(start_date: dt.date, end_date: dt.date):
     except Exception as e:
         return None, f"Error al obtener calendario de investpy: {e}"
 
-    # Normalizamos columnas esperadas
-    # importance: 'low' / 'medium' / 'high'
     if "importance" not in df.columns:
         return None, "La respuesta de investpy no tiene columna 'importance'."
 
-    # Filtramos solo medium / high (≈ 2–3 estrellas)
+    # Solo medium / high (≈ 2–3 estrellas)
     df = df[df["importance"].isin(["medium", "high"])]
 
     if df.empty:
         return [], None
 
-    # Convertimos a lista de dicts
     events = df.to_dict("records")
     return events, None
 
 
 def build_events_text(events):
-    """Convierte la lista de eventos en texto plano para pasarlo al modelo."""
     lines = []
     for ev in events:
         date = str(ev.get("date", ""))
         time = str(ev.get("time", ""))
         event_name = str(ev.get("event", ""))
-        importance = str(ev.get("importance", ""))  # medium / high
+        importance = str(ev.get("importance", ""))
         actual = str(ev.get("actual", ""))
         forecast = str(ev.get("forecast", ""))
         previous = str(ev.get("previous", ""))
 
-        # Mapeo rápido importancia → estrellas
         if importance == "medium":
             stars = "2⭐"
         elif importance == "high":
@@ -123,10 +107,6 @@ def build_events_text(events):
 # ======================================================
 
 def summarize_events_calendar(raw_text: str, mode: str, today: dt.date) -> str:
-    """
-    Genera un resumen usando gpt-4.1-mini.
-    mode = 'weekly' o 'daily'
-    """
     if mode == "weekly":
         system_prompt = (
             "Eres InvestX, analista institucional. "
@@ -164,30 +144,35 @@ def summarize_events_calendar(raw_text: str, mode: str, today: dt.date) -> str:
 
 
 # ======================================================
-#  FUNCIÓN PÚBLICA: run_econ_calendar(mode)
+#  FUNCIÓN PRINCIPAL: SIN PARÁMETROS
 # ======================================================
 
-def run_econ_calendar(mode: str):
+def run_econ_calendar():
     """
-    mode:
-      - 'weekly' → desde hoy hasta 6 días después
-      - 'daily'  → solo hoy
+    Decide internamente si genera resumen semanal o diario:
 
-    Siempre envía ALGO al Telegram:
-      - resumen (si hay eventos)
-      - mensaje corto si no hay eventos o hay error
+    - Lunes  → semanal (hoy + 6 días).
+    - Mar–Vie → diario (solo hoy).
+    - Sáb/Dom → mensaje corto de “cron OK”.
     """
     today = dt.date.today()
+    weekday = today.weekday()  # 0 = lunes ... 6 = domingo
 
-    if mode == "weekly":
+    # Fin de semana: no hay calendario, pero confirmamos que el cron corre
+    if weekday >= 5:
+        send_telegram_message("📆 Hoy es fin de semana: no hay calendario USA, pero el cron está OK.")
+        return
+
+    if weekday == 0:
+        mode = "weekly"
         start_date = today
         end_date = today + dt.timedelta(days=6)
     else:
+        mode = "daily"
         start_date = end_date = today
 
     # 1) Obtener eventos
     events, err = fetch_investing_calendar(start_date, end_date)
-
     if err:
         send_telegram_message(f"⚠️ Error al obtener calendario económico: {err}")
         return
