@@ -6,7 +6,7 @@ import investpy
 from openai import OpenAI
 
 # ======================================================
-#  ENV VARS (usamos tus nombres sin cambiarlos)
+#  ENV VARS (usamos tus nombres: INVESTX_TOKEN, CHAT_ID)
 # ======================================================
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN") or os.getenv("INVESTX_TOKEN")
@@ -22,126 +22,189 @@ if not OPENAI_API_KEY:
     missing.append("OPENAI_API_KEY")
 
 if missing:
+    # Esto es lo que estás viendo ahora en los logs
     raise RuntimeError("Faltan env vars: " + ", ".join(missing))
 
+# Cliente OpenAI (usa OPENAI_API_KEY)
 client = OpenAI(api_key=OPENAI_API_KEY)
 
 
 # ======================================================
-#  FUNCIÓN: enviar mensaje a Telegram
+#  TELEGRAM
 # ======================================================
 
 def send_telegram_message(text: str):
+    """Envía un mensaje de texto simple al canal de Telegram."""
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
         "text": text,
         "parse_mode": "Markdown"
     }
-    requests.post(url, json=payload)
+    resp = requests.post(url, json=payload)
+    # No levantamos excepción si falla, pero lo puedes descomentar si quieres:
+    # resp.raise_for_status()
+    return resp
 
 
 # ======================================================
-#  FUNCIÓN: obtener calendario de Investing filtrado
+#  CALENDARIO ECONÓMICO (Investing → investpy)
 # ======================================================
 
-def fetch_investing_calendar(from_date, to_date):
+def fetch_investing_calendar(start_date: dt.date, end_date: dt.date):
     """
-    Obtiene el calendario económico filtrado:
-    - País: Estados Unidos
-    - Impacto: 2 y 3 estrellas
+    Usa investpy.economic_calendar (Investing.com) para obtener eventos
+    entre start_date y end_date.
+
+    Filtraremos después por:
+    - País: United States
+    - Importancia: medium / high  (≈ 2–3⭐)
     """
+
+    from_str = start_date.strftime("%d/%m/%Y")
+    to_str = end_date.strftime("%d/%m/%Y")
 
     try:
         df = investpy.economic_calendar(
             countries=["united states"],
-            from_date=from_date.strftime("%d/%m/%Y"),
-            to_date=to_date.strftime("%d/%m/%Y")
+            from_date=from_str,
+            to_date=to_str
         )
     except Exception as e:
-        return None, f"Error obteniendo calendario: {str(e)}"
+        return None, f"Error al obtener calendario de investpy: {e}"
 
-    # Filtrar impacto 2 y 3
-    df = df[df["impact"].isin(["medium", "high"])]
+    # Normalizamos columnas esperadas
+    # importance: 'low' / 'medium' / 'high'
+    if "importance" not in df.columns:
+        return None, "La respuesta de investpy no tiene columna 'importance'."
+
+    # Filtramos solo medium / high (≈ 2–3 estrellas)
+    df = df[df["importance"].isin(["medium", "high"])]
 
     if df.empty:
         return [], None
 
-    return df.to_dict("records"), None
+    # Convertimos a lista de dicts
+    events = df.to_dict("records")
+    return events, None
 
 
-# ======================================================
-#  FUNCIÓN: generar resumen con ChatGPT MINI
-# ======================================================
-
-def ai_summarize(text: str) -> str:
-    """
-    Usa gpt-4o-mini (barato) para hacer un resumen.
-    """
-    try:
-        resp = client.responses.create(
-            model="gpt-4o-mini",
-            input=f"Resume este calendario económico de forma clara y útil para trading:\n\n{text}"
-        )
-        return resp.output_text
-    except Exception as e:
-        return f"No fue posible generar resumen AI: {str(e)}"
-
-
-# ======================================================
-#  FUNCIÓN PRINCIPAL
-# ======================================================
-
-def run_econ_calendar():
-    today = dt.date.today()
-    weekday = today.weekday()  # lunes=0, domingo=6
-
-    # -----------------------------
-    # LUNES → semana completa
-    # -----------------------------
-    if weekday == 0:
-        from_date = today
-        to_date = today + dt.timedelta(days=6)
-        header = "📅 *Calendario Económico — Semana Completa (USA)*"
-    # -----------------------------
-    # MARTES–VIERNES → solo hoy
-    # -----------------------------
-    elif 1 <= weekday <= 4:
-        from_date = to_date = today
-        header = f"📅 *Calendario Económico — {today.strftime('%d/%m/%Y')} (USA)*"
-    else:
-        # Sábado o domingo → no hay calendario, pero mandamos mensaje mínimo
-        send_telegram_message("⏳ Cron ejecutado (fin de semana). No hay calendario económico.")
-        return
-
-    # Obtener calendario
-    data, err = fetch_investing_calendar(from_date, to_date)
-
-    if err:
-        send_telegram_message(f"⚠️ Error obteniendo calendario: {err}")
-        return
-
-    if not data:
-        send_telegram_message(f"{header}\n\nNo hay eventos de impacto 2–3⭐️ en USA.")
-        return
-
-    # Formato básico
+def build_events_text(events):
+    """Convierte la lista de eventos en texto plano para pasarlo al modelo."""
     lines = []
-    for ev in data:
-        lines.append(
-            f"• *{ev['date']} {ev['time']}* — {ev['event']} "
-            f"({ev['impact']}) → Actual: {ev['actual']} | Previo: {ev['previous']} | Est.: {ev['forecast']}"
+    for ev in events:
+        date = str(ev.get("date", ""))
+        time = str(ev.get("time", ""))
+        event_name = str(ev.get("event", ""))
+        importance = str(ev.get("importance", ""))  # medium / high
+        actual = str(ev.get("actual", ""))
+        forecast = str(ev.get("forecast", ""))
+        previous = str(ev.get("previous", ""))
+
+        # Mapeo rápido importancia → estrellas
+        if importance == "medium":
+            stars = "2⭐"
+        elif importance == "high":
+            stars = "3⭐"
+        else:
+            stars = ""
+
+        line = (
+            f"{date} {time} | {event_name} | {stars} "
+            f"(act: {actual}, est: {forecast}, prev: {previous})"
         )
+        lines.append(line)
 
-    raw_text = "\n".join(lines)
+    return "\n".join(lines)
 
-    # Resumen AI
-    summary = ai_summarize(raw_text)
 
-    final_msg = (
-        f"{header}\n\n"
-        f"*Resumen AI*\n{summary}\n\n"
-        f"*Detalle completo:*\n{raw_text}"
+# ======================================================
+#  RESUMEN CON GPT-4.1-MINI
+# ======================================================
+
+def summarize_events_calendar(raw_text: str, mode: str, today: dt.date) -> str:
+    """
+    Genera un resumen usando gpt-4.1-mini.
+    mode = 'weekly' o 'daily'
+    """
+    if mode == "weekly":
+        system_prompt = (
+            "Eres InvestX, analista institucional. "
+            "Tienes el calendario económico SOLO de Estados Unidos y SOLO de importancia media/alta "
+            "(equivalente a 2–3 estrellas). Haz un resumen SEMANAL para un canal de Telegram:\n\n"
+            "- Agrupa por día (Lunes, Martes, etc.).\n"
+            "- Indica hora, dato y por qué es relevante para índices USA y el USD.\n"
+            "- Máximo 8–10 viñetas.\n"
+            "- Termina SIEMPRE con una sección '📌 Claves InvestX' con 2–3 ideas clave."
+        )
+        header = "📆 *Resumen calendario económico de la semana – EE. UU. (2–3⭐)*\n\n"
+    else:
+        system_prompt = (
+            "Eres InvestX, analista institucional. "
+            "Tienes el calendario económico SOLO de Estados Unidos y SOLO de importancia media/alta "
+            "(equivalente a 2–3 estrellas). Haz un resumen DIARIO para un canal de Telegram:\n\n"
+            "- Haz 3–6 viñetas.\n"
+            "- Indica hora, dato y posible impacto en índices USA y el USD.\n"
+            "- Termina SIEMPRE con una línea '👉 Clave del día:' con el catalizador principal."
+        )
+        header = f"📆 *Calendario económico para hoy ({today.strftime('%d/%m')}) – EE. UU. (2–3⭐)*\n\n"
+
+    user_prompt = f"Estos son los eventos filtrados (USA, importancia media/alta):\n\n{raw_text}"
+
+    resp = client.chat.completions.create(
+        model="gpt-4.1-mini",
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
     )
 
+    summary = resp.choices[0].message.content.strip()
+    return header + summary
+
+
+# ======================================================
+#  FUNCIÓN PÚBLICA: run_econ_calendar(mode)
+# ======================================================
+
+def run_econ_calendar(mode: str):
+    """
+    mode:
+      - 'weekly' → desde hoy hasta 6 días después
+      - 'daily'  → solo hoy
+
+    Siempre envía ALGO al Telegram:
+      - resumen (si hay eventos)
+      - mensaje corto si no hay eventos o hay error
+    """
+    today = dt.date.today()
+
+    if mode == "weekly":
+        start_date = today
+        end_date = today + dt.timedelta(days=6)
+    else:
+        start_date = end_date = today
+
+    # 1) Obtener eventos
+    events, err = fetch_investing_calendar(start_date, end_date)
+
+    if err:
+        send_telegram_message(f"⚠️ Error al obtener calendario económico: {err}")
+        return
+
+    if not events:
+        if mode == "weekly":
+            msg = "📆 Esta semana no hay eventos relevantes (2–3⭐) en EE. UU."
+        else:
+            msg = "📆 Hoy no hay eventos relevantes (2–3⭐) en EE. UU."
+        send_telegram_message(msg)
+        return
+
+    # 2) Construir texto base
+    raw_text = build_events_text(events)
+
+    # 3) Resumen AI
+    final_msg = summarize_events_calendar(raw_text, mode, today)
+
+    # 4) Enviar a Telegram
     send_telegram_message(final_msg)
