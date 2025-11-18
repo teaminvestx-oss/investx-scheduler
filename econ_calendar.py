@@ -49,9 +49,17 @@ def send_telegram_message(text: str):
 def fetch_investing_calendar(start_date: dt.date, end_date: dt.date):
     """
     Obtiene calendario económico de Investing (vía investpy) para USA,
-    entre start_date y end_date (incluidos).
+    entre start_date y end_date.
     Luego filtramos por importancia media/alta (≈ 2–3⭐).
+
+    FIX: si por lo que sea end_date <= start_date, forzamos end_date = start_date + 1 día
+    para evitar el error ERR#0032 de investpy.
     """
+
+    # Cinturón de seguridad por si algo raro pasa con fechas
+    if end_date <= start_date:
+        end_date = start_date + dt.timedelta(days=1)
+
     from_str = start_date.strftime("%d/%m/%Y")
     to_str = end_date.strftime("%d/%m/%Y")
 
@@ -155,8 +163,7 @@ def run_econ_calendar():
     Decide internamente si genera resumen semanal o diario:
 
     - Lunes   → semanal (hoy + 6 días)
-    - Mar–Vie → diario (solo hoy, pero pedimos rango hoy→mañana
-                 para evitar el ERR#0032 de investpy)
+    - Mar–Vie → diario (hoy → hoy+1, y luego resumimos solo lo relevante)
     - Sáb/Dom → mensaje corto de “cron OK”
     """
     today = dt.date.today()
@@ -176,7 +183,6 @@ def run_econ_calendar():
         # MAR–VIE → DIARIO
         mode = "daily"
         start_date = today
-        # FIX investpy: 'to_date' debe ser estrictamente mayor que 'from_date'
         end_date = today + dt.timedelta(days=1)
 
     # 1) Obtener eventos
