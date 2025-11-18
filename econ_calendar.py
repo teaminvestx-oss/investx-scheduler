@@ -32,6 +32,7 @@ client = OpenAI(api_key=OPENAI_API_KEY)
 # ======================================================
 
 def send_telegram_message(text: str):
+    """Envía un mensaje de texto simple al canal de Telegram."""
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
@@ -48,7 +49,8 @@ def send_telegram_message(text: str):
 def fetch_investing_calendar(start_date: dt.date, end_date: dt.date):
     """
     Obtiene calendario económico de Investing (vía investpy) para USA,
-    filtrando después por importancia media/alta (≈ 2–3⭐).
+    entre start_date y end_date (incluidos).
+    Luego filtramos por importancia media/alta (≈ 2–3⭐).
     """
     from_str = start_date.strftime("%d/%m/%Y")
     to_str = end_date.strftime("%d/%m/%Y")
@@ -76,6 +78,7 @@ def fetch_investing_calendar(start_date: dt.date, end_date: dt.date):
 
 
 def build_events_text(events):
+    """Convierte los eventos en texto plano para pasarlo al modelo."""
     lines = []
     for ev in events:
         date = str(ev.get("date", ""))
@@ -111,7 +114,7 @@ def summarize_events_calendar(raw_text: str, mode: str, today: dt.date) -> str:
         system_prompt = (
             "Eres InvestX, analista institucional. "
             "Tienes el calendario económico SOLO de Estados Unidos y SOLO de importancia media/alta "
-            "(equivalente a 2–3 estrellas). Haz un resumen SEMANAL para un canal de Telegram:\n\n"
+            "(2–3 estrellas). Haz un resumen SEMANAL para un canal de Telegram:\n\n"
             "- Agrupa por día (Lunes, Martes, etc.).\n"
             "- Indica hora, dato y por qué es relevante para índices USA y el USD.\n"
             "- Máximo 8–10 viñetas.\n"
@@ -122,7 +125,7 @@ def summarize_events_calendar(raw_text: str, mode: str, today: dt.date) -> str:
         system_prompt = (
             "Eres InvestX, analista institucional. "
             "Tienes el calendario económico SOLO de Estados Unidos y SOLO de importancia media/alta "
-            "(equivalente a 2–3 estrellas). Haz un resumen DIARIO para un canal de Telegram:\n\n"
+            "(2–3 estrellas). Haz un resumen DIARIO para un canal de Telegram:\n\n"
             "- Haz 3–6 viñetas.\n"
             "- Indica hora, dato y posible impacto en índices USA y el USD.\n"
             "- Termina SIEMPRE con una línea '👉 Clave del día:' con el catalizador principal."
@@ -144,16 +147,17 @@ def summarize_events_calendar(raw_text: str, mode: str, today: dt.date) -> str:
 
 
 # ======================================================
-#  FUNCIÓN PRINCIPAL: SIN PARÁMETROS
+#  FUNCIÓN PRINCIPAL (sin parámetros)
 # ======================================================
 
 def run_econ_calendar():
     """
     Decide internamente si genera resumen semanal o diario:
 
-    - Lunes  → semanal (hoy + 6 días).
-    - Mar–Vie → diario (solo hoy).
-    - Sáb/Dom → mensaje corto de “cron OK”.
+    - Lunes   → semanal (hoy + 6 días)
+    - Mar–Vie → diario (solo hoy, pero pedimos rango hoy→mañana
+                 para evitar el ERR#0032 de investpy)
+    - Sáb/Dom → mensaje corto de “cron OK”
     """
     today = dt.date.today()
     weekday = today.weekday()  # 0 = lunes ... 6 = domingo
@@ -164,12 +168,16 @@ def run_econ_calendar():
         return
 
     if weekday == 0:
+        # LUNES → SEMANAL
         mode = "weekly"
         start_date = today
         end_date = today + dt.timedelta(days=6)
     else:
+        # MAR–VIE → DIARIO
         mode = "daily"
-        start_date = end_date = today
+        start_date = today
+        # FIX investpy: 'to_date' debe ser estrictamente mayor que 'from_date'
+        end_date = today + dt.timedelta(days=1)
 
     # 1) Obtener eventos
     events, err = fetch_investing_calendar(start_date, end_date)
