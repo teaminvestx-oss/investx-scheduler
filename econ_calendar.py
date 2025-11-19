@@ -1,4 +1,3 @@
-# econ_calendar.py
 import logging
 from datetime import datetime, timedelta
 
@@ -10,163 +9,176 @@ from utils import send_telegram_message, call_gpt_mini
 logger = logging.getLogger(__name__)
 
 
-def _get_today_range():
-    """
-    Devuelve from_date y to_date en formato dd/mm/yyyy.
-    Ponemos to_date = hoy + 1 día para evitar el error:
-    'to_date should be greater than from_date'.
-    """
-    today = datetime.now()
+def _get_calendar_df():
+    """Descarga calendario USA de hoy (forzando to_date > from_date)."""
+    today = datetime.utcnow().date()
     tomorrow = today + timedelta(days=1)
-    from_date = today.strftime("%d/%m/%Y")
-    to_date = tomorrow.strftime("%d/%m/%Y")
-    return from_date, to_date
+
+    from_str = today.strftime("%d/%m/%Y")
+    to_str = tomorrow.strftime("%d/%m/%Y")
+
+    logger.info(
+        f"econ_calendar:[INFO] econ_calendar: Rango fechas from_date={from_str}, "
+        f"to_date={to_str}"
+    )
+
+    try:
+        df = investpy.economic_calendar(
+            countries=["united states"],
+            from_date=from_str,
+            to_date=to_str,
+        )
+    except Exception as e:
+        raise RuntimeError(f"Error al obtener calendario de investpy: {e}")
+
+    if df is None or df.empty:
+        return pd.DataFrame()
+
+    # Nos quedamos solo con USA y quitamos filas sin hora/evento
+    df = df[df["country"].str.lower().str.contains("united states")]
+    df = df.dropna(subset=["event"])
+
+    # Orden por fecha/hora si las columnas existen
+    if "date" in df.columns and "time" in df.columns:
+        try:
+            dt = pd.to_datetime(df["date"] + " " + df["time"])
+            df = df.assign(_dt=dt).sort_values("_dt")
+        except Exception:
+            pass
+
+    return df
 
 
-def _format_event_line(row: pd.Series) -> str:
-    """
-    Devuelve una línea de texto legible para Telegram para un evento.
-    """
-    # importancia en estrellas
-    importance = str(row.get("importance", "")).lower()
-    if "high" in importance:
-        stars = "⭐⭐⭐"
-    elif "medium" in importance:
-        stars = "⭐⭐"
+def _stars_from_importance(importance: str) -> str:
+    imp = str(importance).lower()
+    if "high" in imp or imp.strip() in {"3", "3.0"}:
+        return "⭐⭐⭐"
+    if "medium" in imp or imp.strip() in {"2", "2.0"}:
+        return "⭐⭐"
+    return "⭐"
+
+
+def _format_event_row(row) -> str:
+    stars = _stars_from_importance(row.get("importance", ""))
+    time = row.get("time", "--:--")
+    name = row.get("event", "").strip()
+
+    actual = str(row.get("actual", "") or "").strip()
+    forecast = str(row.get("forecast", "") or "").strip()
+    previous = str(row.get("previous", "") or "").strip()
+
+    nums = []
+    if actual:
+        nums.append(f"*Actual:* {actual}")
+    if forecast:
+        nums.append(f"*Previsión:* {forecast}")
+    if previous:
+        nums.append(f"*Anterior:* {previous}")
+
+    if nums:
+        nums_str = " | ".join(nums)
     else:
-        stars = "⭐"
+        nums_str = "Sin datos numéricos disponibles."
 
-    time_str = str(row.get("time", "")).strip()
-    event = str(row.get("event", "")).strip()
+    line = (
+        f"{stars} *{name}*\n"
+        f"🕒 {time}\n"
+        f"💬 {nums_str}"
+    )
+    return line
 
-    actual = str(row.get("actual", "")).strip()
-    forecast = str(row.get("forecast", "")).strip()
-    previous = str(row.get("previous", "")).strip()
 
-    parts = []
+def _build_message_with_ai(df: pd.DataFrame) -> str:
+    """
+    Construye el mensaje final usando la IA para un breve análisis,
+    pero si la IA falla se envía solo el listado.
+    """
+    today = datetime.utcnow().date()
+    title = f"📅 Resumen económico USA – {today.strftime('%d/%m/%Y')} (2–3⭐)\n\n"
 
-    # cabecera
-    if time_str and time_str != "NaN":
-        header = f"{stars} {time_str} – {event}"
+    # Filtramos solo media/alta importancia para que no sea eterno
+    if "importance" in df.columns:
+        mask = df["importance"].astype(str).str.lower().isin(
+            ["medium", "high", "2", "3", "2.0", "3.0"]
+        )
+        df_imp = df[mask].copy()
+        if df_imp.empty:
+            df_imp = df.copy()
     else:
-        header = f"{stars} {event}"
-    parts.append(header)
+        df_imp = df.copy()
 
-    # detalles numéricos si existen
-    sub = []
-    if actual and actual != "nan":
-        sub.append(f"Actual: {actual}")
-    if forecast and forecast != "nan":
-        sub.append(f"Previsión: {forecast}")
-    if previous and previous != "nan":
-        sub.append(f"Anterior: {previous}")
+    # Limitamos a los 10–12 eventos más relevantes para el mensaje
+    df_imp = df_imp.head(12)
 
-    if sub:
-        parts.append(" | " + " · ".join(sub))
+    # Texto resumido para pasar a la IA
+    eventos_for_ai = []
+    for _, row in df_imp.iterrows():
+        eventos_for_ai.append(
+            f"- {row.get('time','--:--')} | {row.get('event','').strip()} | "
+            f"imp={row.get('importance','')} | "
+            f"actual={row.get('actual','')} | "
+            f"forecast={row.get('forecast','')} | "
+            f"previous={row.get('previous','')}"
+        )
+    eventos_for_ai_text = "\n".join(eventos_for_ai)
 
-    return "".join(parts)
+    system_prompt = (
+        "Eres un analista macro que explica a traders intradía, en español, "
+        "qué eventos de EEUU pueden mover índices USA y el dólar. "
+        "Sé concreto, tono natural, máximo 3–4 frases cortas."
+    )
+    user_prompt = (
+        "Con esta lista de eventos macro de EEUU para hoy, explica brevemente "
+        "qué vigilarías y dónde puede haber más impacto en índices y USD:\n\n"
+        f"{eventos_for_ai_text}"
+    )
+
+    resumen = call_gpt_mini(system_prompt, user_prompt, max_tokens=220)
+
+    if resumen:
+        resumen_block = f"👉 *Clave del día:*\n{resumen.strip()}\n\n"
+    else:
+        resumen_block = ""
+
+    # Listado formateado de eventos
+    lines = [_format_event_row(row) for _, row in df_imp.iterrows()]
+    events_block = "\n\n".join(lines)
+
+    msg = title + resumen_block + events_block
+    return msg
 
 
 def run_econ_calendar():
     """
-    Obtiene el calendario económico de USA para hoy (impacto medio/alto)
-    y lo envía a Telegram con una breve interpretación usando GPT mini.
+    Función que llama main.py.
+    - Descarga calendario USA.
+    - Si no hay nada relevante, manda mensaje indicándolo.
+    - Si hay datos, construye mensaje (con IA si se puede) y lo envía por Telegram.
     """
-    logger.info("[INFO] econ_calendar: Obteniendo calendario económico USA...")
+    logger.info("econ_calendar:[INFO] econ_calendar: Obteniendo calendario económico USA...")
 
     try:
-        from_date, to_date = _get_today_range()
-        logger.info(
-            f"[INFO] econ_calendar: Rango fechas from_date={from_date}, to_date={to_date}"
-        )
-
-        # llamada correcta a investpy (OJO: es una función, no .get_economic_calendar)
-        df = investpy.economic_calendar(
-            countries=["united states"],
-            from_date=from_date,
-            to_date=to_date,
-            time_zone="GMT",
-        )
-
-        if df is None or df.empty:
-            msg = (
-                "🗓️ Calendario económico USA – hoy\n\n"
-                "⚠️ No hay eventos económicos relevantes de impacto medio/alto en EE. UU."
-            )
-            send_telegram_message(msg)
-            logger.info("[INFO] econ_calendar: Sin eventos relevantes.")
-            return
-
-        # Nos quedamos solo con importancia media/alta
-        df["importance"] = df["importance"].astype(str).str.lower()
-        df = df[df["importance"].isin(["medium", "high"])]
-
-        if df.empty:
-            msg = (
-                "🗓️ Calendario económico USA – hoy\n\n"
-                "⚠️ No hay eventos de impacto medio/alto en EE. UU."
-            )
-            send_telegram_message(msg)
-            logger.info("[INFO] econ_calendar: Solo había importancia baja, filtrado.")
-            return
-
-        # Ordenamos por hora si hay columna time
-        if "time" in df.columns:
-            df["time"] = df["time"].astype(str)
-            try:
-                df = df.sort_values("time")
-            except Exception:
-                pass
-
-        # Construimos líneas para Telegram y para la IA
-        lines_tg = []
-        lines_ai = []
-
-        for _, row in df.iterrows():
-            line = _format_event_line(row)
-            lines_tg.append("• " + line)
-
-            lines_ai.append(
-                f"{row.get('time', '')} - {row.get('event', '')} | "
-                f"importance={row.get('importance', '')}, "
-                f"actual={row.get('actual', '')}, "
-                f"forecast={row.get('forecast', '')}, "
-                f"previous={row.get('previous', '')}"
-            )
-
-        today_str = datetime.now().strftime("%d/%m/%Y")
-        header = f"🗓️ Calendario económico USA – {today_str} (impacto medio/alto)\n\n"
-        body_events = "\n".join(lines_tg)
-
-        # Interpretación con GPT mini (gpt-4o-mini en utils)
-        prompt = (
-            "Eres analista macro para un canal de trading en español. "
-            "Te doy los eventos del calendario económico de HOY en EE. UU. "
-            "Quiero un resumen muy breve (máx 4 líneas) sobre cómo pueden impactar "
-            "en índices USA (especialmente S&P 500 y Nasdaq) y en el USD. "
-            "No menciones que eres IA ni hables de 'datos proporcionados'. "
-            "Va directo al grano.\n\n"
-            "Eventos:\n"
-            + "\n".join(lines_ai)
-        )
-
-        interpretacion = call_gpt_mini(prompt, max_tokens=220)
-
-        if interpretacion:
-            texto_final = (
-                header
-                + body_events
-                + "\n\n📌 Interpretación del día:\n"
-                + interpretacion.strip()
-            )
-        else:
-            texto_final = header + body_events
-
-        send_telegram_message(texto_final)
-        logger.info("[INFO] econ_calendar: Calendario económico enviado.")
-
+        df = _get_calendar_df()
     except Exception as e:
-        logger.error(f"[ERROR] econ_calendar: ⚠️ Error al obtener calendario económico: {e}")
-        send_telegram_message(
-            f"⚠️ Error al obtener calendario económico:\n{e}"
+        # Aquí sí queremos que se vea el error en Telegram
+        err_msg = (
+            "⚠️ Error al obtener calendario económico:\n"
+            f"{e}"
         )
+        logger.error(f"ERROR:econ_calendar: {err_msg}")
+        send_telegram_message(err_msg)
+        return
+
+    if df.empty:
+        msg = (
+            "📅 Calendario económico USA – hoy\n\n"
+            "No hay publicaciones macro de alto impacto previstas para hoy en EEUU."
+        )
+        logger.info("econ_calendar:[INFO] Sin eventos relevantes, enviando aviso.")
+        send_telegram_message(msg)
+        return
+
+    msg = _build_message_with_ai(df)
+    logger.info("econ_calendar:[INFO] Enviando calendario económico...")
+    send_telegram_message(msg)
+    logger.info("econ_calendar:[INFO] Calendario económico enviado.")
