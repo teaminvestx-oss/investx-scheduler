@@ -5,54 +5,44 @@ import datetime as dt
 import investpy
 from openai import OpenAI
 
-# =====================================
-# ENV VARS
-# =====================================
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN") or os.getenv("INVESTX_TOKEN")
-CHAT_ID = os.getenv("CHAT_ID") or os.getenv("TELEGRAM_CHAT_ID")
+CHAT_ID = os.getenv("TELEGRAM_CHAT_ID") or os.getenv("CHAT_ID")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
 
-def env_ok() -> bool:
-    missing = []
-    if not TELEGRAM_TOKEN:
-        missing.append("TELEGRAM_TOKEN/INVESTX_TOKEN")
-    if not CHAT_ID:
-        missing.append("CHAT_ID/TELEGRAM_CHAT_ID")
-
-    if missing:
-        print("Faltan env vars:", ", ".join(missing))
-        return False
-    return True
-
-
-# =====================================
-# TELEGRAM
-# =====================================
-def send_telegram(msg: str):
-    if not env_ok():
+# ================================
+# TELEGRAM (con troceo)
+# ================================
+def send_telegram(text: str):
+    if not TELEGRAM_TOKEN or not CHAT_ID:
+        print("[ERROR] Faltan TELEGRAM_TOKEN / CHAT_ID para enviar mensaje.")
         return
 
+    max_len = 3900  # margen bajo 4096
+    chunks = [text[i:i + max_len] for i in range(0, len(text), max_len)] or [""]
+
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": CHAT_ID,
-        "text": msg,
-        "parse_mode": "HTML",
-    }
-    try:
-        resp = requests.post(url, data=payload, timeout=15)
-        if resp.status_code >= 400:
-            print(f"[WARN] Error Telegram HTTP {resp.status_code}: {resp.text}")
-    except Exception as e:
-        print("Error enviando Telegram (econ):", e)
+
+    for idx, chunk in enumerate(chunks, start=1):
+        payload = {
+            "chat_id": CHAT_ID,
+            "text": chunk,
+            "parse_mode": "HTML",
+        }
+        try:
+            r = requests.post(url, data=payload, timeout=20)
+            if r.status_code >= 400:
+                print(f"[WARN] Error Telegram HTTP {r.status_code} (chunk {idx}/{len(chunks)}): {r.text}")
+        except Exception as e:
+            print(f"[ERROR] Excepción enviando mensaje Telegram (chunk {idx}/{len(chunks)}): {e}")
 
 
-# =====================================
+# ================================
 # CALENDARIO ECONÓMICO (USA, 2–3⭐)
-# =====================================
-def get_calendar():
+# ================================
+def get_calendar_df():
     today = dt.date.today()
     tomorrow = today + dt.timedelta(days=1)
 
@@ -68,11 +58,18 @@ def get_calendar():
     except Exception as e:
         raise RuntimeError(f"Error al obtener calendario de investpy: {e}")
 
+    if df is None or df.empty:
+        return None
+
     if "importance" not in df.columns:
         raise RuntimeError("La respuesta de investpy no tiene columna 'importance'.")
 
-    # Solo importancia media/alta (≈ 2–3⭐)
+    # Solo importancia media/alta
     df = df[df["importance"].isin(["medium", "high"])]
+
+    # Por si viene enorme: limitar a los 8 eventos más importantes (por hora y nombre)
+    if len(df) > 8:
+        df = df.sort_values(["importance", "date", "time"], ascending=[False, True, True]).head(8)
 
     if df.empty:
         return None
@@ -80,17 +77,9 @@ def get_calendar():
     return df
 
 
-# =====================================
-# FORMATEO EVENTOS + TEXTO PARA IA
-# =====================================
 def format_events_for_ai(df):
-    """
-    Devuelve:
-    - lista de dicts (eventos "limpios")
-    - texto plano para que el modelo genere justificaciones
-    """
     events = []
-    plain_lines = []
+    lines = []
 
     for _, row in df.iterrows():
         ev = {
@@ -104,26 +93,18 @@ def format_events_for_ai(df):
         }
         events.append(ev)
 
-        plain_line = (
+        line = (
             f"{ev['event']} | {ev['date']} {ev['time']} | "
             f"importance={ev['importance']} | "
             f"actual={ev['actual']} | forecast={ev['forecast']} | previous={ev['previous']}"
         )
-        plain_lines.append(plain_line)
+        lines.append(line)
 
-    return events, "\n".join(plain_lines)
+    return events, "\n".join(lines)
 
 
-# =====================================
-# JUSTIFICACIONES POR EVENTO (TONO NATURAL)
-# =====================================
 def get_justifications(plain_events: str, n_events: int):
-    """
-    Pide una justificación corta por evento.
-    Devuelve lista de frases (n_events).
-    Si no hay API key o error, devuelve genéricas.
-    """
-    default = ["Dato relevante que puede generar movimientos en mercado USA."] * n_events
+    default = ["Dato relevante que puede mover mercado USA o el dólar."] * n_events
 
     if not client or not plain_events.strip():
         return default
@@ -132,9 +113,9 @@ def get_justifications(plain_events: str, n_events: int):
         "Vas a recibir un listado de eventos macroeconómicos de Estados Unidos. "
         "Cada línea incluye nombre del dato, fecha, hora, importancia y valores. "
         "Devuelve exactamente UNA línea de justificación por evento, en el mismo orden, "
-        "sin numerar ni usar viñetas. Cada línea debe ser una frase corta (máx. 20 palabras) en español, "
-        "explicando por qué el dato es relevante o qué suele implicar para la bolsa USA o el dólar. "
-        "No menciones que eres un modelo ni hables de IA."
+        "sin numerar ni usar viñetas. Cada línea debe ser una frase corta (máx. 20 palabras) "
+        "en español, explicando por qué el dato es relevante o qué suele implicar para "
+        "la bolsa USA o el dólar. No menciones IA ni modelos."
     )
 
     user_prompt = (
@@ -165,19 +146,9 @@ def get_justifications(plain_events: str, n_events: int):
         return default
 
 
-# =====================================
-# CONSTRUIR MENSAJE FINAL
-# =====================================
-def build_message(events, justifications):
-    """
-    Construye el HTML final para Telegram:
-    - ⭐⭐ / ⭐⭐⭐
-    - nombre en negrita
-    - hora + valores
-    - línea de justificación debajo
-    """
-    today = dt.date.today().strftime("%d/%m/%Y")
-    lines = [f"📊 <b>Calendario económico (USA)</b>\n📆 Hoy — {today}\n"]
+def build_calendar_message(events, justifications):
+    today_str = dt.date.today().strftime("%d/%m/%Y")
+    out_lines = [f"📊 <b>Calendario económico (USA)</b>\n📆 Hoy — {today_str}\n"]
 
     for ev, just in zip(events, justifications):
         importance = ev["importance"]
@@ -204,10 +175,7 @@ def build_message(events, justifications):
         if previous and previous.lower() != "none":
             value_parts.append(f"Anterior: {previous}")
 
-        if value_parts:
-            values_line = " | ".join(value_parts)
-        else:
-            values_line = "Sin datos numéricos disponibles."
+        values_line = " | ".join(value_parts) if value_parts else "Sin datos numéricos disponibles."
 
         block = (
             f"\n{stars} <b>{name}</b>\n"
@@ -215,30 +183,33 @@ def build_message(events, justifications):
             f"{values_line}\n"
             f"💬 {just}\n"
         )
-        lines.append(block)
+        out_lines.append(block)
 
-    return "\n".join(lines).strip()
+    return "\n".join(out_lines).strip()
 
 
-# =====================================
+# ================================
 # FUNCIÓN PRINCIPAL
-# =====================================
+# ================================
 def run_econ_calendar():
-    if not env_ok():
-        return
-
+    print("[INFO] Obteniendo calendario económico USA...")
     try:
-        df = get_calendar()
+        df = get_calendar_df()
     except Exception as e:
-        send_telegram(f"⚠️ Error al obtener calendario económico:\n{e}")
+        msg = f"⚠️ Error al obtener calendario económico:\n{e}"
+        print("[ERROR]", msg)
+        send_telegram(msg)
         return
 
     if df is None or df.empty:
-        send_telegram("📭 <b>No hay eventos económicos relevantes en USA (2–3⭐).</b>")
+        msg = "📭 <b>No hay eventos económicos relevantes en USA (2–3⭐) para hoy.</b>"
+        print("[INFO]", msg)
+        send_telegram(msg)
         return
 
     events, plain = format_events_for_ai(df)
     justifications = get_justifications(plain, len(events))
-    msg = build_message(events, justifications)
+    msg = build_calendar_message(events, justifications)
 
+    print("[INFO] Enviando calendario económico...")
     send_telegram(msg)
