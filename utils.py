@@ -3,53 +3,81 @@ import logging
 import requests
 from openai import OpenAI
 
-logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# -------- TELEGRAM --------
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+TELEGRAM_CHAT_ID = os.getenv("CHAT_ID") or os.getenv("TELEGRAM_CHAT_ID")
 
-client = OpenAI()
-
-# -------------------------
-# FUNCIONES GENERALES
-# -------------------------
 
 def send_telegram_message(text: str):
-    """Envia un mensaje a Telegram y maneja errores de longitud."""
+    """
+    Envía texto a Telegram. Si es muy largo, lo trocea en varios mensajes.
+    """
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        logger.error("Telegram: faltan TELEGRAM_TOKEN o CHAT_ID / TELEGRAM_CHAT_ID.")
+        return
+
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+
+    # Límite duro de Telegram ~4096; dejamos margen
+    max_len = 3500
+    if not text:
+        text = "(Mensaje vacío)"
+
+    parts = [text[i:i + max_len] for i in range(0, len(text), max_len)]
+
+    for idx, part in enumerate(parts, start=1):
+        payload = {
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": part,
+            "parse_mode": "Markdown",
+            "disable_web_page_preview": True,
+        }
+        resp = requests.post(url, json=payload, timeout=10)
+
+        try:
+            data = resp.json()
+        except Exception:
+            data = {"raw": resp.text}
+
+        if not resp.ok or not data.get("ok"):
+            logger.warning(
+                "Telegram: error al enviar parte %s/%s: status=%s resp=%s",
+                idx, len(parts), resp.status_code, data,
+            )
+        else:
+            logger.info(
+                "Telegram: mensaje %s/%s enviado correctamente.",
+                idx, len(parts)
+            )
+
+
+# -------- OPENAI (mini) --------
+_openai_api_key = os.getenv("OPENAI_API_KEY")
+_client = OpenAI(api_key=_openai_api_key) if _openai_api_key else None
+
+
+def call_gpt_mini(system_prompt: str, user_prompt: str, max_tokens: int = 600) -> str:
+    """
+    Llama a un modelo ligero de OpenAI para generar texto breve.
+    Si hay cualquier error, devuelve cadena vacía y se loguea.
+    """
+    if not _client:
+        logger.warning("OpenAI: falta OPENAI_API_KEY; no se llama a la IA.")
+        return ""
+
     try:
-        if len(text) > 3900:
-            partes = []
-            while len(text) > 3900:
-                partes.append(text[:3900])
-                text = text[3900:]
-            partes.append(text)
-
-            for p in partes:
-                requests.post(
-                    f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-                    data={"chat_id": TELEGRAM_CHAT_ID, "text": p, "parse_mode": "Markdown"},
-                )
-            return
-
-        requests.post(
-            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-            data={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "Markdown"},
-        )
-
-    except Exception as e:
-        logger.error(f"Telegram error: {e}")
-
-
-def call_gpt_mini(prompt: str, max_tokens: int = 600) -> str:
-    """Llama a GPT-4o-mini para obtener una interpretación."""
-    try:
-        resp = client.responses.create(
-            model="gpt-4o-mini",   # ← MODELO CORRECTO
-            input=prompt,
+        resp = _client.responses.create(
+            model="gpt-4.1-mini",  # <- modelo ligero disponible
+            input=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
             max_output_tokens=max_tokens,
         )
-        return resp.output[0].content[0].text
+        text = resp.output[0].content[0].text
+        return text.strip()
     except Exception as e:
-        logger.warning(f"[WARN] Error llamando a OpenAI: {e}")
-        return None
+        logger.warning(f"OpenAI: error llamando a gpt mini: {e}")
+        return ""
