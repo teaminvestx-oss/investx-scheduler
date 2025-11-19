@@ -5,6 +5,9 @@ import datetime as dt
 import investpy
 from openai import OpenAI
 
+# =====================================
+# ENV VARS
+# =====================================
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN") or os.getenv("INVESTX_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID") or os.getenv("CHAT_ID")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
@@ -12,15 +15,15 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
 
-# ================================
-# TELEGRAM (con troceo)
-# ================================
+# =====================================
+# TELEGRAM (con troceo por longitud)
+# =====================================
 def send_telegram(text: str):
     if not TELEGRAM_TOKEN or not CHAT_ID:
         print("[ERROR] Faltan TELEGRAM_TOKEN / CHAT_ID para enviar mensaje.")
         return
 
-    max_len = 3900  # margen bajo 4096
+    max_len = 3900  # margen bajo los 4096 de Telegram
     chunks = [text[i:i + max_len] for i in range(0, len(text), max_len)] or [""]
 
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
@@ -39,15 +42,13 @@ def send_telegram(text: str):
             print(f"[ERROR] Excepción enviando mensaje Telegram (chunk {idx}/{len(chunks)}): {e}")
 
 
-# ================================
+# =====================================
 # CALENDARIO ECONÓMICO (USA, 2–3⭐)
-# ================================
+# =====================================
 def get_calendar_df():
     today = dt.date.today()
-    tomorrow = today + dt.timedelta(days=1)
-
     from_date = today.strftime("%d/%m/%Y")
-    to_date = tomorrow.strftime("%d/%m/%Y")
+    to_date = today.strftime("%d/%m/%Y")
 
     try:
         df = investpy.economic_calendar(
@@ -64,20 +65,34 @@ def get_calendar_df():
     if "importance" not in df.columns:
         raise RuntimeError("La respuesta de investpy no tiene columna 'importance'.")
 
-    # Solo importancia media/alta
+    # Solo importancia media/alta (≈ 2–3 estrellas)
     df = df[df["importance"].isin(["medium", "high"])]
-
-    # Por si viene enorme: limitar a los 8 eventos más importantes (por hora y nombre)
-    if len(df) > 8:
-        df = df.sort_values(["importance", "date", "time"], ascending=[False, True, True]).head(8)
 
     if df.empty:
         return None
 
+    # Eliminar duplicados (a veces investing repite eventos)
+    df = df.drop_duplicates(subset=["event", "date", "time"], keep="first")
+
+    # Ordenar: high primero, luego medium, por fecha y hora
+    df["imp_rank"] = df["importance"].map({"high": 0, "medium": 1}).fillna(2)
+    df = df.sort_values(by=["imp_rank", "date", "time"])
+
+    # Limitar número de eventos para no saturar
+    df = df.head(8)
+
     return df
 
 
-def format_events_for_ai(df):
+# =====================================
+# CONSTRUIR LISTA PLANA DE EVENTOS
+# =====================================
+def build_plain_events(df):
+    """
+    Devuelve:
+    - events: lista de dicts con la info de cada evento
+    - plain: texto plano con todos los eventos para pasárselo a la IA
+    """
     events = []
     lines = []
 
@@ -93,35 +108,61 @@ def format_events_for_ai(df):
         }
         events.append(ev)
 
+        importance = ev["importance"]
+        if importance == "high":
+            stars = "⭐⭐⭐"
+        elif importance == "medium":
+            stars = "⭐⭐"
+        else:
+            stars = ""
+
         line = (
-            f"{ev['event']} | {ev['date']} {ev['time']} | "
-            f"importance={ev['importance']} | "
+            f"{stars} {ev['date']} {ev['time']} – {ev['event']} | "
             f"actual={ev['actual']} | forecast={ev['forecast']} | previous={ev['previous']}"
         )
         lines.append(line)
 
-    return events, "\n".join(lines)
+    plain = "\n".join(lines)
+    return events, plain
 
 
-def get_justifications(plain_events: str, n_events: int):
-    default = ["Dato relevante que puede mover mercado USA o el dólar."] * n_events
-
+# =====================================
+# INTERPRETACIÓN GLOBAL CON IA
+# =====================================
+def interpret_calendar(plain_events: str) -> str:
+    """
+    Pide a GPT que haga un resumen estilo InvestX:
+    - 1–2 líneas sobre el foco principal (ej. FOMC, tipos, etc.)
+    - Varias líneas tipo '• 18:00 – dato | impacto...'
+    - Cierre con '👉 Clave del día: ...'
+    """
     if not client or not plain_events.strip():
-        return default
+        return ""
 
     system_prompt = (
-        "Vas a recibir un listado de eventos macroeconómicos de Estados Unidos. "
-        "Cada línea incluye nombre del dato, fecha, hora, importancia y valores. "
-        "Devuelve exactamente UNA línea de justificación por evento, en el mismo orden, "
-        "sin numerar ni usar viñetas. Cada línea debe ser una frase corta (máx. 20 palabras) "
-        "en español, explicando por qué el dato es relevante o qué suele implicar para "
-        "la bolsa USA o el dólar. No menciones IA ni modelos."
+        "Eres un analista macro que prepara un resumen para un canal de trading llamado InvestX. "
+        "Recibirás una lista de eventos del calendario económico de Estados Unidos con hora, nombre y datos. "
+        "Tu objetivo es escribir un RESUMEN BREVE en español, claro y directo, sin mencionar IA ni modelos. "
+        "Formato deseado (ejemplo de estilo):\n\n"
+        "FOMC y discurso de FOMC Member Williams | Muy relevante para mercado; pistas sobre futura política "
+        "monetaria pueden generar volatilidad en índices y divisa, especialmente el USD.\n\n"
+        "• 18:00 – Subasta de bonos a 20 años y balance presupuestario | Resultados influyen en rentabilidad "
+        "de bonos y percepción fiscal, afectando a mercados de renta fija y dólar.\n\n"
+        "👉 Clave del día: Publicación de minutos del FOMC a las 19:00, foco principal para anticipar movimientos "
+        "en Fed, índices USA y USD.\n\n"
+        "Instrucciones clave:\n"
+        "- Máximo 8–10 líneas en total.\n"
+        "- Puedes agrupar varios datos similares en una misma línea (ej. varios datos de vivienda).\n"
+        "- Si hay FOMC, tipos, inflación o empleo, destácalos claramente.\n"
+        "- Termina SIEMPRE con una línea '👉 Clave del día: ...' comentando el evento más importante.\n"
+        "- No uses HTML ni negritas: solo texto plano.\n"
+        "- Tono profesional pero cercano, sin exageraciones."
     )
 
     user_prompt = (
-        "Eventos macroeconómicos de hoy en Estados Unidos:\n\n"
+        "Estos son los eventos macroeconómicos de hoy en Estados Unidos (2–3 estrellas de importancia):\n\n"
         f"{plain_events}\n\n"
-        "Devuélveme solo una frase por línea, en el mismo orden de los eventos."
+        "Escribe el resumen siguiendo exactamente el estilo descrito."
     )
 
     try:
@@ -133,66 +174,55 @@ def get_justifications(plain_events: str, n_events: int):
             ],
         )
         text = resp.choices[0].message.content.strip()
-        lines = [l.strip() for l in text.split("\n") if l.strip()]
-
-        if len(lines) < n_events:
-            lines += default[len(lines):]
-        elif len(lines) > n_events:
-            lines = lines[:n_events]
-
-        return lines
+        return text
     except Exception as e:
-        print("Error pidiendo justificaciones:", e)
-        return default
+        print("Error interpretando calendario económico:", e)
+        return ""
 
 
-def build_calendar_message(events, justifications):
-    today_str = dt.date.today().strftime("%d/%m/%Y")
-    out_lines = [f"📊 <b>Calendario económico (USA)</b>\n📆 Hoy — {today_str}\n"]
-
-    for ev, just in zip(events, justifications):
+# =====================================
+# FALLBACK: LISTADO SIMPLE SIN IA
+# =====================================
+def build_simple_list(events):
+    lines = []
+    for ev in events:
         importance = ev["importance"]
-        if importance == "medium":
-            stars = "⭐⭐"
-        elif importance == "high":
+        if importance == "high":
             stars = "⭐⭐⭐"
+        elif importance == "medium":
+            stars = "⭐⭐"
         else:
             stars = ""
 
-        name = ev["event"]
         date = ev["date"]
         time = ev["time"]
-
+        name = ev["event"]
         actual = ev["actual"]
         forecast = ev["forecast"]
         previous = ev["previous"]
 
         value_parts = []
         if actual and actual.lower() != "none":
-            value_parts.append(f"📉 Actual: {actual}")
+            value_parts.append(f"Actual: {actual}")
         if forecast and forecast.lower() != "none":
-            value_parts.append(f"📈 Previsión: {forecast}")
+            value_parts.append(f"Previsión: {forecast}")
         if previous and previous.lower() != "none":
             value_parts.append(f"Anterior: {previous}")
 
         values_line = " | ".join(value_parts) if value_parts else "Sin datos numéricos disponibles."
 
-        block = (
-            f"\n{stars} <b>{name}</b>\n"
-            f"🕒 {date} — {time}\n"
-            f"{values_line}\n"
-            f"💬 {just}\n"
-        )
-        out_lines.append(block)
+        line = f"{stars} {time} – {name} | {values_line}"
+        lines.append(line)
 
-    return "\n".join(out_lines).strip()
+    return "\n".join(lines).strip()
 
 
-# ================================
+# =====================================
 # FUNCIÓN PRINCIPAL
-# ================================
+# =====================================
 def run_econ_calendar():
     print("[INFO] Obteniendo calendario económico USA...")
+
     try:
         df = get_calendar_df()
     except Exception as e:
@@ -202,14 +232,23 @@ def run_econ_calendar():
         return
 
     if df is None or df.empty:
-        msg = "📭 <b>No hay eventos económicos relevantes en USA (2–3⭐) para hoy.</b>"
+        msg = "📭 No hay eventos económicos relevantes en USA (2–3⭐) para hoy."
         print("[INFO]", msg)
         send_telegram(msg)
         return
 
-    events, plain = format_events_for_ai(df)
-    justifications = get_justifications(plain, len(events))
-    msg = build_calendar_message(events, justifications)
+    events, plain = build_plain_events(df)
+    interpretation = interpret_calendar(plain)
 
+    today = dt.date.today().strftime("%d/%m")
+    header = f"({today}) – EE. UU. (2–3⭐)\n\n"
+
+    if interpretation:
+        body = interpretation
+    else:
+        # Si algo va mal con la IA, mandamos solo el listado sin comentarios genéricos
+        body = build_simple_list(events)
+
+    msg = header + body
     print("[INFO] Enviando calendario económico...")
     send_telegram(msg)
