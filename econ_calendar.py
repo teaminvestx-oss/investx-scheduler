@@ -34,11 +34,17 @@ def _get_calendar_df():
     if df is None or df.empty:
         return pd.DataFrame()
 
-    # Nos quedamos solo con USA y quitamos filas sin hora/evento
-    df = df[df["country"].str.lower().str.contains("united states")]
-    df = df.dropna(subset=["event"])
+    df = df.copy()
 
-    # Orden por fecha/hora si las columnas existen
+    # ❌ ANTES petaba aquí si no existía la columna 'country'
+    if "country" in df.columns:
+        df = df[df["country"].astype(str).str.lower().str.contains("united states")]
+
+    # Quitamos filas sin evento
+    if "event" in df.columns:
+        df = df.dropna(subset=["event"])
+
+    # Orden por fecha/hora si se puede
     if "date" in df.columns and "time" in df.columns:
         try:
             dt = pd.to_datetime(df["date"] + " " + df["time"])
@@ -61,7 +67,7 @@ def _stars_from_importance(importance: str) -> str:
 def _format_event_row(row) -> str:
     stars = _stars_from_importance(row.get("importance", ""))
     time = row.get("time", "--:--")
-    name = row.get("event", "").strip()
+    name = str(row.get("event", "")).strip()
 
     actual = str(row.get("actual", "") or "").strip()
     forecast = str(row.get("forecast", "") or "").strip()
@@ -89,14 +95,10 @@ def _format_event_row(row) -> str:
 
 
 def _build_message_with_ai(df: pd.DataFrame) -> str:
-    """
-    Construye el mensaje final usando la IA para un breve análisis,
-    pero si la IA falla se envía solo el listado.
-    """
     today = datetime.utcnow().date()
     title = f"📅 Resumen económico USA – {today.strftime('%d/%m/%Y')} (2–3⭐)\n\n"
 
-    # Filtramos solo media/alta importancia para que no sea eterno
+    # Filtramos solo media/alta importancia si existe la columna
     if "importance" in df.columns:
         mask = df["importance"].astype(str).str.lower().isin(
             ["medium", "high", "2", "3", "2.0", "3.0"]
@@ -107,10 +109,9 @@ def _build_message_with_ai(df: pd.DataFrame) -> str:
     else:
         df_imp = df.copy()
 
-    # Limitamos a los 10–12 eventos más relevantes para el mensaje
+    # Limitamos nº de eventos para que el mensaje no sea eterno
     df_imp = df_imp.head(12)
 
-    # Texto resumido para pasar a la IA
     eventos_for_ai = []
     for _, row in df_imp.iterrows():
         eventos_for_ai.append(
@@ -140,7 +141,6 @@ def _build_message_with_ai(df: pd.DataFrame) -> str:
     else:
         resumen_block = ""
 
-    # Listado formateado de eventos
     lines = [_format_event_row(row) for _, row in df_imp.iterrows()]
     events_block = "\n\n".join(lines)
 
@@ -149,23 +149,16 @@ def _build_message_with_ai(df: pd.DataFrame) -> str:
 
 
 def run_econ_calendar():
-    """
-    Función que llama main.py.
-    - Descarga calendario USA.
-    - Si no hay nada relevante, manda mensaje indicándolo.
-    - Si hay datos, construye mensaje (con IA si se puede) y lo envía por Telegram.
-    """
     logger.info("econ_calendar:[INFO] econ_calendar: Obteniendo calendario económico USA...")
 
     try:
         df = _get_calendar_df()
     except Exception as e:
-        # Aquí sí queremos que se vea el error en Telegram
         err_msg = (
             "⚠️ Error al obtener calendario económico:\n"
             f"{e}"
         )
-        logger.error(f"ERROR:econ_calendar: {err_msg}")
+        logger.error(f"ERROR:econ_calendar:{err_msg}")
         send_telegram_message(err_msg)
         return
 
