@@ -9,43 +9,37 @@ from openai import OpenAI
 # ENV VARS
 # ================================
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN") or os.getenv("INVESTX_TOKEN")
-CHAT_ID = os.getenv("CHAT_ID") or os.getenv("TELEGRAM_CHAT_ID")
+CHAT_ID = os.getenv("TELEGRAM_CHAT_ID") or os.getenv("CHAT_ID")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
 
-def env_ok() -> bool:
-    missing = []
-    if not TELEGRAM_TOKEN:
-        missing.append("TELEGRAM_TOKEN/INVESTX_TOKEN")
-    if not CHAT_ID:
-        missing.append("CHAT_ID/TELEGRAM_CHAT_ID")
-    if missing:
-        print("Faltan env vars:", ", ".join(missing))
-        return False
-    return True
-
-
 # ================================
-# TELEGRAM
+# TELEGRAM (con troceo)
 # ================================
-def send_telegram(msg: str):
-    if not env_ok():
+def send_telegram(text: str):
+    if not TELEGRAM_TOKEN or not CHAT_ID:
+        print("[ERROR] Faltan TELEGRAM_TOKEN / CHAT_ID para enviar mensaje.")
         return
 
+    max_len = 3900  # margen bajo los 4096 de Telegram
+    chunks = [text[i:i + max_len] for i in range(0, len(text), max_len)] or [""]
+
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": CHAT_ID,
-        "text": msg,
-        "parse_mode": "HTML",
-    }
-    try:
-        resp = requests.post(url, data=payload, timeout=15)
-        if resp.status_code >= 400:
-            print(f"[WARN] Error Telegram HTTP {resp.status_code}: {resp.text}")
-    except Exception as e:
-        print("Error enviando Telegram (premarket):", e)
+
+    for idx, chunk in enumerate(chunks, start=1):
+        payload = {
+            "chat_id": CHAT_ID,
+            "text": chunk,
+            "parse_mode": "HTML",
+        }
+        try:
+            r = requests.post(url, data=payload, timeout=20)
+            if r.status_code >= 400:
+                print(f"[WARN] Error Telegram HTTP {r.status_code} (chunk {idx}/{len(chunks)}): {r.text}")
+        except Exception as e:
+            print(f"[ERROR] Excepción enviando mensaje Telegram (chunk {idx}/{len(chunks)}): {e}")
 
 
 # ================================
@@ -75,30 +69,11 @@ def get_changes_map(ticker_map: dict, period: str = "2d"):
 
 
 def get_crypto_changes():
-    """
-    Variación aproximada usando histórico reciente de BTC y ETH.
-    El texto no menciona periodos, solo muestra el %.
-    """
     cryptos = {
         "BTC": "BTC-USD",
         "ETH": "ETH-USD",
     }
-    results = []
-    for name, yf_ticker in cryptos.items():
-        try:
-            data = yf.Ticker(yf_ticker).history(period="2d")
-            if data is None or data.empty or len(data) < 2:
-                continue
-            last = data["Close"].iloc[-1]
-            prev = data["Close"].iloc[-2]
-            if prev == 0:
-                continue
-            change_pct = (last - prev) / prev * 100
-            results.append({"name": name, "change_pct": round(change_pct, 2)})
-        except Exception as e:
-            print(f"[WARN] Error obteniendo datos de cripto {name}: {e}")
-            continue
-    return results
+    return get_changes_map(cryptos, period="2d")
 
 
 # ================================
@@ -170,12 +145,12 @@ def format_premarket_lines(indices, megacaps, sectors, cryptos):
 
 
 # ================================
-# INTERPRETACIÓN DEL DÍA (TONO NATURAL)
+# INTERPRETACIÓN DEL DÍA
 # ================================
 def interpret_premarket(plain_text: str) -> str:
     """
-    Devuelve unas pocas frases explicando de forma natural
-    cómo pinta el día según el movimiento de acciones, índices y cripto.
+    Devuelve unas frases explicando de forma natural
+    cómo pinta el día según índices, acciones y cripto.
     No menciona IA ni periodos.
     """
     if not client or not plain_text:
@@ -216,9 +191,6 @@ def interpret_premarket(plain_text: str) -> str:
 # FUNCIÓN PRINCIPAL: BUENOS DÍAS
 # ================================
 def run_premarket_morning():
-    if not env_ok():
-        return
-
     today = dt.date.today()
     if today.weekday() >= 5:
         print("[INFO] Es fin de semana, no se envía 'Buenos días'.")
