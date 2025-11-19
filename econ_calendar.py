@@ -1,60 +1,45 @@
-# === econ_calendar.py ===
 import os
-import requests
 import datetime as dt
 import investpy
-from openai import OpenAI
+import requests
+from dotenv import load_dotenv
 
-# =====================================
-# ENV VARS
-# =====================================
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN") or os.getenv("INVESTX_TOKEN")
-CHAT_ID = os.getenv("TELEGRAM_CHAT_ID") or os.getenv("CHAT_ID")
+load_dotenv()
+
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
-client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
-
-
-# =====================================
-# TELEGRAM (con troceo por longitud)
-# =====================================
-def send_telegram(text: str):
-    if not TELEGRAM_TOKEN or not CHAT_ID:
-        print("[ERROR] Faltan TELEGRAM_TOKEN / CHAT_ID para enviar mensaje.")
-        return
-
-    max_len = 3900  # margen bajo los 4096 de Telegram
-    chunks = [text[i:i + max_len] for i in range(0, len(text), max_len)] or [""]
-
+# ---------------------------
+#  SEND TO TELEGRAM
+# ---------------------------
+def send_telegram(msg: str):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "HTML"}
+    try:
+        r = requests.post(url, json=payload, timeout=20)
+        if r.status_code != 200:
+            print("[WARN] Error Telegram:", r.text)
+        return r.status_code == 200
+    except Exception as e:
+        print("[WARN] Error enviando a Telegram:", e)
+        return False
 
-    for idx, chunk in enumerate(chunks, start=1):
-        payload = {
-            "chat_id": CHAT_ID,
-            "text": chunk,
-            "parse_mode": "HTML",
-        }
-        try:
-            r = requests.post(url, data=payload, timeout=20)
-            if r.status_code >= 400:
-                print(f"[WARN] Error Telegram HTTP {r.status_code} (chunk {idx}/{len(chunks)}): {r.text}")
-        except Exception as e:
-            print(f"[ERROR] Excepción enviando mensaje Telegram (chunk {idx}/{len(chunks)}): {e}")
-
-
-# =====================================
-# CALENDARIO ECONÓMICO (USA, 2–3⭐)
-# =====================================
+# ---------------------------
+#  GET ECONOMIC CALENDAR
+# ---------------------------
 def get_calendar_df():
     today = dt.date.today()
-    from_date = today.strftime("%d/%m/%Y")
-    to_date = today.strftime("%d/%m/%Y")
+    tomorrow = today + dt.timedelta(days=1)
+
+    from_date_str = today.strftime("%d/%m/%Y")
+    to_date_str = tomorrow.strftime("%d/%m/%Y")
 
     try:
         df = investpy.economic_calendar(
             countries=["united states"],
-            from_date=from_date,
-            to_date=to_date,
+            from_date=from_date_str,
+            to_date=to_date_str
         )
     except Exception as e:
         raise RuntimeError(f"Error al obtener calendario de investpy: {e}")
@@ -65,190 +50,100 @@ def get_calendar_df():
     if "importance" not in df.columns:
         raise RuntimeError("La respuesta de investpy no tiene columna 'importance'.")
 
-    # Solo importancia media/alta (≈ 2–3 estrellas)
+    # 🔹 QUEDARME SOLO CON LOS EVENTOS DE HOY
+    df = df[df["date"] == from_date_str]
+
+    if df.empty:
+        return None
+
+    # Filtrar solo importancia media/alta
     df = df[df["importance"].isin(["medium", "high"])]
 
     if df.empty:
         return None
 
-    # Eliminar duplicados (a veces investing repite eventos)
+    # Eliminar duplicados
     df = df.drop_duplicates(subset=["event", "date", "time"], keep="first")
 
-    # Ordenar: high primero, luego medium, por fecha y hora
+    # Ordenar por importancia
     df["imp_rank"] = df["importance"].map({"high": 0, "medium": 1}).fillna(2)
     df = df.sort_values(by=["imp_rank", "date", "time"])
 
-    # Limitar número de eventos para no saturar
+    # Limitar número de eventos
     df = df.head(8)
 
     return df
 
+# ---------------------------
+#  INTERPRETACIÓN IA EVENTO
+# ---------------------------
+def interpret_event(event_name: str):
+    """Interpretación usando ChatGPT Mini, natural, sin decir 'IA' en ningún sitio."""
+    import openai
+    openai.api_key = OPENAI_API_KEY
 
-# =====================================
-# CONSTRUIR LISTA PLANA DE EVENTOS
-# =====================================
-def build_plain_events(df):
-    """
-    Devuelve:
-    - events: lista de dicts con la info de cada evento
-    - plain: texto plano con todos los eventos para pasárselo a la IA
-    """
-    events = []
-    lines = []
+    prompt = f"""
+Eres analista macroeconómico. Explica en 1 frase clara y natural por qué este evento es importante para los mercados: {event_name}.
+Tono profesional pero sencillo. No menciones IA.
+"""
+
+    try:
+        resp = openai.ChatCompletion.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.5,
+        )
+        return resp.choices[0].message["content"].strip()
+    except Exception as e:
+        print("[WARN] Error interpretando evento:", e)
+        return "Dato relevante que puede influir en mercados dependiendo de contexto macro."
+
+# ---------------------------
+#  BUILD FINAL MESSAGE
+# ---------------------------
+def build_calendar_message(df):
+    if df is None or df.empty:
+        return "⚠️ No hay eventos relevantes en el calendario económico de hoy."
+
+    today_str = dt.date.today().strftime("%d/%m/%Y")
+
+    msg = f"<b>📅 Calendario económico — {today_str}</b>\n"
 
     for _, row in df.iterrows():
-        ev = {
-            "date": str(row.get("date", "")),
-            "time": str(row.get("time", "")),
-            "event": str(row.get("event", "")),
-            "importance": str(row.get("importance", "")),
-            "actual": str(row.get("actual", "")),
-            "forecast": str(row.get("forecast", "")),
-            "previous": str(row.get("previous", "")),
-        }
-        events.append(ev)
+        title = row["event"]
+        time = row["time"]
+        star = "⭐⭐⭐" if row["importance"] == "high" else "⭐⭐"
+        actual = row.get("actual", "")
+        forecast = row.get("forecast", "")
+        previous = row.get("previous", "")
 
-        importance = ev["importance"]
-        if importance == "high":
-            stars = "⭐⭐⭐"
-        elif importance == "medium":
-            stars = "⭐⭐"
-        else:
-            stars = ""
+        msg += f"\n{star} <b>{title}</b>\n"
+        msg += f"⏰ {time}\n"
 
-        line = (
-            f"{stars} {ev['date']} {ev['time']} – {ev['event']} | "
-            f"actual={ev['actual']} | forecast={ev['forecast']} | previous={ev['previous']}"
-        )
-        lines.append(line)
+        # Números si existen
+        if actual not in ["-", "", None]:
+            msg += f"<b>Actual:</b> {actual} | "
+        if forecast not in ["-", "", None]:
+            msg += f"<b>Previsión:</b> {forecast} | "
+        if previous not in ["-", "", None]:
+            msg += f"<b>Anterior:</b> {previous}"
 
-    plain = "\n".join(lines)
-    return events, plain
+        msg += "\n💬 " + interpret_event(title) + "\n"
 
+    return msg
 
-# =====================================
-# INTERPRETACIÓN GLOBAL CON IA
-# =====================================
-def interpret_calendar(plain_events: str) -> str:
+# ---------------------------
+#  MAIN EXECUTION
+# ---------------------------
+def run_econ_calendar(force=False):
     """
-    Pide a GPT que haga un resumen estilo InvestX:
-    - 1–2 líneas sobre el foco principal (ej. FOMC, tipos, etc.)
-    - Varias líneas tipo '• 18:00 – dato | impacto...'
-    - Cierre con '👉 Clave del día: ...'
+    force=True = se envía siempre, aunque esté fuera de la franja (para ejecuciones manuales)
     """
-    if not client or not plain_events.strip():
-        return ""
 
-    system_prompt = (
-        "Eres un analista macro que prepara un resumen para un canal de trading llamado InvestX. "
-        "Recibirás una lista de eventos del calendario económico de Estados Unidos con hora, nombre y datos. "
-        "Tu objetivo es escribir un RESUMEN BREVE en español, claro y directo, sin mencionar IA ni modelos. "
-        "Formato deseado (ejemplo de estilo):\n\n"
-        "FOMC y discurso de FOMC Member Williams | Muy relevante para mercado; pistas sobre futura política "
-        "monetaria pueden generar volatilidad en índices y divisa, especialmente el USD.\n\n"
-        "• 18:00 – Subasta de bonos a 20 años y balance presupuestario | Resultados influyen en rentabilidad "
-        "de bonos y percepción fiscal, afectando a mercados de renta fija y dólar.\n\n"
-        "👉 Clave del día: Publicación de minutos del FOMC a las 19:00, foco principal para anticipar movimientos "
-        "en Fed, índices USA y USD.\n\n"
-        "Instrucciones clave:\n"
-        "- Máximo 8–10 líneas en total.\n"
-        "- Puedes agrupar varios datos similares en una misma línea (ej. varios datos de vivienda).\n"
-        "- Si hay FOMC, tipos, inflación o empleo, destácalos claramente.\n"
-        "- Termina SIEMPRE con una línea '👉 Clave del día: ...' comentando el evento más importante.\n"
-        "- No uses HTML ni negritas: solo texto plano.\n"
-        "- Tono profesional pero cercano, sin exageraciones."
-    )
+    df = get_calendar_df()
 
-    user_prompt = (
-        "Estos son los eventos macroeconómicos de hoy en Estados Unidos (2–3 estrellas de importancia):\n\n"
-        f"{plain_events}\n\n"
-        "Escribe el resumen siguiendo exactamente el estilo descrito."
-    )
+    msg = build_calendar_message(df)
 
-    try:
-        resp = client.chat.completions.create(
-            model="gpt-4.1-mini",
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-        )
-        text = resp.choices[0].message.content.strip()
-        return text
-    except Exception as e:
-        print("Error interpretando calendario económico:", e)
-        return ""
-
-
-# =====================================
-# FALLBACK: LISTADO SIMPLE SIN IA
-# =====================================
-def build_simple_list(events):
-    lines = []
-    for ev in events:
-        importance = ev["importance"]
-        if importance == "high":
-            stars = "⭐⭐⭐"
-        elif importance == "medium":
-            stars = "⭐⭐"
-        else:
-            stars = ""
-
-        date = ev["date"]
-        time = ev["time"]
-        name = ev["event"]
-        actual = ev["actual"]
-        forecast = ev["forecast"]
-        previous = ev["previous"]
-
-        value_parts = []
-        if actual and actual.lower() != "none":
-            value_parts.append(f"Actual: {actual}")
-        if forecast and forecast.lower() != "none":
-            value_parts.append(f"Previsión: {forecast}")
-        if previous and previous.lower() != "none":
-            value_parts.append(f"Anterior: {previous}")
-
-        values_line = " | ".join(value_parts) if value_parts else "Sin datos numéricos disponibles."
-
-        line = f"{stars} {time} – {name} | {values_line}"
-        lines.append(line)
-
-    return "\n".join(lines).strip()
-
-
-# =====================================
-# FUNCIÓN PRINCIPAL
-# =====================================
-def run_econ_calendar():
-    print("[INFO] Obteniendo calendario económico USA...")
-
-    try:
-        df = get_calendar_df()
-    except Exception as e:
-        msg = f"⚠️ Error al obtener calendario económico:\n{e}"
-        print("[ERROR]", msg)
-        send_telegram(msg)
-        return
-
-    if df is None or df.empty:
-        msg = "📭 No hay eventos económicos relevantes en USA (2–3⭐) para hoy."
-        print("[INFO]", msg)
-        send_telegram(msg)
-        return
-
-    events, plain = build_plain_events(df)
-    interpretation = interpret_calendar(plain)
-
-    today = dt.date.today().strftime("%d/%m")
-    header = f"({today}) – EE. UU. (2–3⭐)\n\n"
-
-    if interpretation:
-        body = interpretation
-    else:
-        # Si algo va mal con la IA, mandamos solo el listado sin comentarios genéricos
-        body = build_simple_list(events)
-
-    msg = header + body
-    print("[INFO] Enviando calendario económico...")
     send_telegram(msg)
+
+    return True
