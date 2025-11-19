@@ -46,7 +46,7 @@ def send_telegram(msg: str):
         if resp.status_code >= 400:
             print(f"[WARN] Error Telegram HTTP {resp.status_code}: {resp.text}")
     except Exception as e:
-        print("Error enviando Telegram:", e)
+        print("Error enviando Telegram (econ):", e)
 
 
 # =====================================
@@ -87,7 +87,7 @@ def format_events_for_ai(df):
     """
     Devuelve:
     - lista de dicts (eventos "limpios")
-    - texto plano para la IA (una línea por evento)
+    - texto plano para que el modelo genere justificaciones
     """
     events = []
     plain_lines = []
@@ -119,9 +119,9 @@ def format_events_for_ai(df):
 # =====================================
 def get_justifications(plain_events: str, n_events: int):
     """
-    Pide al modelo una justificación corta por evento.
-    Devuelve una lista de strings (longitud n_events).
-    Si no hay API key o hay error, devuelve justificaciones genéricas.
+    Pide una justificación corta por evento.
+    Devuelve lista de frases (n_events).
+    Si no hay API key o error, devuelve genéricas.
     """
     default = ["Dato relevante que puede generar movimientos en mercado USA."] * n_events
 
@@ -130,17 +130,15 @@ def get_justifications(plain_events: str, n_events: int):
 
     system_prompt = (
         "Vas a recibir un listado de eventos macroeconómicos de Estados Unidos. "
-        "Cada línea incluye nombre del dato, fecha, hora, importancia y valores "
-        "previos/previsión. Devuelve exactamente UNA línea de justificación por evento, "
-        "en el mismo orden, sin numerar y sin viñetas. "
-        "Cada línea debe ser una frase corta (máx. 20 palabras) en español, "
-        "explicando por qué el dato es relevante o qué suele implicar "
-        "para la bolsa USA o el dólar. "
-        "No menciones que eres un modelo ni hables de 'IA' ni 'analista'."
+        "Cada línea incluye nombre del dato, fecha, hora, importancia y valores. "
+        "Devuelve exactamente UNA línea de justificación por evento, en el mismo orden, "
+        "sin numerar ni usar viñetas. Cada línea debe ser una frase corta (máx. 20 palabras) en español, "
+        "explicando por qué el dato es relevante o qué suele implicar para la bolsa USA o el dólar. "
+        "No menciones que eres un modelo ni hables de IA."
     )
 
     user_prompt = (
-        "Eventos macroeconómicos de hoy (Estados Unidos):\n\n"
+        "Eventos macroeconómicos de hoy en Estados Unidos:\n\n"
         f"{plain_events}\n\n"
         "Devuélveme solo una frase por línea, en el mismo orden de los eventos."
     )
@@ -156,17 +154,14 @@ def get_justifications(plain_events: str, n_events: int):
         text = resp.choices[0].message.content.strip()
         lines = [l.strip() for l in text.split("\n") if l.strip()]
 
-        # Ajustamos al número de eventos
         if len(lines) < n_events:
-            # Rellenamos con genéricas si faltan
             lines += default[len(lines):]
         elif len(lines) > n_events:
             lines = lines[:n_events]
 
         return lines
-
     except Exception as e:
-        print("Error pidiendo justificaciones al modelo:", e)
+        print("Error pidiendo justificaciones:", e)
         return default
 
 
@@ -201,7 +196,6 @@ def build_message(events, justifications):
         forecast = ev["forecast"]
         previous = ev["previous"]
 
-        # Construimos la línea de valores de forma inteligente
         value_parts = []
         if actual and actual.lower() != "none":
             value_parts.append(f"📉 Actual: {actual}")
@@ -221,7 +215,6 @@ def build_message(events, justifications):
             f"{values_line}\n"
             f"💬 {just}\n"
         )
-
         lines.append(block)
 
     return "\n".join(lines).strip()
