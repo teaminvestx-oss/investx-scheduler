@@ -4,27 +4,35 @@ import datetime
 import pkg_resources   # requerido por investpy, NO BORRAR
 
 from econ_calendar import run_econ_calendar
-from premarket import run_buenos_dias   # ✔️ ESTA ES LA FUNCIÓN REAL
+from premarket import run_premarket_morning  # función real del premarket
 
 # ---------------------------------------------------------
-# CONFIGURACIÓN
+# CONFIGURACIÓN HORARIA
 # ---------------------------------------------------------
 
-TZ_OFFSET = 1  # GMT+1 España
+# Offset sencillo para España (CET). Si quieres algo más fino, usamos pytz, pero esto vale.
+TZ_OFFSET = 1  # GMT+1 España (ajústalo si cambias a verano/invierno con lógica extra)
 NOW = datetime.datetime.utcnow() + datetime.timedelta(hours=TZ_OFFSET)
 
-HOUR = NOW.hour
+HOUR = NOW.hour           # hora actual en España aproximada
 TODAY = NOW.strftime("%Y-%m-%d")
 
-# Variables de entorno
-FORCE_ECON = os.environ.get("FORCE_ECON", "0") in ("1", "true", "TRUE")
-FORCE_BUENOSDIAS = os.environ.get("FORCE_BUENOSDIAS", "0") in ("1", "true", "TRUE")
+# ---------------------------------------------------------
+# VARIABLES DE ENTORNO
+# ---------------------------------------------------------
 
-# Archivos para evitar envíos duplicados
+# Fuerza envío aunque esté fuera de franja o ya enviado
+FORCE_ECON = os.environ.get("FORCE_ECON", "0").lower() in ("1", "true", "yes")
+FORCE_MORNING = os.environ.get("FORCE_MORNING", "0").lower() in ("1", "true", "yes")
+
+# Ficheros para evitar envíos duplicados en el mismo día
 ECON_SENT_FILE = "/tmp/econ_sent.txt"
-BUENOS_SENT_FILE = "/tmp/buenos_sent.txt"
+MORNING_SENT_FILE = "/tmp/morning_sent.txt"
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s:%(message)s",
+)
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------
@@ -32,18 +40,25 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------
 
 def already_sent(file_path: str) -> bool:
+    """Devuelve True si en ese fichero está grabada la fecha de hoy."""
     if not os.path.exists(file_path):
         return False
     try:
         with open(file_path, "r") as f:
-            date = f.read().strip()
-        return date == TODAY
-    except:
+            date_str = f.read().strip()
+        return date_str == TODAY
+    except Exception:
         return False
 
+
 def mark_sent(file_path: str):
-    with open(file_path, "w") as f:
-        f.write(TODAY)
+    """Marca en el fichero que hoy ya se ha enviado ese bloque."""
+    try:
+        with open(file_path, "w") as f:
+            f.write(TODAY)
+    except Exception as e:
+        logger.warning("No se pudo marcar como enviado en %s: %s", file_path, e)
+
 
 # ---------------------------------------------------------
 # EJECUCIÓN PRINCIPAL
@@ -51,45 +66,49 @@ def mark_sent(file_path: str):
 
 def main():
     logger.info("Ejecutando main.py…")
-    logger.info(f"Fecha/hora España: {NOW}")
+    logger.info("Fecha/hora (offset +%sh): %s", TZ_OFFSET, NOW)
 
     # ======================================================
     # 1) BLOQUE BUENOS DÍAS (PREMARKET)
+    #    - Franja normal: 10:00–11:00 (hora España)
+    #    - Sólo una vez al día, salvo FORCE_MORNING=1
     # ======================================================
-    if 10 <= HOUR < 11 or FORCE_BUENOSDIAS:
+    if FORCE_MORNING or (10 <= HOUR < 11):
         logger.info("Bloque 'Buenos días' dentro de franja o forzado.")
 
-        if not FORCE_BUENOSDIAS and already_sent(BUENOS_SENT_FILE):
-            logger.info("Buenos días YA enviado hoy -> no se repite.")
+        if not FORCE_MORNING and already_sent(MORNING_SENT_FILE):
+            logger.info("'Buenos días' YA enviado hoy -> no se repite.")
         else:
             try:
-                run_buenos_dias()
-                mark_sent(BUENOS_SENT_FILE)
-                logger.info("Buenos días enviado correctamente.")
+                run_premarket_morning()
+                mark_sent(MORNING_SENT_FILE)
+                logger.info("'Buenos días' enviado correctamente.")
             except Exception as e:
-                logger.error(f"Error ejecutando Buenos días: {e}")
-
+                logger.error("Error ejecutando 'Buenos días': %s", e)
     else:
         logger.info("Fuera de franja 10–11h para 'Buenos días', no se envía.")
 
     # ======================================================
     # 2) BLOQUE CALENDARIO ECONÓMICO
+    #    - Franja normal: 12:00–13:00 (hora España)
+    #    - Sólo una vez al día, salvo FORCE_ECON=1
     # ======================================================
-    if 12 <= HOUR < 13 or FORCE_ECON:
+    if FORCE_ECON or (12 <= HOUR < 13):
         logger.info("Bloque 'Calendario económico' dentro de franja o forzado.")
 
         if not FORCE_ECON and already_sent(ECON_SENT_FILE):
             logger.info("Calendario económico YA enviado hoy -> no se repite.")
         else:
             try:
+                # econ_calendar ya controla importancia, IA, etc.
                 run_econ_calendar(force=FORCE_ECON)
                 mark_sent(ECON_SENT_FILE)
                 logger.info("Calendario económico enviado correctamente.")
             except Exception as e:
-                logger.error(f"Error ejecutando calendario económico: {e}")
-
+                logger.error("Error ejecutando calendario económico: %s", e)
     else:
         logger.info("Fuera de franja 12–13h para 'Calendario económico', no se envía.")
+
 
 # ---------------------------------------------------------
 # ENTRYPOINT
