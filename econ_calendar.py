@@ -4,7 +4,7 @@
 import os
 import json
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 from typing import List, Dict
 
 import pandas as pd
@@ -25,12 +25,7 @@ STATE_FILE = "econ_calendar_state.json"
 # País por defecto
 DEFAULT_COUNTRY = os.environ.get("ECON_COUNTRY", "united states")
 
-# (La ventana horaria real la controla main.py, aquí no se fuerza nada)
-WINDOW_START_HOUR = 10
-WINDOW_END_HOUR = 13
-
-
-# ----------------------------------------------------------------=====
+# ---------------------------------------------------------------------
 # Utilidades de estado diario
 # ---------------------------------------------------------------------
 
@@ -68,29 +63,23 @@ def _mark_sent_today(today_str: str) -> None:
 # Lógica de calendario
 # ---------------------------------------------------------------------
 
-def _get_investpy_calendar(country: str,
-                           from_date: datetime,
-                           to_date: datetime) -> pd.DataFrame:
+def _get_investpy_calendar_for_day(country: str, target_day: date) -> pd.DataFrame:
     """
     Obtiene calendario económico desde investpy para un país concreto
-    entre from_date (incluido) y to_date (excluido en la práctica).
-    - investpy exige que to_date sea > from_date, no >=.
-    - Aquí forzamos to_date > from_date añadiendo un día si hace falta.
-    - Luego filtramos manualmente solo el día de from_date.
+    alrededor de target_day (target_day-1, target_day+1) y luego
+    filtra SOLO los eventos cuya fecha sea exactamente target_day.
+    Esto evita el ERR#0032 ("to_date should be greater than from_date")
+    y pequeños problemas de zona horaria.
     """
-    # Aseguramos to_date > from_date para evitar ERR#0032
-    if to_date <= from_date:
-        to_date = from_date + timedelta(days=1)
+    # Rango amplio para contentar a investpy
+    from_day = target_day - timedelta(days=1)
+    to_day = target_day + timedelta(days=1)
 
-    ref_day = from_date.date()
-
-    f_str = from_date.strftime("%d/%m/%Y")
-    t_str = to_date.strftime("%d/%m/%Y")
-
+    f_str = from_day.strftime("%d/%m/%Y")
+    t_str = to_day.strftime("%d/%m/%Y")
     logger.info(
-        "econ_calendar:[INFO] econ_calendar: Rango fechas from_date=%s, to_date=%s",
-        f_str,
-        t_str,
+        "econ_calendar:[INFO] econ_calendar: Rango bruto investpy "
+        "from_date=%s, to_date=%s", f_str, t_str
     )
 
     df = investpy.economic_calendar(
@@ -100,44 +89,37 @@ def _get_investpy_calendar(country: str,
     )
 
     if df.empty:
-        logger.info("econ_calendar:[INFO] econ_calendar: Sin eventos para el rango dado.")
+        logger.info("econ_calendar:[INFO] econ_calendar: Sin eventos para el rango bruto.")
         return df
 
-    # Normalizamos columnas que nos interesan
+    # Aseguramos columnas esperadas
     expected_cols = [
-        "date",
-        "time",
-        "country",
-        "event",
-        "importance",
-        "actual",
-        "forecast",
-        "previous",
+        "date", "time", "country", "event",
+        "importance", "actual", "forecast", "previous",
     ]
     for col in expected_cols:
         if col not in df.columns:
             df[col] = ""
 
-    # Filtramos SOLO el día de referencia (today)
-    # investpy devuelve 'date' como string tipo '20/11/2025'
-    df["date_dt"] = pd.to_datetime(df["date"], format="%d/%m/%Y", errors="coerce")
-    df = df[df["date_dt"].dt.date == ref_day]
-
-    if df.empty:
-        logger.info("econ_calendar:[INFO] econ_calendar: Sin eventos para el día %s.", ref_day)
-        return df
-
-    # Convertimos a datetime para ordenar por fecha/hora
+    # Normalizamos a datetime
     df["datetime"] = pd.to_datetime(
-        df["date"] + " " + df["time"],
-        format="%d/%m/%Y %H:%M",
-        errors="coerce",
+        df["date"].astype(str) + " " + df["time"].astype(str),
+        errors="coerce"
     )
     df = df.dropna(subset=["datetime"])
+
+    # Filtramos SOLO el día objetivo
+    df = df[df["datetime"].dt.date == target_day]
+
+    # Solo el país deseado (por si se cuela algo)
+    df = df[df["country"].astype(str).str.contains(country.split()[0], case=False, na=False)]
+
     df = df.sort_values("datetime")
 
-    # Solo el país que queremos, por si vinieran mezclados
-    df = df[df["country"].str.contains(country.split()[0], case=False, na=False)]
+    logger.info(
+        "econ_calendar:[INFO] econ_calendar: %d eventos tras filtrar por día y país.",
+        len(df)
+    )
 
     return df
 
@@ -145,6 +127,7 @@ def _get_investpy_calendar(country: str,
 def _importance_to_stars(importance: str) -> int:
     """
     Convierte la importancia de investpy a número de estrellas (1–3).
+    Muy defensivo: si no entiende el texto, devuelve 2⭐.
     """
     if isinstance(importance, str):
         text = importance.lower()
@@ -163,10 +146,10 @@ def _normalize_title(title: str) -> str:
     Normaliza títulos para agrupar eventos similares
     (ej. Housing Starts (MoM) / Housing Starts).
     """
-    t = title.lower()
+    t = str(title).lower()
     import re
-    t = re.sub(r"\(.*?\)", "", t)  # quitamos paréntesis
-    t = " ".join(t.split())        # espacios extra
+    t = re.sub(r"\(.*?\)", "", t)   # quitamos paréntesis
+    t = " ".join(t.split())         # espacios duplicados
     return t
 
 
@@ -175,7 +158,8 @@ def _filter_and_group_events(df: pd.DataFrame) -> List[Dict]:
     - Convierte importancia a estrellas.
     - Se queda con >= 2⭐.
     - Agrupa eventos con título similar.
-    - Selecciona los más relevantes (máx. 6).
+    - Da prioridad a eventos clave (Fed, FOMC, empleo, inflación, etc.).
+    - Selecciona máx. 6 eventos.
     Devuelve lista de dicts ordenados por fecha/hora.
     """
     if df.empty:
@@ -184,19 +168,16 @@ def _filter_and_group_events(df: pd.DataFrame) -> List[Dict]:
     df = df.copy()
     df["stars"] = df["importance"].apply(_importance_to_stars)
 
-    # Sólo 2 y 3 estrellas
+    # Solo 2 y 3 estrellas
     df = df[df["stars"] >= 2]
     if df.empty:
         return []
 
-    # Normalizar título para agrupar
     df["title_norm"] = df["event"].astype(str).apply(_normalize_title)
 
     grouped_rows = []
     for _, g in df.groupby("title_norm"):
-        # Nos quedamos con:
-        # - más estrellas
-        # - y si empatan, el más temprano
+        # nos quedamos con el de más estrellas y, si empatan, el más temprano
         g = g.sort_values(["stars", "datetime"], ascending=[False, True])
         row = g.iloc[0]
         grouped_rows.append(row)
@@ -206,76 +187,38 @@ def _filter_and_group_events(df: pd.DataFrame) -> List[Dict]:
 
     grouped_df = pd.DataFrame(grouped_rows)
 
-    # Palabras clave para priorizar eventos realmente gordos
+    # Palabras clave gordas (añadimos FOMC / Trump etc.)
     KEYWORDS_PRIORITY = [
-        # Política monetaria / Fed / FOMC
-        "fed",
-        "fomc",
-        "federal reserve",
-        "rate decision",
-        "interest rate",
-        "minutes",
-        "dot plot",
-        # Empleo
-        "nonfarm",
-        "payrolls",
-        "jobless",
-        "unemployment",
-        "initial jobless claims",
-        "continuing jobless claims",
-        # Inflación
-        "cpi",
-        "inflation",
-        "pce",
-        "core",
-        # Crecimiento
-        "gdp",
-        "gross domestic product",
-        # Actividad / sentimiento
-        "retail sales",
-        "ism",
-        "manufacturing",
-        "services",
-        "pmis",
-        # Vivienda
-        "housing starts",
-        "building permits",
-        # Energía / materias primas
-        "cftc",
-        "crude oil",
-        "oil inventories",
-        "eia",
-        # Política / discursos clave
-        "trump",
-        "biden",
-        "president speaks",
-        "chair powell",
+        "fed", "fomc", "rate decision", "interest rate",
+        "nonfarm", "payrolls", "jobless", "unemployment",
+        "cpi", "inflation", "pce", "core",
+        "gdp", "gross domestic product",
+        "retail sales", "ism", "manufacturing", "services",
+        "housing starts", "building permits",
+        "cftc", "crude oil", "oil inventories", "eia",
+        "trump", "powell", "yellen"
     ]
 
     def _is_priority(ev: str, stars: int) -> bool:
-        ev_l = ev.lower()
+        ev_l = str(ev).lower()
         if stars == 3:
             return True
         return any(k in ev_l for k in KEYWORDS_PRIORITY)
 
     grouped_df["is_priority"] = grouped_df.apply(
-        lambda r: _is_priority(str(r["event"]), int(r["stars"])), axis=1
+        lambda r: _is_priority(r["event"], int(r["stars"])),
+        axis=1
     )
 
-    # Ordenamos por:
-    # 1) prioridad
-    # 2) estrellas
-    # 3) hora
     grouped_df = grouped_df.sort_values(
         ["is_priority", "stars", "datetime"],
-        ascending=[False, False, True],
+        ascending=[False, False, True]
     )
 
-    # Limitamos a máx 6 eventos
     MAX_EVENTS = 6
     grouped_df = grouped_df.head(MAX_EVENTS)
 
-    # Orden final por fecha/hora para mostrar
+    # Orden final por fecha/hora
     grouped_df = grouped_df.sort_values("datetime")
 
     events = []
@@ -285,15 +228,9 @@ def _filter_and_group_events(df: pd.DataFrame) -> List[Dict]:
                 "datetime": r["datetime"],
                 "event": str(r["event"]),
                 "stars": int(r["stars"]),
-                "actual": (
-                    str(r.get("actual", "")) if pd.notna(r.get("actual", "")) else ""
-                ),
-                "forecast": (
-                    str(r.get("forecast", "")) if pd.notna(r.get("forecast", "")) else ""
-                ),
-                "previous": (
-                    str(r.get("previous", "")) if pd.notna(r.get("previous", "")) else ""
-                ),
+                "actual": str(r.get("actual", "")) if pd.notna(r.get("actual", "")) else "",
+                "forecast": str(r.get("forecast", "")) if pd.notna(r.get("forecast", "")) else "",
+                "previous": str(r.get("previous", "")) if pd.notna(r.get("previous", "")) else "",
             }
         )
     return events
@@ -311,18 +248,17 @@ def _interpret_event(event: Dict) -> str:
     dt_ = event["datetime"]
     hora = dt_.strftime("%H:%M")
     titulo = event["event"]
-    stars_txt = "⭐" * event["stars"]
+    stars = "⭐" * event["stars"]
     actual = event["actual"] or "—"
     forecast = event["forecast"] or "—"
     previous = event["previous"] or "—"
 
     prompt = f"""
-Eres analista macro en un canal de trading en español (InvestX).
-Resume MUY brevemente el impacto POTENCIAL de este dato en índices USA y el dólar.
+Eres analista macro en un canal de trading en español (InvestX). Resume muy brevemente el impacto POTENCIAL de este dato en índices USA y el dólar.
 
 Evento: {titulo}
 Hora: {hora}
-Importancia: {stars_txt}
+Estrellas: {stars}
 Actual: {actual}
 Previsión: {forecast}
 Anterior: {previous}
@@ -333,8 +269,7 @@ Instrucciones:
 - Tono profesional, claro y directo.
 - Comenta el impacto potencial: positivo/negativo/mixto para índices USA y USD.
 - No repitas literalmente el título ni la hora, ni uses frases tipo "este dato".
-Ejemplo de estilo:
-"Dato fuerte de empleo; favorece subidas en índices USA y refuerza al USD."
+Ejemplo de estilo: "Dato fuerte de empleo; favorece subidas en índices USA y refuerza al USD."
 """.strip()
 
     try:
@@ -342,7 +277,6 @@ Ejemplo de estilo:
         return texto.strip()
     except Exception as e:
         logger.warning("econ_calendar: fallo interpretando evento con OpenAI: %s", e)
-        # Fallback simple
         return "Dato relevante que puede mover índices USA y el dólar."
 
 
@@ -355,18 +289,15 @@ def _build_message(events: List[Dict], today: datetime) -> str:
     max_stars = max(e["stars"] for e in events)
     stars_range = f"{min_stars}–{max_stars}⭐"
 
-    lines: List[str] = []
+    lines = []
     lines.append(f"📅 Calendario económico USA — {fecha_str} ({stars_range})")
-    lines.append(
-        "Solo los datos más relevantes que pueden mover índices USA y el USD.\n"
-    )
+    lines.append("Solo los datos más relevantes que pueden mover índices USA y el USD.\n")
 
-    # Cuerpo: un bloque por evento
     for ev in events:
         dt_ = ev["datetime"]
         hora = dt_.strftime("%H:%M")
         titulo = ev["event"]
-        stars_txt = "⭐" * ev["stars"]
+        stars = "⭐" * ev["stars"]
         actual = ev["actual"] or "—"
         forecast = ev["forecast"] or "—"
         previous = ev["previous"] or "—"
@@ -374,17 +305,16 @@ def _build_message(events: List[Dict], today: datetime) -> str:
         interpretacion = _interpret_event(ev)
 
         bloque = (
-            f"{stars_txt} {hora} – {titulo}\n"
+            f"{stars} {hora} – {titulo}\n"
             f"   Actual: {actual} | Previsión: {forecast} | Anterior: {previous}\n"
             f"   {interpretacion}"
         )
         lines.append(bloque)
 
-    # Clave del día (resumen final por IA)
+    # Resumen clave del día (1 frase, máx 160 caracteres aprox.)
     resumen_prompt = f"""
-Eres analista macro. Resume en 1 frase (máx. 160 caracteres) cuál es la
-CLAVE DEL DÍA para índices USA y USD, dados estos eventos (en español,
-tono profesional y directo).
+Eres analista macro. Resume en 1 frase (máx. 160 caracteres) cuál es la CLAVE DEL DÍA
+para índices USA y USD, dados estos eventos (en español, tono profesional):
 
 Eventos:
 {chr(10).join(f"- {e['datetime'].strftime('%H:%M')} {e['event']} ({'⭐'*e['stars']})" for e in events)}
@@ -394,14 +324,12 @@ Eventos:
         resumen = call_gpt_mini(resumen_prompt, max_tokens=60).strip()
     except Exception as e:
         logger.warning("econ_calendar: fallo generando clave del día con OpenAI: %s", e)
-        resumen = (
-            "Los datos de hoy marcarán el sesgo de la sesión en índices USA y USD."
-        )
+        resumen = "Los datos macro de hoy marcarán el tono de la sesión en índices USA y USD."
 
     lines.append(f"\n👉 Clave del día: {resumen}")
 
     mensaje = "\n".join(lines)
-    if len(mensaje) > 3900:  # seguridad límite Telegram
+    if len(mensaje) > 3900:
         mensaje = mensaje[:3900] + "\n\n(Resumen recortado por longitud.)"
 
     return mensaje
@@ -415,7 +343,7 @@ def run_econ_calendar(force: bool = False) -> None:
     """
     Ejecuta todo el flujo:
     - Control una sola vez al día (salvo force=True).
-    - Obtiene calendario USA SOLO para hoy.
+    - Obtiene calendario USA para HOY (filtrando sobre un rango amplio).
     - Filtra y agrupa eventos clave.
     - Genera mensaje con interpretaciones cortas.
     - Envía a Telegram.
@@ -424,38 +352,29 @@ def run_econ_calendar(force: bool = False) -> None:
     today = now.date()
     today_str = today.isoformat()
 
-    if not force:
-        # Control "solo una vez al día"
-        if _already_sent_today(today_str):
-            logger.info(
-                "econ_calendar:[INFO] econ_calendar: Ya enviado hoy, "
-                "no se vuelve a enviar (force=False)."
-            )
-            return
+    if not force and _already_sent_today(today_str):
+        logger.info(
+            "econ_calendar:[INFO] econ_calendar: Ya enviado hoy, no se vuelve a enviar (force=False)."
+        )
+        return
 
     logger.info("econ_calendar:[INFO] econ_calendar: Obteniendo calendario económico USA...")
 
     try:
-        start_dt = datetime.combine(today, datetime.min.time())
-        end_dt = start_dt + timedelta(days=1)
-        df = _get_investpy_calendar(
+        df = _get_investpy_calendar_for_day(
             country=DEFAULT_COUNTRY,
-            from_date=start_dt,
-            to_date=end_dt,
+            target_day=today,
         )
     except Exception as e:
         logger.error(
-            "econ_calendar:ERROR econ_calendar: Error al obtener calendario de investpy: %s",
-            e,
+            "econ_calendar:ERROR econ_calendar: Error al obtener calendario de investpy: %s", e
         )
-        # Mensaje de error a Telegram para que lo veas
         send_telegram_message(f"⚠️ Error al obtener calendario económico:\n{e}")
         return
 
     events = _filter_and_group_events(df)
     message = _build_message(events, today=now)
 
-    # Enviamos a Telegram
     try:
         send_telegram_message(message)
         logger.info("econ_calendar:[INFO] econ_calendar: Calendario económico enviado.")
@@ -463,6 +382,5 @@ def run_econ_calendar(force: bool = False) -> None:
             _mark_sent_today(today_str)
     except Exception as e:
         logger.error(
-            "econ_calendar:ERROR econ_calendar: fallo enviando a Telegram: %s",
-            e,
+            "econ_calendar:ERROR econ_calendar: fallo enviando a Telegram: %s", e
         )
