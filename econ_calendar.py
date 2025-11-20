@@ -1,177 +1,243 @@
+import os
 import logging
 from datetime import datetime, timedelta
+from pathlib import Path
+from dateutil import tz
 
-import investpy
 import pandas as pd
+import investpy
 
 from utils import send_telegram_message, call_gpt_mini
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("econ_calendar")
+
+LOCAL_TZ = os.getenv("LOCAL_TZ", "Europe/Madrid")
+STATE_FILE = Path(__file__).resolve().parent / ".econ_calendar_last_date"
 
 
-def _get_calendar_df():
-    """Descarga calendario USA de hoy (forzando to_date > from_date)."""
-    today = datetime.utcnow().date()
-    tomorrow = today + timedelta(days=1)
+# ---------------------- FECHAS Y CONTROL ----------------------
 
-    from_str = today.strftime("%d/%m/%Y")
-    to_str = tomorrow.strftime("%d/%m/%Y")
+def _today_local():
+    tzinfo = tz.gettz(LOCAL_TZ)
+    return datetime.now(tzinfo).date()
 
-    logger.info(
-        f"econ_calendar:[INFO] econ_calendar: Rango fechas from_date={from_str}, "
-        f"to_date={to_str}"
-    )
 
-    try:
-        df = investpy.economic_calendar(
-            countries=["united states"],
-            from_date=from_str,
-            to_date=to_str,
-        )
-    except Exception as e:
-        raise RuntimeError(f"Error al obtener calendario de investpy: {e}")
-
-    if df is None or df.empty:
-        return pd.DataFrame()
-
-    df = df.copy()
-
-    # ❌ ANTES petaba aquí si no existía la columna 'country'
-    if "country" in df.columns:
-        df = df[df["country"].astype(str).str.lower().str.contains("united states")]
-
-    # Quitamos filas sin evento
-    if "event" in df.columns:
-        df = df.dropna(subset=["event"])
-
-    # Orden por fecha/hora si se puede
-    if "date" in df.columns and "time" in df.columns:
+def _already_sent_today() -> bool:
+    today = _today_local().isoformat()
+    if STATE_FILE.exists():
         try:
-            dt = pd.to_datetime(df["date"] + " " + df["time"])
-            df = df.assign(_dt=dt).sort_values("_dt")
-        except Exception:
+            if STATE_FILE.read_text().strip() == today:
+                return True
+        except:
             pass
+    return False
 
-    return df
+
+def _mark_sent_today():
+    today = _today_local().isoformat()
+    try:
+        STATE_FILE.write_text(today)
+    except Exception as e:
+        logger.warning("No se pudo escribir STATE_FILE: %s", e)
 
 
-def _stars_from_importance(importance: str) -> str:
+# ---------------------- AGRUPAR EVENTOS DUPLICADOS ----------------------
+
+def _normalize_title(event: str) -> str:
+    """
+    Normaliza los nombres de eventos para agrupar duplicados:
+    - Housing Starts (MoM)
+    - Housing Starts (YoY)
+    - Monthly Housing Starts
+    → "Housing Starts"
+    """
+    if not event:
+        return "Evento"
+
+    e = event.lower()
+
+    # Housing Starts — varias versiones
+    if "housing starts" in e:
+        return "Housing Starts"
+
+    # Initial Jobless Claims
+    if "jobless" in e:
+        return "Jobless Claims"
+
+    # Average Hourly Earnings
+    if "hourly earnings" in e:
+        return "Average Hourly Earnings"
+
+    # Manufacturing Index
+    if "manufacturing" in e:
+        return "Manufacturing Index"
+
+    # Participation Rate
+    if "participation rate" in e:
+        return "Participation Rate"
+
+    # Otros → primer bloque sin paréntesis
+    return event.split("(")[0].strip()
+
+
+# ---------------------- FORMATEO DE EVENTOS ----------------------
+
+def _importance_to_stars(importance):
     imp = str(importance).lower()
-    if "high" in imp or imp.strip() in {"3", "3.0"}:
+    if "high" in imp or imp in ["3", "3.0"]:
         return "⭐⭐⭐"
-    if "medium" in imp or imp.strip() in {"2", "2.0"}:
+    if "medium" in imp or imp in ["2", "2.0"]:
         return "⭐⭐"
     return "⭐"
 
 
-def _format_event_row(row) -> str:
-    stars = _stars_from_importance(row.get("importance", ""))
-    time = row.get("time", "--:--")
-    name = str(row.get("event", "")).strip()
+def _event_block(title, row_group):
+    """
+    row_group: conjunto de filas investpy que pertenecen al mismo título base
+    """
+    # Tomamos la primera fila para hora
+    row0 = row_group.iloc[0]
 
-    actual = str(row.get("actual", "") or "").strip()
-    forecast = str(row.get("forecast", "") or "").strip()
-    previous = str(row.get("previous", "") or "").strip()
+    stars = _importance_to_stars(row0.get("importance", ""))
+    time = row0.get("time", "--:--")
 
-    nums = []
-    if actual:
-        nums.append(f"*Actual:* {actual}")
-    if forecast:
-        nums.append(f"*Previsión:* {forecast}")
-    if previous:
-        nums.append(f"*Anterior:* {previous}")
+    # Consolidar números
+    datos = []
 
-    if nums:
-        nums_str = " | ".join(nums)
+    # Nivel
+    if any(str(x) not in ["", "None", "nan"] for x in row_group["actual"]):
+        val = row_group["actual"].dropna().iloc[0]
+        datos.append(f"Nivel: {val}")
+
+    # Forecast
+    if any(str(x) not in ["", "None", "nan"] for x in row_group["forecast"]):
+        val = row_group["forecast"].dropna().iloc[0]
+        datos.append(f"Previsión: {val}")
+
+    # Previous
+    if any(str(x) not in ["", "None", "nan"] for x in row_group["previous"]):
+        val = row_group["previous"].dropna().iloc[0]
+        datos.append(f"Anterior: {val}")
+
+    if not datos:
+        datos_str = "Sin datos disponibles"
     else:
-        nums_str = "Sin datos numéricos disponibles."
+        datos_str = " | ".join(datos)
 
-    line = (
-        f"{stars} *{name}*\n"
-        f"🕒 {time}\n"
-        f"💬 {nums_str}"
-    )
-    return line
-
-
-def _build_message_with_ai(df: pd.DataFrame) -> str:
-    today = datetime.utcnow().date()
-    title = f"📅 Resumen económico USA – {today.strftime('%d/%m/%Y')} (2–3⭐)\n\n"
-
-    # Filtramos solo media/alta importancia si existe la columna
-    if "importance" in df.columns:
-        mask = df["importance"].astype(str).str.lower().isin(
-            ["medium", "high", "2", "3", "2.0", "3.0"]
-        )
-        df_imp = df[mask].copy()
-        if df_imp.empty:
-            df_imp = df.copy()
-    else:
-        df_imp = df.copy()
-
-    # Limitamos nº de eventos para que el mensaje no sea eterno
-    df_imp = df_imp.head(12)
-
-    eventos_for_ai = []
-    for _, row in df_imp.iterrows():
-        eventos_for_ai.append(
-            f"- {row.get('time','--:--')} | {row.get('event','').strip()} | "
-            f"imp={row.get('importance','')} | "
-            f"actual={row.get('actual','')} | "
-            f"forecast={row.get('forecast','')} | "
-            f"previous={row.get('previous','')}"
-        )
-    eventos_for_ai_text = "\n".join(eventos_for_ai)
-
+    # Interpretación individual con GPT-mini
     system_prompt = (
-        "Eres un analista macro que explica a traders intradía, en español, "
-        "qué eventos de EEUU pueden mover índices USA y el dólar. "
-        "Sé concreto, tono natural, máximo 3–4 frases cortas."
+        "Eres un analista macro. Explica en 1–2 frases el impacto del evento "
+        "en índices USA y en el USD. Tono profesional y natural."
     )
-    user_prompt = (
-        "Con esta lista de eventos macro de EEUU para hoy, explica brevemente "
-        "qué vigilarías y dónde puede haber más impacto en índices y USD:\n\n"
-        f"{eventos_for_ai_text}"
+    user_prompt = f"Evento: {title}\nHora: {time}\nDatos: {datos_str}"
+    interpretacion = call_gpt_mini(system_prompt, user_prompt) or "Impacto moderado."
+
+    block = (
+        f"{stars} {time} – *{title}*\n"
+        f"• Datos: {datos_str}\n"
+        f"• Impacto: {interpretacion}"
     )
-
-    resumen = call_gpt_mini(system_prompt, user_prompt, max_tokens=220)
-
-    if resumen:
-        resumen_block = f"👉 *Clave del día:*\n{resumen.strip()}\n\n"
-    else:
-        resumen_block = ""
-
-    lines = [_format_event_row(row) for _, row in df_imp.iterrows()]
-    events_block = "\n\n".join(lines)
-
-    msg = title + resumen_block + events_block
-    return msg
+    return block
 
 
-def run_econ_calendar():
-    logger.info("econ_calendar:[INFO] econ_calendar: Obteniendo calendario económico USA...")
+# ---------------------- MENSAJE COMPLETO ----------------------
+
+def _build_message(df: pd.DataFrame, today):
+    """
+    Construye el mensaje final:
+    - Título
+    - Resumen clave
+    - Lista de eventos formateados (sin duplicados)
+    """
+    title = f"📅 Calendario económico USA – {today.strftime('%d/%m')} (2–3⭐)\n\n"
+
+    # Resumen general con IA
+    eventos_texto = []
+    for _, row in df.iterrows():
+        eventos_texto.append(
+            f"- {row.get('time','--:--')} | {row.get('event','').strip()} | "
+            f"Actual={row.get('actual','')} | Forecast={row.get('forecast','')} | Prev={row.get('previous','')}"
+        )
+    joined = "\n".join(eventos_texto)
+
+    resumen = call_gpt_mini(
+        "Eres analista macro. Resume en 2 frases breves el foco del día "
+        "para traders de índices USA. Sé claro y natural.",
+        f"Eventos de hoy:\n{joined}",
+        max_tokens=120,
+    ) or "Jornada centrada en eventos macro de interés moderado."
+
+    resumen_block = f"👉 *Clave del día:*\n{resumen}\n\n"
+
+    # Agrupar por título normalizado
+    df["title_norm"] = df["event"].apply(_normalize_title)
+
+    blocks = []
+    for title_norm, group in df.groupby("title_norm"):
+        block = _event_block(title_norm, group)
+        blocks.append(block)
+
+    final_text = title + resumen_block + "\n\n".join(blocks)
+    return final_text
+
+
+# ---------------------- FUNCIÓN PRINCIPAL ----------------------
+
+def run_econ_calendar(force: bool = False):
+    today = _today_local()
+
+    if not force and _already_sent_today():
+        logger.info("Calendario YA enviado hoy. No se repite.")
+        return
+
+    # Fechas para investpy (evita error 0032)
+    from_date = today.strftime("%d/%m/%Y")
+    to_date = (today + timedelta(days=1)).strftime("%d/%m/%Y")
 
     try:
-        df = _get_calendar_df()
-    except Exception as e:
-        err_msg = (
-            "⚠️ Error al obtener calendario económico:\n"
-            f"{e}"
+        df = investpy.economic_calendar(
+            from_date=from_date,
+            to_date=to_date,
+            countries=["united states"],
         )
-        logger.error(f"ERROR:econ_calendar:{err_msg}")
-        send_telegram_message(err_msg)
+    except Exception as e:
+        err = f"⚠️ Error al obtener calendario económico:\n{e}"
+        logger.error(err)
+        send_telegram_message(err)
         return
+
+    if df is None or df.empty:
+        msg = f"📅 Calendario económico USA – {today.strftime('%d/%m')}\n\nNo hay eventos relevantes hoy."
+        send_telegram_message(msg)
+        _mark_sent_today()
+        return
+
+    # Limpieza básica
+    if "event" not in df.columns:
+        send_telegram_message("⚠️ Calendario económico vacío o mal formado.")
+        _mark_sent_today()
+        return
+
+    # Orden por fecha/hora
+    try:
+        df["_dt"] = pd.to_datetime(df["date"] + " " + df["time"], errors="coerce")
+        df = df.sort_values("_dt")
+    except:
+        pass
+
+    # Filtrar solo importancia media/alta
+    if "importance" in df.columns:
+        df = df[df["importance"].astype(str).str.lower().isin(["2", "3", "medium", "high", "2.0", "3.0"])]
 
     if df.empty:
-        msg = (
-            "📅 Calendario económico USA – hoy\n\n"
-            "No hay publicaciones macro de alto impacto previstas para hoy en EEUU."
-        )
-        logger.info("econ_calendar:[INFO] Sin eventos relevantes, enviando aviso.")
-        send_telegram_message(msg)
+        send_telegram_message("📅 Hoy no hay eventos de relevancia (2–3⭐) en EEUU.")
+        _mark_sent_today()
         return
 
-    msg = _build_message_with_ai(df)
-    logger.info("econ_calendar:[INFO] Enviando calendario económico...")
-    send_telegram_message(msg)
-    logger.info("econ_calendar:[INFO] Calendario económico enviado.")
+    # Construir mensaje final
+    text = _build_message(df, today)
+
+    # Enviar
+    send_telegram_message(text)
+    logger.info("Calendario enviado.")
+    _mark_sent_today()
