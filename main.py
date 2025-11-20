@@ -1,92 +1,79 @@
+# main.py
 import os
-import subprocess
 import logging
-from datetime import datetime
-
+from datetime import datetime, time
 from dateutil import tz
-import pkg_resources  # lo usa investpy por debajo, no borrar
+import pkg_resources  # lo usa investpy por debajo, NO borrar
 
 from econ_calendar import run_econ_calendar
+from buenos_dias import run_buenos_dias
 
-
-# ----------------- LOGGING -----------------
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s:%(message)s",
+    format="%(asctime)s %(levelname)s %(name)s:%(funcName)s: %(message)s",
 )
+
 logger = logging.getLogger(__name__)
 
-
-# ----------------- UTILIDADES -----------------
-def get_now_local():
-    """Devuelve datetime con la zona horaria indicada en LOCAL_TZ (por defecto Europe/Madrid)."""
-    local_tz_name = os.getenv("LOCAL_TZ", "Europe/Madrid")
-    local_tz = tz.gettz(local_tz_name)
-    return datetime.now(local_tz)
+LOCAL_TZ = os.getenv("LOCAL_TZ", "Europe/Madrid")
+FORCE_ECON = os.getenv("FORCE_ECON", "0")
+FORCE_MORNING = os.getenv("FORCE_MORNING", "0")
 
 
-def in_hour_window(now: datetime, start_hour: int, end_hour: int) -> bool:
-    """Devuelve True si now.hour está en [start_hour, end_hour)."""
-    return start_hour <= now.hour < end_hour
+def now_local():
+    tzinfo = tz.gettz(LOCAL_TZ)
+    return datetime.now(tzinfo)
 
 
-def run_buenos_dias_script():
-    """
-    Lanza el fichero buenos_dias.py como script independiente,
-    igual que hacía el cron antiguo (no tocamos buenos_dias.py).
-    """
-    logger.info("Buenos días: lanzando script 'buenos_dias.py' con subprocess...")
-    try:
-        subprocess.run(["python", "buenos_dias.py"], check=True)
-        logger.info("Buenos días: script ejecutado correctamente.")
-    except subprocess.CalledProcessError as e:
-        logger.error(f"Buenos días: error al ejecutar buenos_dias.py: {e}")
+def in_morning_window(dt: datetime) -> bool:
+    """Franja Buenos días: 09:00–11:00."""
+    return time(9, 0) <= dt.time() <= time(11, 0)
 
 
-# ----------------- MAIN -----------------
+def in_econ_window(dt: datetime) -> bool:
+    """Franja calendario económico: 10:30–13:00."""
+    t = dt.time()
+    # 10:30 <= hora < 13:00
+    return (t >= time(10, 30)) and (t < time(13, 0))
+
+
 def main():
     logger.info("Ejecutando main.py...")
+    current = now_local()
+    logger.info("Hora local: %s (%s)", current, LOCAL_TZ)
 
-    now = get_now_local()
-    weekday = now.weekday()  # 0 = lunes, 6 = domingo
-
-    # Flags de forzado desde variables de entorno
-    force_morning = os.getenv("FORCE_MORNING", "0") == "1"
-    force_econ = os.getenv("FORCE_ECON", "0") == "1"
-
-    # -------- 1) Mensaje de Buenos días / premarket --------
-    # Ventana normal: lunes-viernes, 9h-11h
-    if force_morning:
-        logger.info("FORCE_MORNING=1 -> enviando 'Buenos días' sin restricciones de hora.")
-        run_buenos_dias_script()
-    else:
-        if 0 <= weekday <= 4 and in_hour_window(now, 9, 11):
-            logger.info("Dentro de franja 9–11h para 'Buenos días', se envía.")
-            run_buenos_dias_script()
+    # ----------------------
+    # 1) Mensaje Buenos días
+    # ----------------------
+    try:
+        if FORCE_MORNING == "1":
+            logger.info("FORCE_MORNING=1 -> enviando 'Buenos días' sin restricciones.")
+            run_buenos_dias(force=True)
         else:
-            logger.info("Fuera de franja 9–11h para 'Buenos días', no se envía.")
+            if in_morning_window(current):
+                logger.info("Dentro de la franja 9–11h -> comprobando 'Buenos días'.")
+                run_buenos_dias(force=False)
+            else:
+                logger.info("Fuera de franja 9–11h para 'Buenos días', no se envía.")
+    except Exception as e:
+        logger.exception("Error al ejecutar 'Buenos días': %s", e)
 
-    # -------- 2) Calendario económico USA --------
-    # Ventana normal: lunes-viernes, 10h-13h
-    if force_econ:
-        logger.info("FORCE_ECON=1 -> enviando calendario económico sin restricciones.")
-        try:
-            logger.info("econ_calendar: Obteniendo calendario económico USA...")
-            run_econ_calendar()  # sin parámetro 'force'
-            logger.info("econ_calendar: Calendario económico enviado.")
-        except Exception as e:
-            logger.error(f"econ_calendar: ⚠️ Error al obtener/enviar calendario económico: {e}")
-    else:
-        if 0 <= weekday <= 4 and in_hour_window(now, 10, 13):
-            logger.info("Dentro de franja 10–13h para calendario económico, se envía.")
-            try:
-                logger.info("econ_calendar: Obteniendo calendario económico USA...")
-                run_econ_calendar()
-                logger.info("econ_calendar: Calendario económico enviado.")
-            except Exception as e:
-                logger.error(f"econ_calendar: ⚠️ Error al obtener/enviar calendario económico: {e}")
+    # --------------------------
+    # 2) Calendario económico USA
+    # --------------------------
+    try:
+        if FORCE_ECON == "1":
+            logger.info("FORCE_ECON=1 -> enviando calendario económico sin restricciones (ignora franja y 'una vez al día').")
+            run_econ_calendar(force=True)
         else:
-            logger.info("Fuera de franja 10–13h para calendario económico, no se envía.")
+            if in_econ_window(current):
+                logger.info("Dentro de la franja 10:30–13h -> intentando enviar calendario (1 vez al día).")
+                # run_econ_calendar(force=False) internamente ya controla si se envió hoy
+                run_econ_calendar(force=False)
+            else:
+                logger.info("Fuera de franja 10:30–13h -> no se envía calendario económico.")
+    except Exception as e:
+        logger.exception("Error al ejecutar calendario económico: %s", e)
 
 
 if __name__ == "__main__":
