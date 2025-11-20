@@ -1,79 +1,116 @@
-# main.py
-import os
-import logging
-from datetime import datetime, time
-from dateutil import tz
-import pkg_resources  # lo usa investpy por debajo, NO borrar
+# main.py  — InvestX-Main
+# Lanza:
+#   - buenos_dias.py (premarket / mensaje de buenos días)
+#   - econ_calendar.py (calendario económico USA)
+#
+# Controla:
+#   - Franjas horarias (hora local)
+#   - Variables de forzado:
+#       FORCE_MORNING=1  → envía "Buenos días" siempre
+#       FORCE_ECON=1     → envía calendario económico siempre
+#
+# NOTA: no toca nada del código interno de buenos_dias.py
 
-from econ_calendar import run_econ_calendar
-from buenos_dias import run_buenos_dias
+import os
+import subprocess
+import logging
+import datetime
+
+from dateutil import tz
+import pkg_resources  # lo usa investpy por debajo, no borrar
+
+from econ_calendar import run_econ_calendar   # aquí sí tenemos función
+
+# ---------- Configuración básica ----------
+
+LOCAL_TZ = os.environ.get("LOCAL_TZ", "Europe/Madrid")
+
+FORCE_MORNING = os.environ.get("FORCE_MORNING", "0").lower() in ("1", "true", "yes")
+FORCE_ECON = os.environ.get("FORCE_ECON", "0").lower() in ("1", "true", "yes")
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(name)s:%(funcName)s: %(message)s",
+    format="%(asctime)s [%(levelname)s] %(name)s:%(message)s",
 )
-
-logger = logging.getLogger(__name__)
-
-LOCAL_TZ = os.getenv("LOCAL_TZ", "Europe/Madrid")
-FORCE_ECON = os.getenv("FORCE_ECON", "0")
-FORCE_MORNING = os.getenv("FORCE_MORNING", "0")
+log = logging.getLogger(__name__)
 
 
-def now_local():
-    tzinfo = tz.gettz(LOCAL_TZ)
-    return datetime.now(tzinfo)
+# ---------- Utilidades de tiempo ----------
+
+def now_local() -> datetime.datetime:
+    """Devuelve la hora local según LOCAL_TZ."""
+    now_utc = datetime.datetime.now(datetime.timezone.utc)
+    return now_utc.astimezone(tz.gettz(LOCAL_TZ))
 
 
-def in_morning_window(dt: datetime) -> bool:
-    """Franja Buenos días: 09:00–11:00."""
-    return time(9, 0) <= dt.time() <= time(11, 0)
+def in_window(start_hour: int, end_hour: int, current: datetime.datetime) -> bool:
+    """
+    Devuelve True si current.hour está dentro de [start_hour, end_hour),
+    es decir, start_hour <= hora < end_hour.
+    """
+    return start_hour <= current.hour < end_hour
 
 
-def in_econ_window(dt: datetime) -> bool:
-    """Franja calendario económico: 10:30–13:00."""
-    t = dt.time()
-    # 10:30 <= hora < 13:00
-    return (t >= time(10, 30)) and (t < time(13, 0))
+# ---------- Lanzador de buenos_dias.py ----------
 
+def run_buenos_dias_cli(force: bool = False) -> None:
+    """
+    Ejecuta buenos_dias.py como script, sin depender de funciones internas.
+    Si 'force' es True, añade un argumento --force (si lo quieres usar en el script).
+    """
+    cmd = ["python", "buenos_dias.py"]
+    if force:
+        cmd.append("--force")
+
+    log.info("buenos_dias: Lanzando script: %s", " ".join(cmd))
+    result = subprocess.run(cmd, check=False)
+
+    if result.returncode != 0:
+        log.error("buenos_dias: script terminó con código %s", result.returncode)
+    else:
+        log.info("buenos_dias: script ejecutado correctamente.")
+
+
+# ---------- MAIN ----------
 
 def main():
-    logger.info("Ejecutando main.py...")
-    current = now_local()
-    logger.info("Hora local: %s (%s)", current, LOCAL_TZ)
+    ahora = now_local()
+    log.info("Ejecutando main.py...")
+    log.info("Hora local (%s): %s", LOCAL_TZ, ahora.strftime("%Y-%m-%d %H:%M:%S"))
 
-    # ----------------------
-    # 1) Mensaje Buenos días
-    # ----------------------
-    try:
-        if FORCE_MORNING == "1":
-            logger.info("FORCE_MORNING=1 -> enviando 'Buenos días' sin restricciones.")
-            run_buenos_dias(force=True)
+    # ==============================
+    # 1) Mensaje de BUENOS DÍAS
+    # ==============================
+    # Reglas:
+    #   - Si FORCE_MORNING=1 → se envía siempre.
+    #   - Si no, solo una vez en la franja 9–11h local.
+    #     (si tu cron está a las 10:30 y 12:00 → solo 10:30 cae en 9–11)
+    if FORCE_MORNING:
+        log.info("FORCE_MORNING=1 → enviando 'Buenos días' sin restricciones.")
+        run_buenos_dias_cli(force=True)
+    else:
+        if in_window(9, 11, ahora):
+            log.info("Dentro de franja 9–11h → se envía 'Buenos días'.")
+            run_buenos_dias_cli(force=False)
         else:
-            if in_morning_window(current):
-                logger.info("Dentro de la franja 9–11h -> comprobando 'Buenos días'.")
-                run_buenos_dias(force=False)
-            else:
-                logger.info("Fuera de franja 9–11h para 'Buenos días', no se envía.")
-    except Exception as e:
-        logger.exception("Error al ejecutar 'Buenos días': %s", e)
+            log.info("Fuera de franja 9–11h para 'Buenos días'; no se envía.")
 
-    # --------------------------
+    # ==============================
     # 2) Calendario económico USA
-    # --------------------------
-    try:
-        if FORCE_ECON == "1":
-            logger.info("FORCE_ECON=1 -> enviando calendario económico sin restricciones (ignora franja y 'una vez al día').")
-            run_econ_calendar(force=True)
+    # ==============================
+    # Reglas:
+    #   - Si FORCE_ECON=1 → se envía siempre.
+    #   - Si no, solo en la franja 11–13h local.
+    #     (con cron 10:30 y 12:00 → solo 12:00 cae en 11–13)
+    if FORCE_ECON:
+        log.info("FORCE_ECON=1 → enviando calendario económico sin restricciones.")
+        run_econ_calendar(force=True)
+    else:
+        if in_window(11, 13, ahora):
+            log.info("Dentro de franja 11–13h → se envía calendario económico.")
+            run_econ_calendar(force=False)
         else:
-            if in_econ_window(current):
-                logger.info("Dentro de la franja 10:30–13h -> intentando enviar calendario (1 vez al día).")
-                # run_econ_calendar(force=False) internamente ya controla si se envió hoy
-                run_econ_calendar(force=False)
-            else:
-                logger.info("Fuera de franja 10:30–13h -> no se envía calendario económico.")
-    except Exception as e:
-        logger.exception("Error al ejecutar calendario económico: %s", e)
+            log.info("Fuera de franja 11–13h; no se envía calendario económico.")
 
 
 if __name__ == "__main__":
