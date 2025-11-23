@@ -99,23 +99,24 @@ def fetch_weekly_earnings(week_start: datetime) -> List[Dict[str, Any]]:
         logger.error(f"earnings_weekly | Error HTTP/JSON Investing: {e}")
         return []
 
-    rows_html = raw.get("data", [])
-    if isinstance(rows_html, str):
-        rows_html = [rows_html]
+    # raw["data"] suele ser una lista con uno o varios bloques HTML (<tr>...</tr>...)
+    blocks_html = raw.get("data", [])
+    if isinstance(blocks_html, str):
+        blocks_html = [blocks_html]
 
     earnings: List[Dict[str, Any]] = []
 
-    for row_html in rows_html:
-        # Cada elemento de rows_html es un <tr> en HTML
-        try:
-            soup = BeautifulSoup(row_html, "html.parser")
-            tds = soup.find_all("td")
+    for block_html in blocks_html:
+        soup = BeautifulSoup(block_html, "html.parser")
+        # Recorremos cada fila de la tabla
+        for tr in soup.find_all("tr"):
+            tds = tr.find_all("td")
             if len(tds) < 6:
                 continue
 
-            # Estructura típica del calendario de resultados:
-            # 0: fecha
-            # 1: empresa (nombre + link)
+            # Estructura típica:
+            # 0: fecha          (24.11.2025)
+            # 1: empresa        (nombre + link)
             # 2: BPA / Previsión
             # 3: Ingresos / Previsión
             # 4: Cap. mercado
@@ -126,11 +127,15 @@ def fetch_weekly_earnings(week_start: datetime) -> List[Dict[str, Any]]:
             rev_text = tds[3].get_text(strip=True)
             time_text = tds[5].get_text(strip=True) or "—"
 
-            # La fecha suele venir como "24.11.2025"
+            if not company:
+                continue
+
+            # La fecha viene como "24.11.2025"
             try:
                 parsed_date = datetime.strptime(date_text, "%d.%m.%Y")
                 date_iso = parsed_date.strftime("%Y-%m-%d")
             except Exception:
+                # Por si cambian el formato, no tiramos todo
                 date_iso = week_start.strftime("%Y-%m-%d")
 
             earnings.append(
@@ -142,9 +147,6 @@ def fetch_weekly_earnings(week_start: datetime) -> List[Dict[str, Any]]:
                     "time": time_text,
                 }
             )
-        except Exception as e:
-            logger.error(f"earnings_weekly | Error parseando fila HTML: {e}")
-            continue
 
     logger.info(
         f"earnings_weekly | Investing (USA, impacto 3): {len(earnings)} resultados "
@@ -230,8 +232,18 @@ def _build_professional_note(earnings: List[Dict[str, Any]], week_start: datetim
 # =====================================================
 
 def run_weekly_earnings(force: bool = False) -> None:
+    """
+    Envía al canal de Telegram el resumen semanal de resultados empresariales:
+
+    - Por defecto solo 1 envío al día (control STATE_FILE).
+    - Si force=True ignora el control y envía siempre.
+    - Si EARNINGS_SIMULATE_TOMORROW=1, toma como base 'hoy + 1 día'
+      para poder forzar un domingo la semana siguiente.
+    """
+
     simulate_tomorrow = (
-        os.getenv("EARNINGS_SIMULATE_TOMORROW", "0").strip().lower() in ("1", "true", "yes")
+        os.getenv("EARNINGS_SIMULATE_TOMORROW", "0").strip().lower()
+        in ("1", "true", "yes")
     )
 
     now = datetime.utcnow() + timedelta(hours=TZ_OFFSET)
@@ -241,14 +253,15 @@ def run_weekly_earnings(force: bool = False) -> None:
     today_str = now.strftime("%Y-%m-%d")
 
     logger.info(
-        f"earnings_weekly | run_weekly_earnings(force={force}, simulate_tomorrow={simulate_tomorrow}, "
-        f"today={today_str})"
+        f"earnings_weekly | run_weekly_earnings(force={force}, "
+        f"simulate_tomorrow={simulate_tomorrow}, today={today_str})"
     )
 
     if not force and _already_sent(today_str):
         logger.info("earnings_weekly | Ya se envió hoy. No se repite.")
         return
 
+    # Semana que comienza en la fecha base (habitualmente lunes)
     week_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
     earnings = fetch_weekly_earnings(week_start)
 
