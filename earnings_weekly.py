@@ -1,8 +1,8 @@
 # === earnings_weekly.py ===
 # Resumen semanal de resultados empresariales (earnings)
-# - Usa FinancialModelingPrep (FMP) como fuente real
+# Fuente: Yahoo Finance (web scraping del calendario de resultados)
+# - Gratis, sin API key
 # - Español, tono profesional
-# - Sin títulos tipo "Resumen IA"
 # - Control de 1 envío/día + simulación "mañana"
 
 import os
@@ -12,6 +12,7 @@ from datetime import datetime, timedelta
 from typing import List, Dict, Any
 
 import requests
+from bs4 import BeautifulSoup
 
 from utils import send_telegram_message, call_gpt_mini
 
@@ -20,8 +21,6 @@ logger.setLevel(logging.INFO)
 
 STATE_FILE = "earnings_weekly_state.json"
 TZ_OFFSET = int(os.getenv("TZ_OFFSET", "1"))
-
-FMP_API_KEY = os.getenv("FMP_API_KEY", "").strip()
 
 
 # =====================================================
@@ -58,70 +57,115 @@ def _mark_sent(today_str: str) -> None:
 
 
 # =====================================================
-# Earnings reales desde FMP
+# Scraping Yahoo Finance (earnings calendar)
 # =====================================================
 
-def fetch_weekly_earnings(week_start: datetime) -> List[Dict[str, Any]]:
+YF_BASE_URL = "https://finance.yahoo.com/calendar/earnings"
+YF_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0 Safari/537.36"
+    )
+}
+
+
+def _fetch_yahoo_earnings_for_day(day: datetime) -> List[Dict[str, Any]]:
     """
-    Obtiene los earnings reales de la API de FinancialModelingPrep (FMP)
-    para el rango lunes–viernes de la semana indicada.
+    Descarga el calendario de resultados de Yahoo Finance para un día concreto.
+    Devuelve una lista de dicts con:
+      - date: "YYYY-MM-DD"
+      - ticker
+      - company
+      - time: "Before Open" | "After Close" | "Horario no especificado"
     """
 
-    if not FMP_API_KEY:
-        logger.error("earnings_weekly | FMP_API_KEY no definida en variables de entorno.")
-        return []
-
-    week_end = week_start + timedelta(days=4)
-
-    from_date = week_start.strftime("%Y-%m-%d")
-    to_date = week_end.strftime("%Y-%m-%d")
-
-    url = "https://financialmodelingprep.com/api/v3/historical/earning_calendar"
+    date_str = day.strftime("%Y-%m-%d")
     params = {
-        "from": from_date,
-        "to": to_date,
-        "apikey": FMP_API_KEY,
+        "day": date_str,
+        "offset": "0",
+        "size": "100",  # máx. filas por página
     }
 
     try:
-        resp = requests.get(url, params=params, timeout=15)
+        resp = requests.get(YF_BASE_URL, params=params, headers=YF_HEADERS, timeout=15)
         resp.raise_for_status()
-        data = resp.json()
+    except Exception as e:
+        logger.error(f"earnings_weekly | Error HTTP al consultar Yahoo para {date_str}: {e}")
+        return []
 
-        earnings: List[Dict[str, Any]] = []
-        for item in data:
-            date_str = item.get("date")
-            symbol = item.get("symbol")
-            hour_raw = (item.get("time") or "").lower().strip()
+    try:
+        soup = BeautifulSoup(resp.text, "html.parser")
+        table = soup.find("table")
 
-            if not date_str or not symbol:
+        if not table:
+            logger.warning(f"earnings_weekly | No se encontró tabla de earnings en Yahoo ({date_str}).")
+            return []
+
+        tbody = table.find("tbody")
+        if not tbody:
+            logger.warning(f"earnings_weekly | Tabla sin tbody en Yahoo ({date_str}).")
+            return []
+
+        rows = tbody.find_all("tr")
+        results: List[Dict[str, Any]] = []
+
+        for row in rows:
+            cells = row.find_all("td")
+            if len(cells) < 3:
                 continue
 
-            if hour_raw == "bmo":
-                hora = "Before Open"
-            elif hour_raw == "amc":
-                hora = "After Close"
-            else:
-                hora = "Horario no especificado"
+            ticker = cells[0].get_text(strip=True)
+            company = cells[1].get_text(strip=True)
+            time_raw = cells[2].get_text(strip=True)
 
-            earnings.append(
+            if not ticker:
+                continue
+
+            t_lower = (time_raw or "").lower()
+            if "before" in t_lower:
+                time_label = "Before Open"
+            elif "after" in t_lower:
+                time_label = "After Close"
+            else:
+                time_label = "Horario no especificado"
+
+            results.append(
                 {
                     "date": date_str,
-                    "ticker": symbol,
-                    "company": symbol,  # si quieres luego hacemos lookup del nombre completo
-                    "time": hora,
+                    "ticker": ticker,
+                    "company": company or ticker,
+                    "time": time_label,
                 }
             )
 
         logger.info(
-            f"earnings_weekly | FMP devolvió {len(earnings)} earnings entre "
-            f"{from_date} y {to_date}."
+            f"earnings_weekly | Yahoo devolvió {len(results)} earnings para {date_str}."
         )
-        return earnings
+        return results
 
     except Exception as e:
-        logger.error(f"earnings_weekly | Error consultando FMP: {e}")
+        logger.error(f"earnings_weekly | Error parseando HTML de Yahoo ({date_str}): {e}")
         return []
+
+
+def fetch_weekly_earnings(week_start: datetime) -> List[Dict[str, Any]]:
+    """
+    Obtiene los earnings de la semana [week_start, week_start+4] (L-V)
+    haciendo 1 petición al calendario de Yahoo por día.
+    """
+    earnings: List[Dict[str, Any]] = []
+
+    for i in range(5):  # Lunes → Viernes
+        day = week_start + timedelta(days=i)
+        day_list = _fetch_yahoo_earnings_for_day(day)
+        earnings.extend(day_list)
+
+    logger.info(
+        f"earnings_weekly | Yahoo total semana: {len(earnings)} resultados "
+        f"desde {week_start.date()} hasta {(week_start + timedelta(days=4)).date()}."
+    )
+    return earnings
 
 
 # =====================================================
