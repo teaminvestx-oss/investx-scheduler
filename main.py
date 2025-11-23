@@ -9,7 +9,7 @@ import pkg_resources  # lo usa investpy por debajo, NO BORRAR
 from premarket import run_premarket_morning
 from econ_calendar import run_econ_calendar
 from news_es import run_news_once  # Noticias
-from earnings_weekly import run_weekly_earnings  # 🚀 Earnings semanales
+from earnings_weekly import run_weekly_earnings  # Earnings semanales
 
 # ---------------------------
 # Configuración de franjas
@@ -29,13 +29,13 @@ ECON_END_HOUR   = int(os.getenv("ECON_END_HOUR", "13"))
 FORCE_MORNING = os.getenv("FORCE_MORNING", "0").lower() in ("1", "true", "yes")
 FORCE_ECON    = os.getenv("FORCE_ECON", "0").lower() in ("1", "true", "yes")
 
-# === IMPORTANTE: aceptar varias variantes para las noticias ===
+# Variantes para noticias
 FORCE_NEWS = any(
     os.getenv(var, "0").strip().lower() in ("1", "true", "yes")
     for var in ("FORCE_NEWS", "NEWS_FORCE", "news_force")
 )
 
-# Flag de forzado para earnings semanales
+# Forzado de earnings semanales
 FORCE_EARNINGS = os.getenv("FORCE_EARNINGS", "0").strip().lower() in ("1", "true", "yes")
 
 
@@ -69,7 +69,7 @@ def main():
             )
 
     # ---------------------------
-    # Bloque earnings semanales (LUNES 10-11h, solo una vez)
+    # Bloque earnings semanales (lunes 10-11h, solo una vez)
     # ---------------------------
     within_earnings_window = MORNING_START_HOUR <= hour < MORNING_END_HOUR
 
@@ -116,7 +116,6 @@ def main():
     # ---------------------------
     if FORCE_NEWS:
         print("INFO | __main__: FORCE_NEWS/NEWS_FORCE=1 -> enviando noticias sin restricciones.")
-        # Forzado: run_news_once(force=True) ignora franjas y fines de semana
         run_news_once(force=True)
     else:
         if weekday < 5:
