@@ -8,7 +8,7 @@ import pkg_resources  # lo usa investpy por debajo, NO BORRAR
 
 from premarket import run_premarket_morning
 from econ_calendar import run_econ_calendar
-from news_es import run_news_once  # <<< NUEVO: noticias
+from news_es import run_news_once  # Noticias
 
 # ---------------------------
 # Configuración de franjas
@@ -16,18 +16,23 @@ from news_es import run_news_once  # <<< NUEVO: noticias
 # Offset horario respecto a UTC (para Madrid normalmente 1 en horario normal)
 TZ_OFFSET = int(os.getenv("TZ_OFFSET", "1"))
 
-# Franja "Buenos días / premarket"
+# Franja "Buenos días" / premarket
 MORNING_START_HOUR = int(os.getenv("MORNING_START_HOUR", "10"))
-MORNING_END_HOUR = int(os.getenv("MORNING_END_HOUR", "11"))
+MORNING_END_HOUR   = int(os.getenv("MORNING_END_HOUR", "11"))
 
 # Franja calendario económico
 ECON_START_HOUR = int(os.getenv("ECON_START_HOUR", "11"))
-ECON_END_HOUR = int(os.getenv("ECON_END_HOUR", "13"))
+ECON_END_HOUR   = int(os.getenv("ECON_END_HOUR", "13"))
 
 # Flags de forzado desde variables de entorno
 FORCE_MORNING = os.getenv("FORCE_MORNING", "0").lower() in ("1", "true", "yes")
 FORCE_ECON    = os.getenv("FORCE_ECON", "0").lower() in ("1", "true", "yes")
-FORCE_NEWS    = os.getenv("FORCE_NEWS", "0").lower() in ("1", "true", "yes")  # <<< NUEVO
+
+# === IMPORTANTE: aceptar varias variantes para las noticias ===
+FORCE_NEWS = any(
+    os.getenv(var, "0").strip().lower() in ("1", "true", "yes")
+    for var in ("FORCE_NEWS", "NEWS_FORCE", "news_force")
+)
 
 
 def main():
@@ -81,19 +86,18 @@ def main():
             )
 
     # ---------------------------
-    # Bloque noticias (L-V, 11-13 y 22-24, control interno en news_es.py)
+    # Bloque noticias
     # ---------------------------
     if FORCE_NEWS:
-        print("INFO | __main__: FORCE_NEWS=1 -> enviando noticias sin restricciones.")
-        # Forzado: el propio run_news_once(force=True) ignora franjas y fines de semana
+        print("INFO | __main__: FORCE_NEWS/NEWS_FORCE=1 -> enviando noticias sin restricciones.")
+        # Forzado: run_news_once(force=True) ignora franjas y fines de semana
         run_news_once(force=True)
     else:
         if weekday < 5:
             print(
-                "INFO | __main__: Evaluando envío de noticias (control interno de franjas "
-                "11-13 y 22-24 en news_es.run_news_once)."
+                "INFO | __main__: Evaluando envío de noticias (L-V). "
+                "Las franjas 11-13 y 22-24 se controlan dentro de news_es.run_news_once()."
             )
-            # Aquí no controlamos la franja: la lógica de horarios/slots está en news_es.py
             run_news_once(force=False)
         else:
             print(
