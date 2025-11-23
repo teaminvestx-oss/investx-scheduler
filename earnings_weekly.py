@@ -1,9 +1,9 @@
 # === earnings_weekly.py ===
 # Earnings semanales desde Investing.com usando endpoint filtrado
-# - Filtra por Estados Unidos (country=5)
-# - Impacto = 3 estrellas
-# - Semana L-V
-# - Formato profesional en español
+# - País: Estados Unidos (country=5)
+# - Impacto: 3 estrellas
+# - Semana L-V desde la fecha base
+# - Formato profesional en español para Telegram
 
 import os
 import json
@@ -22,6 +22,8 @@ logger.setLevel(logging.INFO)
 STATE_FILE = "earnings_weekly_state.json"
 TZ_OFFSET = int(os.getenv("TZ_OFFSET", "1"))
 
+API_URL = "https://es.investing.com/earnings-calendar/Service/getCalendarFilteredData"
+
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -31,10 +33,8 @@ HEADERS = {
     "Accept": "application/json, text/javascript, */*; q=0.01",
     "X-Requested-With": "XMLHttpRequest",
     "Referer": "https://es.investing.com/earnings-calendar/",
+    "Accept-Language": "es-ES,es;q=0.9",
 }
-
-API_URL = "https://es.investing.com/earnings-calendar/Service/getCalendarFilteredData"
-
 
 # =====================================================
 # Estado (solo 1 envío por día)
@@ -66,27 +66,31 @@ def _mark_sent(today_str: str) -> None:
 
 
 # =====================================================
-# Descarga de earnings (API Investing + parseo HTML)
+# Descarga de earnings: un día concreto (USA, impacto 3)
 # =====================================================
 
-def fetch_weekly_earnings(week_start: datetime) -> List[Dict[str, Any]]:
+def _fetch_day_from_investing(day: datetime) -> List[Dict[str, Any]]:
     """
-    Investing.com API interna:
-      - country[] = 5 (USA)
-      - importance[] = 3 (impacto 3 estrellas)
-      - dateFrom/dateTo = semana L-V
+    Descarga el calendario de resultados de Investing.com para un día concreto,
+    filtrando por:
+      - country[] = 5 (Estados Unidos)
+      - importance[] = 3 (impacto fuerte)
 
-    Devuelve lista de dicts con:
-      date, company, eps, revenue, time
+    Devuelve lista de dicts:
+      - date (YYYY-MM-DD)
+      - company
+      - eps  (texto "BPA / Previsión")
+      - revenue (texto "Ingresos / Previsión")
+      - time (hora / icono)
     """
 
-    week_end = week_start + timedelta(days=4)
+    date_str = day.strftime("%Y-%m-%d")
 
     payload = {
-        "country[]": ["5"],        # Estados Unidos
-        "importance[]": ["3"],     # Impacto 3 estrellas
-        "dateFrom": week_start.strftime("%Y-%m-%d"),
-        "dateTo": week_end.strftime("%Y-%m-%d"),
+        "country[]": ["5"],       # Estados Unidos
+        "importance[]": ["3"],    # Impacto 3 estrellas
+        "dateFrom": date_str,
+        "dateTo": date_str,
         "currentTab": "earnings",
         "limit_from": "0",
     }
@@ -96,10 +100,9 @@ def fetch_weekly_earnings(week_start: datetime) -> List[Dict[str, Any]]:
         resp.raise_for_status()
         raw = resp.json()
     except Exception as e:
-        logger.error(f"earnings_weekly | Error HTTP/JSON Investing: {e}")
+        logger.error(f"earnings_weekly | Error HTTP/JSON Investing para {date_str}: {e}")
         return []
 
-    # raw["data"] suele ser una lista con uno o varios bloques HTML (<tr>...</tr>...)
     blocks_html = raw.get("data", [])
     if isinstance(blocks_html, str):
         blocks_html = [blocks_html]
@@ -108,39 +111,29 @@ def fetch_weekly_earnings(week_start: datetime) -> List[Dict[str, Any]]:
 
     for block_html in blocks_html:
         soup = BeautifulSoup(block_html, "html.parser")
-        # Recorremos cada fila de la tabla
         for tr in soup.find_all("tr"):
             tds = tr.find_all("td")
             if len(tds) < 6:
                 continue
 
             # Estructura típica:
-            # 0: fecha          (24.11.2025)
-            # 1: empresa        (nombre + link)
+            # 0: país (bandera / texto fecha según formato)
+            # 1: empresa
             # 2: BPA / Previsión
             # 3: Ingresos / Previsión
             # 4: Cap. mercado
             # 5: Hora
-            date_text = tds[0].get_text(strip=True)
             company = tds[1].get_text(strip=True)
-            eps_text = tds[2].get_text(strip=True)
-            rev_text = tds[3].get_text(strip=True)
-            time_text = tds[5].get_text(strip=True) or "—"
-
             if not company:
                 continue
 
-            # La fecha viene como "24.11.2025"
-            try:
-                parsed_date = datetime.strptime(date_text, "%d.%m.%Y")
-                date_iso = parsed_date.strftime("%Y-%m-%d")
-            except Exception:
-                # Por si cambian el formato, no tiramos todo
-                date_iso = week_start.strftime("%Y-%m-%d")
+            eps_text = tds[2].get_text(strip=True) or "--"
+            rev_text = tds[3].get_text(strip=True) or "--"
+            time_text = tds[5].get_text(strip=True) or "—"
 
             earnings.append(
                 {
-                    "date": date_iso,
+                    "date": date_str,
                     "company": company,
                     "eps": eps_text,
                     "revenue": rev_text,
@@ -149,14 +142,37 @@ def fetch_weekly_earnings(week_start: datetime) -> List[Dict[str, Any]]:
             )
 
     logger.info(
-        f"earnings_weekly | Investing (USA, impacto 3): {len(earnings)} resultados "
-        f"entre {week_start.date()} y {week_end.date()}."
+        f"earnings_weekly | Investing {date_str} (USA, impacto 3): "
+        f"{len(earnings)} resultados."
     )
     return earnings
 
 
 # =====================================================
-# Construcción de mensajes
+# Semana completa (L-V)
+# =====================================================
+
+def fetch_weekly_earnings(week_start: datetime) -> List[Dict[str, Any]]:
+    """
+    Obtiene los earnings de la semana [week_start, week_start+4] (lunes a viernes).
+    Para cada día hace una llamada independiente al endpoint filtrado.
+    """
+    earnings: List[Dict[str, Any]] = []
+
+    for i in range(5):
+        day = week_start + timedelta(days=i)
+        day_list = _fetch_day_from_investing(day)
+        earnings.extend(day_list)
+
+    logger.info(
+        f"earnings_weekly | Total semana Investing (USA, impacto 3): "
+        f"{len(earnings)} resultados."
+    )
+    return earnings
+
+
+# =====================================================
+# Construcción de texto principal
 # =====================================================
 
 def _build_calendar_text(earnings: List[Dict[str, Any]], week_start: datetime) -> str:
@@ -179,7 +195,7 @@ def _build_calendar_text(earnings: List[Dict[str, Any]], week_start: datetime) -
     for e in earnings_sorted:
         try:
             d = datetime.strptime(e["date"], "%Y-%m-%d")
-            date_label = d.strftime("%A %d/%m").capitalize()
+            date_label = d.strftime("%A %d/%m").capitalize()  # Monday 24/11, etc.
         except Exception:
             date_label = e["date"]
 
@@ -194,6 +210,10 @@ def _build_calendar_text(earnings: List[Dict[str, Any]], week_start: datetime) -
 
     return "\n".join(lines)
 
+
+# =====================================================
+# Párrafo profesional IA
+# =====================================================
 
 def _build_professional_note(earnings: List[Dict[str, Any]], week_start: datetime) -> str:
     week_end = week_start + timedelta(days=4)
@@ -233,7 +253,7 @@ def _build_professional_note(earnings: List[Dict[str, Any]], week_start: datetim
 
 def run_weekly_earnings(force: bool = False) -> None:
     """
-    Envía al canal de Telegram el resumen semanal de resultados empresariales:
+    Envía al canal de Telegram el resumen semanal de resultados empresariales.
 
     - Por defecto solo 1 envío al día (control STATE_FILE).
     - Si force=True ignora el control y envía siempre.
