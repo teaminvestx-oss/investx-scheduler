@@ -49,7 +49,7 @@ def main():
     weekday = now.weekday()  # 0=lunes, 6=domingo
 
     # ======================================================
-    # 📌 BLOQUE 1 — “Buenos días / Premarket”
+    # 1) "Buenos días / Premarket"
     # ======================================================
     within_morning_window = MORNING_START_HOUR <= hour < MORNING_END_HOUR
 
@@ -64,7 +64,7 @@ def main():
             print(f"INFO | __main__: Fuera de franja para 'Buenos días' (hora={hour}, weekday={weekday}). No se envía.")
 
     # ======================================================
-    # 📌 BLOQUE 2 — Earnings semanales (lunes 10–11h)
+    # 2) Earnings semanales (lunes 10–11h)
     # ======================================================
 
     within_earnings_window = MORNING_START_HOUR <= hour < MORNING_END_HOUR
@@ -72,14 +72,12 @@ def main():
     if FORCE_EARNINGS:
         print("INFO | __main__: FORCE_EARNINGS=1 -> enviando earnings semanales sin restricciones.")
         run_weekly_earnings(force=True)
-
     else:
         if weekday == 0 and within_earnings_window:
             print(
                 "INFO | __main__: Lunes y dentro de franja "
                 f"{MORNING_START_HOUR}-{MORNING_END_HOUR}h -> evaluando earnings semanales."
             )
-            # El propio módulo controla que solo se envíe una vez al día
             run_weekly_earnings(force=False)
         else:
             print(
@@ -88,7 +86,7 @@ def main():
             )
 
     # ======================================================
-    # 📌 BLOQUE 3 — Calendario económico (11–13h)
+    # 3) Calendario económico (11–13h)
     # ======================================================
 
     within_econ_window = ECON_START_HOUR <= hour < ECON_END_HOUR
@@ -107,7 +105,7 @@ def main():
             )
 
     # ======================================================
-    # 📌 BLOQUE 4 — Noticias (franjas internas del módulo)
+    # 4) Noticias (franjas internas en news_es.run_news_once)
     # ======================================================
     if FORCE_NEWS:
         print("INFO | __main__: FORCE_NEWS=1 -> enviando noticias sin restricciones.")
