@@ -8,6 +8,7 @@ import pkg_resources  # lo usa investpy por debajo, NO BORRAR
 
 from premarket import run_premarket_morning
 from econ_calendar import run_econ_calendar
+from news_es import run_news_once  # <<< NUEVO: noticias
 
 # ---------------------------
 # Configuración de franjas
@@ -25,7 +26,8 @@ ECON_END_HOUR = int(os.getenv("ECON_END_HOUR", "13"))
 
 # Flags de forzado desde variables de entorno
 FORCE_MORNING = os.getenv("FORCE_MORNING", "0").lower() in ("1", "true", "yes")
-FORCE_ECON = os.getenv("FORCE_ECON", "0").lower() in ("1", "true", "yes")
+FORCE_ECON    = os.getenv("FORCE_ECON", "0").lower() in ("1", "true", "yes")
+FORCE_NEWS    = os.getenv("FORCE_NEWS", "0").lower() in ("1", "true", "yes")  # <<< NUEVO
 
 
 def main():
@@ -76,6 +78,26 @@ def main():
             print(
                 f"INFO | __main__: Fuera de franja para 'Calendario económico' "
                 f"o fin de semana (hora={hour}, weekday={weekday}). No se envía."
+            )
+
+    # ---------------------------
+    # Bloque noticias (L-V, 11-13 y 22-24, control interno en news_es.py)
+    # ---------------------------
+    if FORCE_NEWS:
+        print("INFO | __main__: FORCE_NEWS=1 -> enviando noticias sin restricciones.")
+        # Forzado: el propio run_news_once(force=True) ignora franjas y fines de semana
+        run_news_once(force=True)
+    else:
+        if weekday < 5:
+            print(
+                "INFO | __main__: Evaluando envío de noticias (control interno de franjas "
+                "11-13 y 22-24 en news_es.run_news_once)."
+            )
+            # Aquí no controlamos la franja: la lógica de horarios/slots está en news_es.py
+            run_news_once(force=False)
+        else:
+            print(
+                f"INFO | __main__: Fin de semana (weekday={weekday}) -> no se evalúan noticias."
             )
 
 
