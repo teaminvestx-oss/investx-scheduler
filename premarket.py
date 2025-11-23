@@ -1,6 +1,11 @@
 # === premarket.py ===
+# "Buenos días" / premarket InvestX
+
 import os
+import json
 import datetime as dt
+from typing import Dict, List
+
 import requests
 import yfinance as yf
 from openai import OpenAI
@@ -13,6 +18,42 @@ CHAT_ID = os.getenv("TELEGRAM_CHAT_ID") or os.getenv("CHAT_ID")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
+
+# Fichero de estado para NO repetir mensaje varias veces al día
+PREMARKET_STATE_FILE = "premarket_state.json"
+
+
+# ================================
+# Estado diario (para 1 envío / día)
+# ================================
+def _load_state() -> Dict:
+    if not os.path.exists(PREMARKET_STATE_FILE):
+        return {}
+    try:
+        with open(PREMARKET_STATE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:
+        print("[WARN] premarket: no se pudo leer estado:", e)
+        return {}
+
+
+def _save_state(state: Dict) -> None:
+    try:
+        with open(PREMARKET_STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(state, f)
+    except Exception as e:
+        print("[WARN] premarket: no se pudo guardar estado:", e)
+
+
+def _already_sent_today(today_str: str) -> bool:
+    state = _load_state()
+    return state.get("last_sent_date") == today_str
+
+
+def _mark_sent_today(today_str: str) -> None:
+    state = _load_state()
+    state["last_sent_date"] = today_str
+    _save_state(state)
 
 
 # ================================
@@ -43,37 +84,79 @@ def send_telegram(text: str):
 
 
 # ================================
-# CÁLCULO DE CAMBIOS
+# CÁLCULO DE CAMBIOS (precio + %)
 # ================================
-def get_changes_map(ticker_map: dict, period: str = "2d"):
+def _get_last_and_prev(yf_ticker: str):
+    """
+    Intenta obtener:
+    - last_price (precio actual / premarket)
+    - previous_close (cierre anterior)
+    usando fast_info. Si falla, hace fallback a history(2d).
+    """
+    try:
+        t = yf.Ticker(yf_ticker)
+        fi = t.fast_info
+
+        last_price = getattr(fi, "last_price", None)
+        prev_close = getattr(fi, "previous_close", None)
+
+        # Si fi es dict-like
+        if last_price is None and isinstance(fi, dict):
+            last_price = fi.get("last_price")
+        if prev_close is None and isinstance(fi, dict):
+            prev_close = fi.get("previous_close")
+
+        # Fallback a history si falta algo
+        if last_price is None or prev_close is None:
+            hist = t.history(period="2d")
+            if hist is None or hist.empty or len(hist) < 1:
+                return None, None
+            last_price = float(hist["Close"].iloc[-1])
+            if len(hist) >= 2:
+                prev_close = float(hist["Close"].iloc[-2])
+            else:
+                prev_close = last_price
+
+        if prev_close == 0:
+            return last_price, None
+
+        return float(last_price), float(prev_close)
+
+    except Exception as e:
+        print(f"[WARN] Error obteniendo datos de {yf_ticker}: {e}")
+        return None, None
+
+
+def get_changes_map(ticker_map: dict) -> List[Dict]:
     """
     ticker_map: { nombre_mostrar: ticker_yfinance }
-    Calcula % de cambio entre los dos últimos cierres disponibles.
+    Devuelve lista con:
+      { "name", "price", "change_pct" }
+    donde price = precio actual (premarket si aplica)
+    y change_pct = % vs previous_close.
     """
     results = []
     for name, yf_ticker in ticker_map.items():
-        try:
-            data = yf.Ticker(yf_ticker).history(period=period)
-            if data is None or data.empty or len(data) < 2:
-                continue
-            last = data["Close"].iloc[-1]
-            prev = data["Close"].iloc[-2]
-            if prev == 0:
-                continue
-            change_pct = (last - prev) / prev * 100
-            results.append({"name": name, "change_pct": round(change_pct, 2)})
-        except Exception as e:
-            print(f"[WARN] Error obteniendo datos de {name} ({yf_ticker}): {e}")
+        last_price, prev_close = _get_last_and_prev(yf_ticker)
+        if last_price is None or prev_close is None:
             continue
+        change_pct = (last_price - prev_close) / prev_close * 100.0
+        results.append(
+            {
+                "name": name,
+                "price": round(last_price, 2),
+                "change_pct": round(change_pct, 2),
+            }
+        )
     return results
 
 
-def get_crypto_changes():
+def get_crypto_changes() -> List[Dict]:
     cryptos = {
         "BTC": "BTC-USD",
         "ETH": "ETH-USD",
     }
-    return get_changes_map(cryptos, period="2d")
+    return get_changes_map(cryptos)
 
 
 # ================================
@@ -81,7 +164,7 @@ def get_crypto_changes():
 # ================================
 def style_change(change_pct: float):
     """
-    Devuelve (icono, flecha, texto_formateado) según si sube, baja o está plano.
+    Devuelve (icono, flecha, texto_porcentaje) según si sube, baja o está plano.
     No menciona periodos, solo el porcentaje.
     """
     if change_pct > 0.3:
@@ -95,14 +178,14 @@ def style_change(change_pct: float):
         arrow = "→"
 
     sign = "+" if change_pct > 0 else ""
-    text = f"{sign}{change_pct:.2f}%"
-    return icon, arrow, text
+    pct_text = f"{sign}{change_pct:.2f}%"
+    return icon, arrow, pct_text
 
 
 def format_premarket_lines(indices, megacaps, sectors, cryptos):
     """
     Devuelve:
-    - texto formateado para Telegram (con iconos)
+    - texto formateado para Telegram (con iconos, precios y %)
     - texto plano para interpretación del modelo
     """
     display_lines = []
@@ -111,33 +194,37 @@ def format_premarket_lines(indices, megacaps, sectors, cryptos):
     if indices:
         display_lines.append("📈 <b>Índices / Futuros</b>\n")
         for item in indices:
-            icon, arrow, txt = style_change(item["change_pct"])
-            display_lines.append(f"{icon} {item['name']} {arrow} {txt}")
-            plain_lines.append(f"{item['name']}: {item['change_pct']:.2f}%")
+            icon, arrow, pct = style_change(item["change_pct"])
+            price = f"{item['price']:.2f}"
+            display_lines.append(f"{icon} {item['name']} {price} {arrow} ({pct})")
+            plain_lines.append(f"{item['name']}: {price} ({pct})")
 
     if megacaps:
         display_lines.append("")
         display_lines.append("📊 <b>Mega-caps USA</b>\n")
         for item in megacaps:
-            icon, arrow, txt = style_change(item["change_pct"])
-            display_lines.append(f"{icon} {item['name']} {arrow} {txt}")
-            plain_lines.append(f"{item['name']}: {item['change_pct']:.2f}%")
+            icon, arrow, pct = style_change(item["change_pct"])
+            price = f"{item['price']:.2f}"
+            display_lines.append(f"{icon} {item['name']} {price} {arrow} ({pct})")
+            plain_lines.append(f"{item['name']}: {price} ({pct})")
 
     if sectors:
         display_lines.append("")
         display_lines.append("🏦 <b>Otros sectores clave</b>\n")
         for item in sectors:
-            icon, arrow, txt = style_change(item["change_pct"])
-            display_lines.append(f"{icon} {item['name']} {arrow} {txt}")
-            plain_lines.append(f"{item['name']}: {item['change_pct']:.2f}%")
+            icon, arrow, pct = style_change(item["change_pct"])
+            price = f"{item['price']:.2f}"
+            display_lines.append(f"{icon} {item['name']} {price} {arrow} ({pct})")
+            plain_lines.append(f"{item['name']}: {price} ({pct})")
 
     if cryptos:
         display_lines.append("")
         display_lines.append("💰 <b>Criptomonedas</b>\n")
         for item in cryptos:
-            icon, arrow, txt = style_change(item["change_pct"])
-            display_lines.append(f"{icon} {item['name']} {arrow} {txt}")
-            plain_lines.append(f"{item['name']}: {item['change_pct']:.2f}%")
+            icon, arrow, pct = style_change(item["change_pct"])
+            price = f"{item['price']:.2f}"
+            display_lines.append(f"{icon} {item['name']} {price} {arrow} ({pct})")
+            plain_lines.append(f"{item['name']}: {price} ({pct})")
 
     display_text = "\n".join(display_lines).strip()
     plain_text = "\n".join(plain_lines).strip()
@@ -190,10 +277,21 @@ def interpret_premarket(plain_text: str) -> str:
 # ================================
 # FUNCIÓN PRINCIPAL: BUENOS DÍAS
 # ================================
-def run_premarket_morning():
+def run_premarket_morning(force: bool = False):
+    """
+    Envía el mensaje de 'Buenos días / premarket' UNA sola vez al día,
+    salvo que force=True (por ejemplo, si lo ejecutas manualmente).
+    """
     today = dt.date.today()
-    if today.weekday() >= 5:
+    today_str = today.isoformat()
+
+    if today.weekday() >= 5 and not force:
+        # sábado (5) o domingo (6)
         print("[INFO] Es fin de semana, no se envía 'Buenos días'.")
+        return
+
+    if not force and _already_sent_today(today_str):
+        print("[INFO] premarket: ya se envió 'Buenos días' hoy. No se repite.")
         return
 
     # Índices
@@ -233,11 +331,11 @@ def run_premarket_morning():
     display_text, plain_text = format_premarket_lines(indices, megacaps, sectors, cryptos)
     interpretation = interpret_premarket(plain_text)
 
-    today_str = today.strftime("%d/%m/%Y")
+    today_str_human = today.strftime("%d/%m/%Y")
 
     parts = [
         "🌅 <b>Buenos días, equipo</b>\n",
-        f"Así viene el mercado hoy — {today_str}:\n",
+        f"Así viene el mercado hoy — {today_str_human}:\n",
         display_text,
     ]
 
@@ -247,3 +345,7 @@ def run_premarket_morning():
 
     final_msg = "\n".join(parts).strip()
     send_telegram(final_msg)
+
+    if not force:
+        _mark_sent_today(today_str)
+        print("[INFO] premarket: marcado como enviado para hoy.")
