@@ -1,7 +1,9 @@
 # === earnings_weekly.py ===
 # Resumen semanal de resultados empresariales (earnings)
-# - Se envía solo una vez al día gracias a un state file
-# - Pensado para ejecutarse los lunes entre 10-11h desde main.py
+# - Usa FinancialModelingPrep (FMP) como fuente real
+# - Español, tono profesional
+# - Sin títulos tipo "Resumen IA"
+# - Control de 1 envío/día + simulación "mañana"
 
 import os
 import json
@@ -9,20 +11,22 @@ import logging
 from datetime import datetime, timedelta
 from typing import List, Dict, Any
 
+import requests
+
 from utils import send_telegram_message, call_gpt_mini
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
 STATE_FILE = "earnings_weekly_state.json"
-
-# Offset horario respecto a UTC (para alinear con main.py / Madrid)
 TZ_OFFSET = int(os.getenv("TZ_OFFSET", "1"))
 
+FMP_API_KEY = os.getenv("FMP_API_KEY", "").strip()
 
-# ============================
-# Gestión de estado (solo 1 envío/día)
-# ============================
+
+# =====================================================
+# Estado (solo 1 envío diario)
+# =====================================================
 
 def _load_state() -> Dict[str, Any]:
     if not os.path.exists(STATE_FILE):
@@ -43,10 +47,8 @@ def _save_state(state: Dict[str, Any]) -> None:
         logger.error(f"earnings_weekly | Error guardando estado: {e}")
 
 
-def _already_sent_today(today_str: str) -> bool:
-    state = _load_state()
-    last_date = state.get("last_run_date")
-    return last_date == today_str
+def _already_sent(today_str: str) -> bool:
+    return _load_state().get("last_run_date") == today_str
 
 
 def _mark_sent(today_str: str) -> None:
@@ -55,181 +57,212 @@ def _mark_sent(today_str: str) -> None:
     _save_state(state)
 
 
-# ============================
-# OBTENCIÓN DE EARNINGS —
-#   Aquí conectas tu API o scraper
-# ============================
+# =====================================================
+# Earnings reales desde FMP
+# =====================================================
 
 def fetch_weekly_earnings(week_start: datetime) -> List[Dict[str, Any]]:
     """
-    Devuelve una lista de earnings planificados para la semana [week_start, week_start+6].
-    Estructura recomendada de cada item:
-      {
-        "date": "2025-11-24",
-        "ticker": "AAPL",
-        "company": "Apple Inc.",
-        "time": "After Close"
-      }
-
-    ✳️ IMPORTANTE: Implementa aquí tu propia lógica de obtención de datos
-    (API de resultados, scraping, fichero local, etc.)
+    Obtiene los earnings reales de la API de FinancialModelingPrep (FMP)
+    para el rango lunes–viernes de la semana indicada.
     """
-    # TEMPORAL — para evitar crash
-    return []
+
+    if not FMP_API_KEY:
+        logger.error("earnings_weekly | FMP_API_KEY no definida en variables de entorno.")
+        return []
+
+    week_end = week_start + timedelta(days=4)
+
+    from_date = week_start.strftime("%Y-%m-%d")
+    to_date = week_end.strftime("%Y-%m-%d")
+
+    url = "https://financialmodelingprep.com/api/v3/historical/earning_calendar"
+    params = {
+        "from": from_date,
+        "to": to_date,
+        "apikey": FMP_API_KEY,
+    }
+
+    try:
+        resp = requests.get(url, params=params, timeout=15)
+        resp.raise_for_status()
+        data = resp.json()
+
+        earnings: List[Dict[str, Any]] = []
+        for item in data:
+            date_str = item.get("date")
+            symbol = item.get("symbol")
+            hour_raw = (item.get("time") or "").lower().strip()
+
+            if not date_str or not symbol:
+                continue
+
+            if hour_raw == "bmo":
+                hora = "Before Open"
+            elif hour_raw == "amc":
+                hora = "After Close"
+            else:
+                hora = "Horario no especificado"
+
+            earnings.append(
+                {
+                    "date": date_str,
+                    "ticker": symbol,
+                    "company": symbol,  # si quieres luego hacemos lookup del nombre completo
+                    "time": hora,
+                }
+            )
+
+        logger.info(
+            f"earnings_weekly | FMP devolvió {len(earnings)} earnings entre "
+            f"{from_date} y {to_date}."
+        )
+        return earnings
+
+    except Exception as e:
+        logger.error(f"earnings_weekly | Error consultando FMP: {e}")
+        return []
 
 
-# ============================
-# Construcción de textos
-# ============================
+# =====================================================
+# Construcción de texto
+# =====================================================
 
-def _build_earnings_text(earnings: List[Dict[str, Any]], week_start: datetime) -> str:
-    """Construye el texto con el calendario de earnings de la semana."""
+def _build_calendar_text(earnings: List[Dict[str, Any]], week_start: datetime) -> str:
+    """Construye el texto del calendario semanal de resultados."""
     week_end = week_start + timedelta(days=4)
 
     if not earnings:
         return (
             "📊 *Resultados empresariales de la semana*\n\n"
-            f"No hay resultados empresariales relevantes entre "
+            f"No hay resultados empresariales previstos entre "
             f"{week_start.strftime('%d/%m')} y {week_end.strftime('%d/%m')}."
         )
 
-    earnings_sorted = sorted(
-        earnings, key=lambda e: (e.get("date", ""), e.get("ticker", ""))
+    earnings_sorted = sorted(earnings, key=lambda e: (e["date"], e["ticker"]))
+
+    lines: List[str] = []
+    lines.append("📊 *Resultados empresariales de la semana*")
+    lines.append(
+        f"Semana del {week_start.strftime('%d/%m')} al {week_end.strftime('%d/%m')}.\n"
     )
 
-    lines = []
-    lines.append("📊 *Resultados empresariales de la semana*")
-    lines.append(f"Del {week_start.strftime('%d/%m')} al {week_end.strftime('%d/%m')}.\n")
-
-    current_date = None
+    current_date_label = None
 
     for e in earnings_sorted:
-        date_str = e.get("date", "")
+        date_str = e.get("date")
         try:
             d = datetime.strptime(date_str, "%Y-%m-%d").date()
             date_label = d.strftime("%a %d/%m")
-        except:
-            date_label = date_str
+        except Exception:
+            date_label = date_str or "Fecha desconocida"
 
-        if date_label != current_date:
+        if date_label != current_date_label:
             lines.append(f"🗓 *{date_label}*")
-            current_date = date_label
+            current_date_label = date_label
 
         ticker = e.get("ticker", "")
-        company = e.get("company", "")
+        company = e.get("company", "") or ticker
         time_str = e.get("time", "") or "Horario no especificado"
 
-        if company:
-            lines.append(f" • {ticker} ({company}) — {time_str}")
-        else:
-            lines.append(f" • {ticker} — {time_str}")
+        lines.append(f" • {ticker} ({company}) — {time_str}")
 
     return "\n".join(lines)
 
 
-def _build_ai_summary(earnings: List[Dict[str, Any]], week_start: datetime) -> str:
-    """Genera un resumen corto con IA de todos los earnings de la semana."""
+def _build_professional_note(earnings: List[Dict[str, Any]], week_start: datetime) -> str:
+    """
+    Párrafo profesional en español describiendo la relevancia semanal.
+    Sin títulos tipo 'Resumen IA'.
+    """
     week_end = week_start + timedelta(days=4)
 
     if not earnings:
         return (
-            "Esta semana no hay resultados empresariales relevantes en el calendario, "
-            "por lo que no se esperan grandes catalizadores por beneficios."
+            "\nDurante esta semana no hay publicaciones de resultados corporativos "
+            "relevantes en el calendario, por lo que no se esperan catalizadores "
+            "significativos derivados de beneficios empresariales."
         )
 
     compact = "\n".join(
-        f"{e.get('date')} — {e.get('ticker')} ({e.get('company')}) — {e.get('time')}"
+        f"{e['date']} — {e['ticker']} ({e['company']}) — {e['time']}"
         for e in earnings
     )
 
     prompt = (
-        "Quiero un resumen financiero en *2-3 frases* sobre los resultados empresariales "
-        "de esta semana. Resume sectores principales, si es una semana fuerte o débil, "
-        "y qué puede implicar para traders swing.\n\n"
-        f"Semana {week_start.strftime('%d/%m')} - {week_end.strftime('%d/%m')}.\n\n"
-        f"Calendario:\n{compact}"
+        "Redacta un párrafo profesional, claro y conciso en español, sin emojis y "
+        "sin mencionar que eres una IA. El texto debe interpretar la relevancia "
+        "semanal del siguiente calendario de resultados empresariales para un "
+        "inversor de corto/medio plazo.\n\n"
+        f"Semana del {week_start.strftime('%d/%m')} al {week_end.strftime('%d/%m')}.\n\n"
+        f"Calendario de resultados:\n{compact}"
     )
 
     try:
-        out = call_gpt_mini(prompt)
-        return out.strip()
+        note = call_gpt_mini(prompt)
+        if not note:
+            raise ValueError("Respuesta vacía")
+        return "\n" + note.strip()
     except Exception as e:
-        logger.error(f"earnings_weekly | Error generando resumen IA: {e}")
-        return "Resumen IA no disponible por un error técnico."
+        logger.error(f"earnings_weekly | Error generando nota profesional: {e}")
+        return (
+            "\nEsta semana se concentran varias publicaciones de resultados corporativos "
+            "que pueden influir en el sentimiento de mercado, especialmente en los "
+            "valores directamente afectados y en sus sectores de referencia."
+        )
 
 
-# ============================
-# BLOQUE PRINCIPAL — ESTE ES EL COMPLETO
-# ============================
+# =====================================================
+# Módulo principal
+# =====================================================
 
 def run_weekly_earnings(force: bool = False) -> None:
     """
-    Envío del resumen semanal de earnings.
-    - force=True: envía siempre e ignora estado.
-    - EARNINGS_SIMULATE_TOMORROW=1 → se usa “hoy + 1 día”
-      para obtener la semana siguiente aunque hoy sea domingo.
+    Envía el resumen semanal de resultados empresariales al canal de Telegram.
+
+    - Solo se ejecuta una vez al día (control por STATE_FILE), salvo que force=True.
+    - Si EARNINGS_SIMULATE_TOMORROW=1, se usa 'hoy + 1 día' como fecha base
+      para calcular la semana; útil para forzar un domingo la semana siguiente.
     """
 
-    # -------------------------------
-    # VARIABLES DE ENTORNO
-    # -------------------------------
-    SIMULATE_TOMORROW = os.getenv(
-        "EARNINGS_SIMULATE_TOMORROW", "0"
-    ).strip().lower() in ("1", "true", "yes")
+    simulate_tomorrow = (
+        os.getenv("EARNINGS_SIMULATE_TOMORROW", "0").strip().lower()
+        in ("1", "true", "yes")
+    )
 
-    # Fecha real
     now_utc = datetime.utcnow()
     now_local = now_utc + timedelta(hours=TZ_OFFSET)
 
-    # Simulación de mañana → semana siguiente
-    if SIMULATE_TOMORROW:
-        logger.info("earnings_weekly | SIMULATE_TOMORROW=1 → usando fecha simulada (hoy + 1).")
+    if simulate_tomorrow:
+        logger.info(
+            "earnings_weekly | EARNINGS_SIMULATE_TOMORROW=1 → usando fecha simulada (hoy + 1 día)."
+        )
         now_local = now_local + timedelta(days=1)
 
     today_str = now_local.strftime("%Y-%m-%d")
 
     logger.info(
-        f"earnings_weekly | Ejecutando run_weekly_earnings("
-        f"force={force}, simulate_tomorrow={SIMULATE_TOMORROW}) "
-        f"fecha base = {now_local}"
+        f"earnings_weekly | run_weekly_earnings("
+        f"force={force}, simulate_tomorrow={simulate_tomorrow}) "
+        f"fecha base={today_str}"
     )
 
-    # -------------------------------
-    # CONTROL SOLO UNA VEZ AL DÍA
-    # -------------------------------
-    if not force and _already_sent_today(today_str):
-        logger.info("earnings_weekly | Ya se envió hoy. No se repite.")
+    if not force and _already_sent(today_str):
+        logger.info("earnings_weekly | Ya se envió hoy, no se repite.")
         return
 
-    # -------------------------------
-    # DEFINICIÓN DE LA SEMANA
-    # -------------------------------
+    # Semana que empieza en la fecha base (habitualmente lunes)
     week_start = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
-    logger.info(f"earnings_weekly | Semana desde {week_start.date()}")
 
-    # -------------------------------
-    # OBTENER EARNINGS
-    # -------------------------------
     earnings = fetch_weekly_earnings(week_start)
+    calendar_text = _build_calendar_text(earnings, week_start)
+    professional_note = _build_professional_note(earnings, week_start)
 
-    # -------------------------------
-    # CONSTRUIR MENSAJE
-    # -------------------------------
-    text_calendar = _build_earnings_text(earnings, week_start)
-    text_summary = _build_ai_summary(earnings, week_start)
+    final_message = f"{calendar_text}\n{professional_note}"
 
-    final_message = (
-        f"{text_calendar}\n\n"
-        "🤖 *Resumen IA*\n"
-        f"{text_summary}"
-    )
-
-    # -------------------------------
-    # ENVIAR MENSAJE
-    # -------------------------------
     try:
         send_telegram_message(final_message)
-        logger.info("earnings_weekly | Enviado correctamente.")
+        logger.info("earnings_weekly | Mensaje enviado correctamente.")
         _mark_sent(today_str)
     except Exception as e:
-        logger.error(f"earnings_weekly | Error al enviar Telegram: {e}")
+        logger.error(f"earnings_weekly | Error enviando mensaje a Telegram: {e}")
