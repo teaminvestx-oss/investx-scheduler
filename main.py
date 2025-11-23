@@ -1,118 +1,83 @@
+# === main.py ===
+# Orquestador InvestX (Render cron)
+
 import os
-import logging
-import datetime
-import pkg_resources   # requerido por investpy, NO BORRAR
+from datetime import datetime, timedelta
 
+import pkg_resources  # lo usa investpy por debajo, NO BORRAR
+
+from premarket import run_premarket_morning
 from econ_calendar import run_econ_calendar
-from premarket import run_premarket_morning  # función real del premarket
 
-# ---------------------------------------------------------
-# CONFIGURACIÓN HORARIA
-# ---------------------------------------------------------
+# ---------------------------
+# Configuración de franjas
+# ---------------------------
+# Offset horario respecto a UTC (para Madrid normalmente 1 en horario normal)
+TZ_OFFSET = int(os.getenv("TZ_OFFSET", "1"))
 
-# Offset sencillo para España (CET). Si quieres algo más fino, usamos pytz, pero esto vale.
-TZ_OFFSET = 1  # GMT+1 España (ajústalo si cambias a verano/invierno con lógica extra)
-NOW = datetime.datetime.utcnow() + datetime.timedelta(hours=TZ_OFFSET)
+# Franja "Buenos días / premarket"
+MORNING_START_HOUR = int(os.getenv("MORNING_START_HOUR", "10"))
+MORNING_END_HOUR = int(os.getenv("MORNING_END_HOUR", "11"))
 
-HOUR = NOW.hour           # hora actual en España aproximada
-TODAY = NOW.strftime("%Y-%m-%d")
+# Franja calendario económico
+ECON_START_HOUR = int(os.getenv("ECON_START_HOUR", "11"))
+ECON_END_HOUR = int(os.getenv("ECON_END_HOUR", "13"))
 
-# ---------------------------------------------------------
-# VARIABLES DE ENTORNO
-# ---------------------------------------------------------
+# Flags de forzado desde variables de entorno
+FORCE_MORNING = os.getenv("FORCE_MORNING", "0").lower() in ("1", "true", "yes")
+FORCE_ECON = os.getenv("FORCE_ECON", "0").lower() in ("1", "true", "yes")
 
-# Fuerza envío aunque esté fuera de franja o ya enviado
-FORCE_ECON = os.environ.get("FORCE_ECON", "0").lower() in ("1", "true", "yes")
-FORCE_MORNING = os.environ.get("FORCE_MORNING", "0").lower() in ("1", "true", "yes")
-
-# Ficheros para evitar envíos duplicados en el mismo día
-ECON_SENT_FILE = "/tmp/econ_sent.txt"
-MORNING_SENT_FILE = "/tmp/morning_sent.txt"
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(name)s:%(message)s",
-)
-logger = logging.getLogger(__name__)
-
-# ---------------------------------------------------------
-# FUNCIONES AUXILIARES
-# ---------------------------------------------------------
-
-def already_sent(file_path: str) -> bool:
-    """Devuelve True si en ese fichero está grabada la fecha de hoy."""
-    if not os.path.exists(file_path):
-        return False
-    try:
-        with open(file_path, "r") as f:
-            date_str = f.read().strip()
-        return date_str == TODAY
-    except Exception:
-        return False
-
-
-def mark_sent(file_path: str):
-    """Marca en el fichero que hoy ya se ha enviado ese bloque."""
-    try:
-        with open(file_path, "w") as f:
-            f.write(TODAY)
-    except Exception as e:
-        logger.warning("No se pudo marcar como enviado en %s: %s", file_path, e)
-
-
-# ---------------------------------------------------------
-# EJECUCIÓN PRINCIPAL
-# ---------------------------------------------------------
 
 def main():
-    logger.info("Ejecutando main.py…")
-    logger.info("Fecha/hora (offset +%sh): %s", TZ_OFFSET, NOW)
+    # Hora "local" aplicando offset
+    now = datetime.utcnow() + timedelta(hours=TZ_OFFSET)
+    print(f"{now} | INFO | __main__: Ejecutando main.py...")
 
-    # ======================================================
-    # 1) BLOQUE BUENOS DÍAS (PREMARKET)
-    #    - Franja normal: 10:00–11:00 (hora España)
-    #    - Sólo una vez al día, salvo FORCE_MORNING=1
-    # ======================================================
-    if FORCE_MORNING or (10 <= HOUR < 11):
-        logger.info("Bloque 'Buenos días' dentro de franja o forzado.")
+    hour = now.hour
+    weekday = now.weekday()  # 0=lunes, 6=domingo
 
-        if not FORCE_MORNING and already_sent(MORNING_SENT_FILE):
-            logger.info("'Buenos días' YA enviado hoy -> no se repite.")
-        else:
-            try:
-                run_premarket_morning()
-                mark_sent(MORNING_SENT_FILE)
-                logger.info("'Buenos días' enviado correctamente.")
-            except Exception as e:
-                logger.error("Error ejecutando 'Buenos días': %s", e)
+    # ---------------------------
+    # Bloque "Buenos días" / premarket
+    # ---------------------------
+    within_morning_window = MORNING_START_HOUR <= hour < MORNING_END_HOUR
+
+    if FORCE_MORNING:
+        print("INFO | __main__: FORCE_MORNING=1 -> enviando 'Buenos días' siempre.")
+        run_premarket_morning(force=True)
     else:
-        logger.info("Fuera de franja 10–11h para 'Buenos días', no se envía.")
-
-    # ======================================================
-    # 2) BLOQUE CALENDARIO ECONÓMICO
-    #    - Franja normal: 12:00–13:00 (hora España)
-    #    - Sólo una vez al día, salvo FORCE_ECON=1
-    # ======================================================
-    if FORCE_ECON or (12 <= HOUR < 13):
-        logger.info("Bloque 'Calendario económico' dentro de franja o forzado.")
-
-        if not FORCE_ECON and already_sent(ECON_SENT_FILE):
-            logger.info("Calendario económico YA enviado hoy -> no se repite.")
+        if weekday < 5 and within_morning_window:
+            print(
+                f"INFO | __main__: Dentro de franja {MORNING_START_HOUR}-{MORNING_END_HOUR}h "
+                "para 'Buenos días'."
+            )
+            run_premarket_morning(force=False)
         else:
-            try:
-                # econ_calendar ya controla importancia, IA, etc.
-                run_econ_calendar(force=FORCE_ECON)
-                mark_sent(ECON_SENT_FILE)
-                logger.info("Calendario económico enviado correctamente.")
-            except Exception as e:
-                logger.error("Error ejecutando calendario económico: %s", e)
+            print(
+                f"INFO | __main__: Fuera de franja para 'Buenos días' "
+                f"o fin de semana (hora={hour}, weekday={weekday}). No se envía."
+            )
+
+    # ---------------------------
+    # Bloque calendario económico
+    # ---------------------------
+    within_econ_window = ECON_START_HOUR <= hour < ECON_END_HOUR
+
+    if FORCE_ECON:
+        print("INFO | __main__: FORCE_ECON=1 -> enviando calendario económico sin restricciones.")
+        run_econ_calendar(force=True)
     else:
-        logger.info("Fuera de franja 12–13h para 'Calendario económico', no se envía.")
+        if weekday < 5 and within_econ_window:
+            print(
+                f"INFO | __main__: Bloque 'Calendario económico' dentro de franja "
+                f"{ECON_START_HOUR}-{ECON_END_HOUR}h."
+            )
+            run_econ_calendar(force=False)
+        else:
+            print(
+                f"INFO | __main__: Fuera de franja para 'Calendario económico' "
+                f"o fin de semana (hora={hour}, weekday={weekday}). No se envía."
+            )
 
-
-# ---------------------------------------------------------
-# ENTRYPOINT
-# ---------------------------------------------------------
 
 if __name__ == "__main__":
     main()
