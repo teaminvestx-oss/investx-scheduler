@@ -3,7 +3,7 @@
 # - País: Estados Unidos (country=5)
 # - Impacto: 3 estrellas
 # - Semana L-V desde la fecha base
-# - Formato profesional en español para Telegram
+# - Formato profesional y minimalista para Telegram
 
 import os
 import json
@@ -79,9 +79,9 @@ def _fetch_day_from_investing(day: datetime) -> List[Dict[str, Any]]:
     Devuelve lista de dicts:
       - date (YYYY-MM-DD)
       - company
-      - eps  (texto "BPA / Previsión")
-      - revenue (texto "Ingresos / Previsión")
-      - time (hora / icono)
+      - eps       (texto BPA / previsión)
+      - revenue   (texto ingresos / previsión)
+      - time      (hora / icono)
     """
 
     date_str = day.strftime("%Y-%m-%d")
@@ -117,7 +117,7 @@ def _fetch_day_from_investing(day: datetime) -> List[Dict[str, Any]]:
                 continue
 
             # Estructura típica:
-            # 0: país (bandera / texto fecha según formato)
+            # 0: país / icono
             # 1: empresa
             # 2: BPA / Previsión
             # 3: Ingresos / Previsión
@@ -172,7 +172,7 @@ def fetch_weekly_earnings(week_start: datetime) -> List[Dict[str, Any]]:
 
 
 # =====================================================
-# Construcción de texto principal
+# Texto principal (formato minimalista)
 # =====================================================
 
 def _build_calendar_text(earnings: List[Dict[str, Any]], week_start: datetime) -> str:
@@ -180,39 +180,41 @@ def _build_calendar_text(earnings: List[Dict[str, Any]], week_start: datetime) -
 
     if not earnings:
         return (
-            "📊 *Resultados empresariales de la semana*\n\n"
+            "📊 *Resultados empresariales de la semana*\n"
+            "(Estados Unidos · impacto alto)\n\n"
             f"No hay resultados entre {week_start:%d/%m} y {week_end:%d/%m} "
-            "bajo los filtros (Estados Unidos, impacto 3)."
+            "bajo los filtros aplicados."
         )
 
     earnings_sorted = sorted(earnings, key=lambda x: (x["date"], x["company"]))
 
     lines: List[str] = []
     lines.append("📊 *Resultados empresariales de la semana*")
-    lines.append(f"Semana del {week_start:%d/%m} al {week_end:%d/%m}.\n")
+    lines.append("(Estados Unidos · impacto alto)")
+    lines.append(f"Semana del {week_start:%d/%m} al {week_end:%d/%m}\n")
 
     last_date = None
     for e in earnings_sorted:
         try:
             d = datetime.strptime(e["date"], "%Y-%m-%d")
-            date_label = d.strftime("%A %d/%m").capitalize()  # Monday 24/11, etc.
+            date_label = d.strftime("%A %d/%m").capitalize()
         except Exception:
             date_label = e["date"]
 
         if date_label != last_date:
-            lines.append(f"🗓 *{date_label}*")
+            # Deja una línea en blanco antes de cada día (menos el primero)
+            if last_date is not None:
+                lines.append("")
+            lines.append(f"📅 *{date_label}*")
             last_date = date_label
 
-        lines.append(
-            f" • {e['company']} — BPA: {e['eps']} | "
-            f"Ingresos: {e['revenue']} | {e['time']}"
-        )
+        lines.append(f"• {e['company']}")
 
     return "\n".join(lines)
 
 
 # =====================================================
-# Párrafo profesional IA
+# Párrafo profesional IA (“Lectura de la semana”)
 # =====================================================
 
 def _build_professional_note(earnings: List[Dict[str, Any]], week_start: datetime) -> str:
@@ -220,31 +222,36 @@ def _build_professional_note(earnings: List[Dict[str, Any]], week_start: datetim
 
     if not earnings:
         return (
-            "\nEsta semana no se esperan publicaciones de resultados corporativos "
+            "\n\n📌 *Lectura de la semana*\n"
+            "Esta semana no se esperan publicaciones de resultados corporativos "
             "de alto impacto en Estados Unidos."
         )
 
     compact = "\n".join(
-        f"{e['date']} — {e['company']} — BPA {e['eps']} — Ingresos {e['revenue']}"
+        f"{e['date']} — {e['company']}"
         for e in earnings
     )
 
     prompt = (
         "Redacta un párrafo profesional, claro y conciso en español, sin emojis y "
-        "sin mencionar que eres una IA. Resume la relevancia semanal del siguiente "
-        "calendario de resultados empresariales (Estados Unidos, impacto 3):\n\n"
+        "sin mencionar que eres una IA. Resume la relevancia semanal del "
+        "siguiente calendario de resultados empresariales en Estados Unidos "
+        "(impacto alto):\n\n"
         f"{compact}"
     )
 
     try:
         note = call_gpt_mini(prompt)
-        return "\n" + (note or "").strip()
+        texto = (note or "").strip()
     except Exception as e:
         logger.error(f"earnings_weekly | Error generando nota profesional: {e}")
-        return (
-            "\nLos resultados previstos para esta semana pueden influir en la volatilidad "
-            "de los principales índices estadounidenses y en los sectores más expuestos."
+        texto = (
+            "Los resultados concentrados en varios valores de gran capitalización "
+            "pueden influir en la volatilidad de los índices estadounidenses y en "
+            "los sectores más expuestos."
         )
+
+    return "\n\n📌 *Lectura de la semana*\n" + texto
 
 
 # =====================================================
@@ -288,7 +295,7 @@ def run_weekly_earnings(force: bool = False) -> None:
     calendar_text = _build_calendar_text(earnings, week_start)
     professional_note = _build_professional_note(earnings, week_start)
 
-    final_message = f"{calendar_text}\n{professional_note}"
+    final_message = f"{calendar_text}{professional_note}"
 
     send_telegram_message(final_message)
     _mark_sent(today_str)
