@@ -1,9 +1,16 @@
 # scripts/news_es.py
-import os, re, calendar, html, math, sys
+import os
+import re
+import sys
+import calendar
+import html
+import math
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
-import feedparser, requests
 from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode
+
+import feedparser
+import requests
 
 # ========= Config =========
 CHAT_ID        = os.getenv("CHAT_ID")
@@ -17,7 +24,7 @@ LOOKBACK_HOURS = int(os.getenv("LOOKBACK_HOURS", "10"))
 MAX_ITEMS_ENV  = int(os.getenv("MAX_ITEMS", "5"))
 MAX_ITEMS      = min(5, MAX_ITEMS_ENV)  # tope absoluto
 
-INCLUDE_DESC   = (os.getenv("INCLUDE_DESC", "0").strip() in {"1","true","yes","y"})
+INCLUDE_DESC   = (os.getenv("INCLUDE_DESC", "0").strip() in {"1", "true", "yes", "y"})
 
 KEYWORDS = [s.strip().lower() for s in os.getenv("KEYWORDS",
     "fed,ecb,boe,ipc,cpi,pmi,ism,nonfarm,empleo,inflación,inflation,tipos,rates,hike,cut,"
@@ -68,11 +75,17 @@ def html_escape(s: str) -> str:
 def normalize_url(u: str) -> str:
     try:
         p = urlparse(u)
-        blacklist = {"utm_source","utm_medium","utm_campaign","utm_term","utm_content",
-                     "utm_id","utm_name","utm_creative","cmpid","seg","mbid","ocid","sref"}
-        q = [(k,v) for k,v in parse_qsl(p.query, keep_blank_values=True) if k.lower() not in blacklist]
+        blacklist = {
+            "utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content",
+            "utm_id", "utm_name", "utm_creative", "cmpid", "seg", "mbid", "ocid", "sref"
+        }
+        q = [
+            (k, v)
+            for k, v in parse_qsl(p.query, keep_blank_values=True)
+            if k.lower() not in blacklist
+        ]
         p = p._replace(query=urlencode(q), fragment="")
-        scheme = "https" if p.scheme in ("http","https") else p.scheme
+        scheme = "https" if p.scheme in ("http", "https") else p.scheme
         netloc = p.netloc.lower().replace("www.", "")
         return urlunparse((scheme, netloc, p.path, p.params, p.query, ""))
     except Exception:
@@ -95,57 +108,85 @@ def deepl_translate(text: str) -> str:
         if DEEPL_PLAN:
             base = "https://api-free.deepl.com" if DEEPL_PLAN == "free" else "https://api.deepl.com"
         else:
-            for base in ("https://api.deepl.com","https://api-free.deepl.com"):
+            # auto: probar ambas
+            for base in ("https://api.deepl.com", "https://api-free.deepl.com"):
                 try:
-                    r = SESSION.post(f"{base}/v2/translate",
-                                     data={"auth_key": DEEPL_API_KEY, "text": text, "target_lang": "ES"},
-                                     timeout=15)
+                    r = SESSION.post(
+                        f"{base}/v2/translate",
+                        data={"auth_key": DEEPL_API_KEY, "text": text, "target_lang": "ES"},
+                        timeout=15,
+                    )
                     r.raise_for_status()
                     js = r.json()
                     return js["translations"][0]["text"]
                 except Exception:
                     continue
             return text
-        r = SESSION.post(f"{base}/v2/translate",
-                         data={"auth_key": DEEPL_API_KEY, "text": text, "target_lang": "ES"},
-                         timeout=15)
+
+        r = SESSION.post(
+            f"{base}/v2/translate",
+            data={"auth_key": DEEPL_API_KEY, "text": text, "target_lang": "ES"},
+            timeout=15,
+        )
         r.raise_for_status()
         js = r.json()
         return js["translations"][0]["text"]
     except Exception:
         return text
 
-_TICKER_PATTERNS = [re.compile(rf"(?<![A-Z0-9]){re.escape(t)}(?![A-Z0-9])") for t in WATCHLIST if t]
-_IMPORTANT_PATTERNS = [re.compile(rf"\b{re.escape(term)}\b", re.IGNORECASE) for term in IMPORTANT_ENTITIES]
+_TICKER_PATTERNS = [
+    re.compile(rf"(?<![A-Z0-9]){re.escape(t)}(?![A-Z0-9])")
+    for t in WATCHLIST if t
+]
+_IMPORTANT_PATTERNS = [
+    re.compile(rf"\b{re.escape(term)}\b", re.IGNORECASE)
+    for term in IMPORTANT_ENTITIES
+]
 
 def score_item(title: str, link: str, published_utc: datetime) -> float:
     t = (title or "").lower()
     score = 0.0
+
+    # Keywords generales
     for k in KEYWORDS:
         if k and k in t:
             score += 2.0
+
+    # Tickers
     up = (title or "").upper()
     for pat in _TICKER_PATTERNS:
         if pat.search(up):
             score += 3.0
+
+    # Entidades importantes (Trump, tarifas, elecciones, etc.)
     for pat in _IMPORTANT_PATTERNS:
         if pat.search(title or ""):
             score += 3.5
             break
+
+    # Palabras tipo "breaking"
     for k in ("breaking", "urgent", "profit warning"):
         if k in t:
             score += 4.0
+
+    # Preferir CNBC un poco
     if "cnbc.com" in (link or "").lower():
         score += 2.5
+
+    # Bonus por frescura (últimas 3h)
     age_minutes = (datetime.now(timezone.utc) - published_utc).total_seconds() / 60.0
     if age_minutes <= 180:
         score += 2.0 * (1.0 - (age_minutes / 180.0))
+
     return score
 
 def _to_dt_utc(entry):
     for fld in ("published_parsed", "updated_parsed"):
         if hasattr(entry, fld) and getattr(entry, fld):
-            return datetime.fromtimestamp(calendar.timegm(getattr(entry, fld)), tz=timezone.utc)
+            return datetime.fromtimestamp(
+                calendar.timegm(getattr(entry, fld)),
+                tz=timezone.utc,
+            )
     return None
 
 def fetch_items():
@@ -154,6 +195,7 @@ def fetch_items():
     cutoff = now_utc - timedelta(hours=LOOKBACK_HOURS)
 
     feedparser.USER_AGENT = "InvestX-NewsBot/1.1"
+
     for url in FEEDS:
         try:
             feed = feedparser.parse(url)
@@ -161,10 +203,12 @@ def fetch_items():
                 dt_utc = _to_dt_utc(e)
                 if not dt_utc or dt_utc < cutoff:
                     continue
+
                 title = (getattr(e, "title", "") or "").strip()
                 link  = (getattr(e, "link", "")  or "").strip()
                 if not title or not link:
                     continue
+
                 link_norm = normalize_url(link)
                 s = score_item(title, link_norm, dt_utc)
                 desc = (getattr(e, "summary", "") or "").strip()
@@ -172,8 +216,10 @@ def fetch_items():
         except Exception:
             continue
 
+    # Ordenar por score y fecha (desc)
     items.sort(key=lambda x: (x[0], x[1]), reverse=True)
 
+    # Deduplicar por (titulo+dominio) y URL normalizada
     seen_title_dom = set()
     seen_url = set()
     uniq = []
@@ -187,16 +233,21 @@ def fetch_items():
         uniq.append((s, dt_utc, title, link, desc))
         if len(uniq) >= MAX_ITEMS:
             break
+
     return uniq
 
 def send_message(text: str):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    r = SESSION.post(url, data={
-        "chat_id": CHAT_ID,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": True,
-        "text": text
-    }, timeout=30)
+    r = SESSION.post(
+        url,
+        data={
+            "chat_id": CHAT_ID,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": True,
+            "text": text,
+        },
+        timeout=30,
+    )
     r.raise_for_status()
 
 def rating_stars(index: int, total: int) -> str:
@@ -211,10 +262,20 @@ def rating_stars(index: int, total: int) -> str:
     else:
         return "⭐"
 
-def build_bullet(stars: str, title_es: str, ts_local: datetime, link: str, fuente: str, desc_es: str = "") -> str:
+def build_bullet(
+    stars: str,
+    title_es: str,
+    ts_local: datetime,
+    link: str,
+    fuente: str,
+    desc_es: str = "",
+) -> str:
     title_es = html_escape(title_es)
     fuente = html_escape(fuente)
-    line = f"{stars} <b>{title_es}</b>\n   {fecha_es(ts_local)} · <a href=\"{link}\">{fuente}</a>"
+    line = (
+        f"{stars} <b>{title_es}</b>\n"
+        f"   {fecha_es(ts_local)} · <a href=\"{link}\">{fuente}</a>"
+    )
     if INCLUDE_DESC and desc_es:
         d = desc_es.strip().replace("\n", " ")
         if len(d) > 160:
@@ -222,75 +283,51 @@ def build_bullet(stars: str, title_es: str, ts_local: datetime, link: str, fuent
         line += f"\n   {html_escape(d)}"
     return line
 
-# ========= Control de franjas y deduplicación =========
+# ========= Control de cuándo enviar (sin estado externo) =========
 
-LAST_SLOT_FILE = "/tmp/investx_last_news_slot.txt"
+def should_send_automatically(now_local: datetime) -> bool:
+    """
+    - Solo lunes a viernes.
+    - Mañana: 11-13h, pero solo si minutos < 20 (p.ej. 11:15 con tu cron :15/:30).
+    - Noche: 22-24h, pero solo si minutos < 20 (p.ej. 22:15).
+    """
+    # Solo días laborables
+    if now_local.weekday() >= 5:  # 5 = sábado, 6 = domingo
+        return False
 
-def detect_slot(now_local: datetime):
-    """
-    Devuelve 'AM' si está en 11-13h, 'PM' si está en 22-24h, o None si fuera de franja.
-    """
     h = now_local.hour
-    if 11 <= h < 13:
-        return "AM"
-    if 22 <= h < 24:
-        return "PM"
-    return None
+    m = now_local.minute
 
-def build_slot_id(now_local: datetime, slot: str) -> str:
-    # Ejemplo: "2025-11-23-AM"
-    return f"{now_local:%Y-%m-%d}-{slot}"
+    # Mañana
+    if 11 <= h < 13 and m < 20:
+        return True
 
-def has_already_sent(slot_id: str) -> bool:
-    try:
-        with open(LAST_SLOT_FILE, "r", encoding="utf-8") as f:
-            last = f.read().strip()
-        return last == slot_id
-    except FileNotFoundError:
-        return False
-    except Exception:
-        # Si hay cualquier problema leyendo, asumimos que NO se ha enviado aún
-        return False
+    # Noche
+    if 22 <= h < 24 and m < 20:
+        return True
 
-def mark_sent(slot_id: str):
-    try:
-        with open(LAST_SLOT_FILE, "w", encoding="utf-8") as f:
-            f.write(slot_id)
-    except Exception:
-        # Si falla, simplemente no persistimos el estado, pero no rompemos el script
-        pass
+    return False
 
 # ========= Lógica principal =========
 
 def run_news_once(force: bool = False):
     """
     Ejecuta el envío de noticias.
-    - Si force=False -> solo L-V, franjas 11-13 y 22-24, y máximo 1 vez por franja.
-    - Si force=True  -> ignora día/franja/fichero y ENVÍA SIEMPRE.
+    - force=False -> solo horarios válidos (L-V, 11-13 y 22-24) y
+                     solo primera ejecución de la franja (minuto < 20).
+    - force=True  -> ignora horarios y ENVÍA SIEMPRE.
     """
     now_local = datetime.now(LOCAL_TZ)
 
-    slot_id = None
-
     if not force:
-        # 1) Solo lunes-viernes
-        if now_local.weekday() >= 5:  # 5=Sábado, 6=Domingo
-            return  # Fin de semana, no hacemos nada
-
-        # 2) Comprobar si estamos dentro de una franja válida
-        slot = detect_slot(now_local)
-        if slot is None:
-            return  # Fuera de franja (11-13 / 22-24), no enviamos
-
-        # 3) Comprobar si ya se ha enviado en este slot
-        slot_id = build_slot_id(now_local, slot)
-        if has_already_sent(slot_id):
-            return  # Ya se envió en esta franja hoy, no repetimos
+        if not should_send_automatically(now_local):
+            print(f"{now_local} | NEWS | No se envía (fuera de ventana o segundo disparo de la franja).")
+            return
+        else:
+            print(f"{now_local} | NEWS | Envío automático dentro de ventana válida.")
     else:
-        # Forzado: sin restricciones y sin marcar slot para no afectar al automático
-        pass
+        print(f"{now_local} | NEWS | Envío forzado (force=True).")
 
-    # 4) Ejecutar la lógica principal (buscar noticias y enviar)
     items = fetch_items()
     items = items[:MAX_ITEMS]  # Tope final de seguridad (máx 5)
 
@@ -298,8 +335,6 @@ def run_news_once(force: bool = False):
 
     if not items:
         send_message(header + "• No hay titulares destacados en la ventana seleccionada.")
-        if slot_id is not None:
-            mark_sent(slot_id)
         return
 
     lines = []
@@ -325,10 +360,7 @@ def run_news_once(force: bool = False):
         text = acc
 
     send_message(text)
-
-    # 5) Marcamos que este slot ya ha sido usado (solo en modo automático)
-    if slot_id is not None:
-        mark_sent(slot_id)
+    print(f"{now_local} | NEWS | Mensaje de noticias enviado correctamente.")
 
 def main(force: bool = False):
     run_news_once(force=force)
@@ -337,8 +369,7 @@ if __name__ == "__main__":
     if not BOT_TOKEN or not CHAT_ID:
         raise SystemExit("Faltan variables de entorno: INVESTX_TOKEN y/o CHAT_ID")
 
-    # Forzado manual por env o por argumento --force
-    FORCE_ENV = (os.getenv("NEWS_FORCE", "0").strip().lower() in {"1","true","yes","y"})
+    FORCE_ENV = (os.getenv("NEWS_FORCE", "0").strip().lower() in {"1", "true", "yes", "y"})
     FORCE_ARG = ("--force" in sys.argv)
 
     main(force=(FORCE_ENV or FORCE_ARG))
