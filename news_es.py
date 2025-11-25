@@ -17,8 +17,13 @@ CHAT_ID        = os.getenv("CHAT_ID")
 BOT_TOKEN      = os.getenv("INVESTX_TOKEN")
 DEEPL_API_KEY  = (os.getenv("DEEPL_API_KEY") or "").strip()
 DEEPL_PLAN     = (os.getenv("DEEPL_PLAN") or "").strip().lower()  # "free" | "pro" (auto si vacío)
+
+# Usamos Europe/Madrid solo para mostrar fechas de las noticias
 LOCAL_TZ       = ZoneInfo(os.getenv("LOCAL_TZ", "Europe/Madrid"))
 LOOKBACK_HOURS = int(os.getenv("LOOKBACK_HOURS", "10"))
+
+# Misma lógica de offset que en main.py para decidir si enviamos o no
+TZ_OFFSET = int(os.getenv("TZ_OFFSET", "1"))
 
 # --- Límite duro a 5 noticias ---
 MAX_ITEMS_ENV  = int(os.getenv("MAX_ITEMS", "5"))
@@ -288,8 +293,8 @@ def build_bullet(
 def should_send_automatically(now_local: datetime) -> bool:
     """
     - Solo lunes a viernes.
-    - Mañana: 11-13h, pero solo si minutos < 20 (p.ej. 11:15 con tu cron :15/:30).
-    - Noche: 22-24h, pero solo si minutos < 20 (p.ej. 22:15).
+    - Mañana: hora 11, minutos < 20  (con tu cron: 11:15 sí, 11:30 no).
+    - Noche:  hora 22, minutos < 20  (22:15 sí, 22:30 no).
     """
     # Solo días laborables
     if now_local.weekday() >= 5:  # 5 = sábado, 6 = domingo
@@ -298,12 +303,10 @@ def should_send_automatically(now_local: datetime) -> bool:
     h = now_local.hour
     m = now_local.minute
 
-    # Mañana
-    if 11 <= h < 13 and m < 20:
+    if h == 11 and m < 20:
         return True
 
-    # Noche
-    if 22 <= h < 24 and m < 20:
+    if h == 22 and m < 20:
         return True
 
     return False
@@ -313,15 +316,15 @@ def should_send_automatically(now_local: datetime) -> bool:
 def run_news_once(force: bool = False):
     """
     Ejecuta el envío de noticias.
-    - force=False -> solo horarios válidos (L-V, 11-13 y 22-24) y
-                     solo primera ejecución de la franja (minuto < 20).
+    - force=False -> solo horarios válidos (L-V, 11:15 y 22:15 aprox, según cron).
     - force=True  -> ignora horarios y ENVÍA SIEMPRE.
     """
-    now_local = datetime.now(LOCAL_TZ)
+    # Usamos el mismo sistema que main.py: UTC + TZ_OFFSET
+    now_local = datetime.utcnow() + timedelta(hours=TZ_OFFSET)
 
     if not force:
         if not should_send_automatically(now_local):
-            print(f"{now_local} | NEWS | No se envía (fuera de ventana o segundo disparo de la franja).")
+            print(f"{now_local} | NEWS | No se envía (fuera de ventana).")
             return
         else:
             print(f"{now_local} | NEWS | Envío automático dentro de ventana válida.")
@@ -331,7 +334,9 @@ def run_news_once(force: bool = False):
     items = fetch_items()
     items = items[:MAX_ITEMS]  # Tope final de seguridad (máx 5)
 
-    header = f"🗞️ <b>Noticias clave — {fecha_es(now_local)}</b>\n\n"
+    # Para mostrar la hora al usuario usamos la zona local "real"
+    now_for_header = datetime.now(LOCAL_TZ)
+    header = f"🗞️ <b>Noticias clave — {fecha_es(now_for_header)}</b>\n\n"
 
     if not items:
         send_message(header + "• No hay titulares destacados en la ventana seleccionada.")
