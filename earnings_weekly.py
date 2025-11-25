@@ -227,26 +227,33 @@ def _build_professional_note(earnings: List[Dict[str, Any]], week_start: datetim
             "de alto impacto en Estados Unidos."
         )
 
+    # Texto compacto para el prompt de usuario
     compact = "\n".join(
         f"{e['date']} — {e['company']}"
         for e in earnings
     )
 
-    prompt = (
-        "Redacta un párrafo profesional, claro y conciso en español, sin emojis y "
-        "sin mencionar que eres una IA. Resume la relevancia semanal del "
-        "siguiente calendario de resultados empresariales en Estados Unidos "
-        "(impacto alto):\n\n"
+    system_prompt = (
+        "Eres un analista de mercados financieros que redacta comentarios breves "
+        "y profesionales para un canal de inversión. Tu estilo es claro, directo y "
+        "centrado en los mensajes clave para el inversor."
+    )
+
+    user_prompt = (
+        "Resume de forma concisa la relevancia semanal del siguiente calendario "
+        "de resultados empresariales en Estados Unidos (alto impacto). Indica qué días "
+        "concentran más publicaciones y qué sectores o tipos de compañías pueden "
+        "marcar el tono del mercado. Evita emojis y no menciones que eres una IA.\n\n"
         f"{compact}"
     )
 
     try:
-        note = call_gpt_mini(prompt)
+        note = call_gpt_mini(system_prompt, user_prompt)
         texto = (note or "").strip()
     except Exception as e:
         logger.error(f"earnings_weekly | Error generando nota profesional: {e}")
         texto = (
-            "Los resultados concentrados en varios valores de gran capitalización "
+            "Los resultados concentrados en varias compañías de gran capitalización "
             "pueden influir en la volatilidad de los índices estadounidenses y en "
             "los sectores más expuestos."
         )
