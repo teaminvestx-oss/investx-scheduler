@@ -10,8 +10,6 @@ from premarket import run_premarket_morning
 from econ_calendar import run_econ_calendar
 from news_es import run_news_once          # Noticias
 from earnings_weekly import run_weekly_earnings   # Earnings semanales
-from market_close import run_market_close        # ⬅️ NUEVO IMPORT
-
 
 # ---------------------------
 # Configuración de franjas
@@ -35,20 +33,13 @@ FORCE_NEWS = any(
     for var in ("FORCE_NEWS", "NEWS_FORCE", "news_force")
 )
 
-# ---- NUEVO ----
-CLOSE_FORCE = os.getenv("CLOSE_FORCE", "0").lower() in ("1", "true", "yes")
-# No necesitamos más variables: cierre siempre a 22:30 local Madrid
-
-
 def main():
     # Hora "local" aplicando offset
     now = datetime.utcnow() + timedelta(hours=TZ_OFFSET)
     print(f"{now} | INFO | __main__: Ejecutando main.py...")
 
     hour = now.hour
-    minute = now.minute
     weekday = now.weekday()  # 0=lunes
-
 
     # ======================================================
     # 1) "Buenos días / Premarket"
@@ -65,7 +56,6 @@ def main():
         else:
             print(f"INFO | __main__: Fuera de franja 'Buenos días' (hora={hour}, weekday={weekday}).")
 
-
     # ======================================================
     # 2) Earnings semanales (solo lunes 10–11h)
     # ======================================================
@@ -80,7 +70,6 @@ def main():
             run_weekly_earnings(force=False)
         else:
             print(f"INFO | __main__: Earnings no enviados (hora={hour}, weekday={weekday}).")
-
 
     # ======================================================
     # 3) Calendario económico (11–13h)
@@ -97,7 +86,6 @@ def main():
         else:
             print(f"INFO | __main__: Calendario no enviado (hora={hour}, weekday={weekday}).")
 
-
     # ======================================================
     # 4) Noticias (control interno dentro del script)
     # ======================================================
@@ -110,22 +98,6 @@ def main():
             run_news_once(force=False)
         else:
             print(f"INFO | __main__: Fin de semana -> no se evalúan noticias.")
-
-
-    # ======================================================
-    # 5) ⬅️ CIERRE MERCADO USA (22:30)
-    # ======================================================
-
-    # Solo enviamos cierre una vez por día y solo a 22:30 local Madrid.
-    if CLOSE_FORCE or (hour == 22 and minute >= 30):
-        print("INFO | __main__: Ejecutando cierre de mercado USA.")
-        try:
-            run_market_close(force=CLOSE_FORCE)
-        except Exception as e:
-            print(f"ERROR | __main__: Error en run_market_close: {e}")
-    else:
-        print(f"INFO | __main__: No es hora de cierre (hora={hour}:{minute}).")
-
 
 if __name__ == "__main__":
     main()
