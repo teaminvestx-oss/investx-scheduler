@@ -1,5 +1,5 @@
 # =====================================================
-# econ_calendar.py — InvestX v3.1 (ESTABLE)
+# econ_calendar.py — InvestX v3.1 (estable)
 # Calendario USA diario / semanal + resumen IA + control de envíos
 # =====================================================
 
@@ -17,13 +17,14 @@ from utils import send_telegram_message, call_gpt_mini
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
+# Archivo para controlar "solo 1 envío por día"
 STATE_FILE = "econ_calendar_state.json"
+
 DEFAULT_COUNTRY = os.environ.get("ECON_COUNTRY", "united states")
 
-
-# =====================================================
+# ================
 # ESTADO DIARIO
-# =====================================================
+# ================
 
 def _load_state():
     if not os.path.exists(STATE_FILE):
@@ -31,14 +32,14 @@ def _load_state():
     try:
         with open(STATE_FILE, "r", encoding="utf-8") as f:
             return json.load(f)
-    except:
+    except Exception:
         return {}
 
 def _save_state(state):
     try:
         with open(STATE_FILE, "w", encoding="utf-8") as f:
             json.dump(state, f)
-    except:
+    except Exception:
         pass
 
 def _already_sent_today(day_key: str) -> bool:
@@ -52,10 +53,13 @@ def _mark_sent_today(day_key: str):
 
 
 # =====================================================
-# RANGO DE FECHAS (FIX DEFINITIVO)
+# CORRECCIÓN DEFINITIVA DEL RANGO FECHAS (NO MÁS ERR#0032)
 # =====================================================
 
 def _safe_investpy_request(country: str, start_date: datetime, end_date: datetime) -> pd.DataFrame:
+    """
+    Siempre garantiza end_date > start_date
+    """
     if end_date <= start_date:
         end_date = start_date + timedelta(days=1)
 
@@ -74,10 +78,12 @@ def _safe_investpy_request(country: str, start_date: datetime, end_date: datetim
         logger.info("econ_calendar: no hay datos para el rango")
         return pd.DataFrame()
 
+    # Normalizar columnas
     for col in ["date", "time", "event", "importance", "actual", "forecast", "previous", "country"]:
         if col not in df.columns:
             df[col] = ""
 
+    # Convertir datetime real
     df["datetime"] = pd.to_datetime(df["date"] + " " + df["time"], errors="coerce")
     df = df.dropna(subset=["datetime"])
     df = df.sort_values("datetime")
@@ -117,7 +123,7 @@ def _normalize_title(t: str) -> str:
 
 
 # =====================================================
-# FILTRADO + AGRUPACIÓN
+# FILTRADO / AGRUPACIÓN
 # =====================================================
 
 def _filter_and_group(df: pd.DataFrame) -> List[Dict]:
@@ -126,13 +132,14 @@ def _filter_and_group(df: pd.DataFrame) -> List[Dict]:
 
     df = df.copy()
     df["stars"] = df["importance"].apply(_importance_to_stars)
-    df = df[df["stars"] >= 2]
+    df = df[df["stars"] >= 2]     # solo 2 y 3 estrellas
 
     if df.empty:
         return []
 
     df["title_norm"] = df["event"].apply(_normalize_title)
 
+    # Agrupación por títulos parecidos
     grouped = []
     for _, g in df.groupby("title_norm"):
         g = g.sort_values(["stars", "datetime"], ascending=[False, True])
@@ -140,6 +147,7 @@ def _filter_and_group(df: pd.DataFrame) -> List[Dict]:
 
     df = pd.DataFrame(grouped)
 
+    # Prioridad real
     def is_priority(ev, stars):
         ev = ev.lower()
         if stars == 3:
@@ -148,8 +156,10 @@ def _filter_and_group(df: pd.DataFrame) -> List[Dict]:
 
     df["priority"] = df.apply(lambda r: is_priority(r["event"], r["stars"]), axis=1)
 
+    # Orden final
     df = df.sort_values(["priority", "stars", "datetime"], ascending=[False, False, True])
 
+    # Reducimos a 6
     df = df.head(6)
     df = df.sort_values("datetime")
 
@@ -169,32 +179,34 @@ def _filter_and_group(df: pd.DataFrame) -> List[Dict]:
 
 
 # =====================================================
-# IA: INTERPRETACIÓN (MEJORADA 2–3 LÍNEAS)
+# IA – INTERPRETACIÓN (mejorada, menos repetitiva)
 # =====================================================
 
 def _interpret(ev: Dict) -> str:
     prompt = f"""
-Eres analista macro en InvestX. Resume el IMPACTO POTENCIAL para índices USA (S&P500, Nasdaq) y el USD.
+Eres analista macro en un canal de trading (InvestX).
+Tu tarea: resumir el IMPACTO POTENCIAL sobre índices USA (S&P 500, Nasdaq) y el USD.
 
-Evento: {ev['event']}
-Actual: {ev['actual']}
-Previsión: {ev['forecast']}
-Anterior: {ev['previous']}
+Datos:
+- Evento: {ev['event']}
+- Actual: {ev['actual']}
+- Previsión: {ev['forecast']}
+- Anterior: {ev['previous']}
 
 Instrucciones:
-- Responde en 2–3 líneas muy cortas.
-- Tono profesional, orientado a traders.
-- Explica si el dato es mejor/peor de lo esperado y qué implicaría.
-- Comenta impacto probable en índices (riesgo) y en el USD.
-- No repitas el nombre del evento. No menciones IA.
-- Máx 230 caracteres.
+- Escribe SOLO 1–3 líneas, máximo ~220 caracteres en total.
+- Comenta si el resultado es mejor/peor/neutro vs previsión/anterior (si se puede deducir).
+- Explica si tiende a ser alcista/bajista/neutro para índices USA y para el USD.
+- Varía el vocabulario, evita frases genéricas o repetidas entre eventos.
+- No menciones IA ni uses expresiones como "este dato" o "este indicador".
+- Responde solo con el texto final, sin viñetas ni títulos.
     """.strip()
 
     try:
-        txt = call_gpt_mini(prompt, max_tokens=120)
+        txt = call_gpt_mini(prompt, max_tokens=80)
         return txt.strip()
-    except:
-        return "Dato relevante para índices USA y el USD, con impacto potencial en volatilidad."
+    except Exception:
+        return "Dato relevante que puede mover índices USA y el USD, según sorprenda frente a lo esperado."
 
 
 # =====================================================
@@ -222,12 +234,16 @@ def _build_message(events: List[Dict], title_date: datetime) -> str:
         )
         lines.append(block)
 
-    resumen_prompt = "Resume en 1 frase (máx 160 caracteres) la CLAVE del día para índices USA y USD:\n"
-    resumen_prompt += "\n".join(f"- {e['event']}" for e in events)
+    # Resumen final
+    resumen_prompt = (
+        "Eres analista macro. Resume en 1 frase (máx. 160 caracteres) "
+        "la CLAVE del día para índices USA y USD a partir de estos eventos:\n"
+        + "\n".join(f"- {e['event']} ({'⭐'*e['stars']})" for e in events)
+    )
 
     try:
-        resumen = call_gpt_mini(resumen_prompt, max_tokens=50)
-    except:
+        resumen = call_gpt_mini(resumen_prompt, max_tokens=50).strip()
+    except Exception:
         resumen = "Los datos macro de hoy marcarán el tono para índices USA y el USD."
 
     lines.append(f"\n👉 Clave del día: {resumen}")
@@ -241,14 +257,27 @@ def _build_message(events: List[Dict], title_date: datetime) -> str:
 # =====================================================
 
 def run_econ_calendar(force: bool = False, force_tomorrow: bool = False):
-    now = datetime.now()
-    weekday = now.weekday()  # 0 = lunes
+    """
+    Lógica final:
+    - Lunes -> semana completa
+    - Otros días -> solo hoy
+    - force=True: ignora estado diario
+    - force_tomorrow=True: envía solo "mañana"
+    """
 
+    now = datetime.now()
+    weekday = now.weekday()  # 0=lunes
+
+    # Control 1 envío por día
     day_key = now.strftime("%Y-%m-%d")
     if not force and not force_tomorrow:
         if _already_sent_today(day_key):
             logger.info("econ_calendar: ya enviado hoy.")
             return
+
+    # ===========================
+    # Selección del rango
+    # ===========================
 
     if force_tomorrow:
         start = datetime.combine(now.date() + timedelta(days=1), time.min)
@@ -256,13 +285,19 @@ def run_econ_calendar(force: bool = False, force_tomorrow: bool = False):
         title_date = start
     else:
         if weekday == 0:
+            # LUNES → SEMANA ENTERA
             start = datetime.combine(now.date(), time.min)
             end = start + timedelta(days=5)
             title_date = now
         else:
+            # DÍA NORMAL
             start = datetime.combine(now.date(), time.min)
             end = start + timedelta(days=1)
             title_date = now
+
+    # ===========================
+    # Descarga de datos
+    # ===========================
 
     try:
         df = _safe_investpy_request(DEFAULT_COUNTRY, start, end)
@@ -273,6 +308,7 @@ def run_econ_calendar(force: bool = False, force_tomorrow: bool = False):
     events = _filter_and_group(df)
     msg = _build_message(events, title_date)
 
+    # Enviar
     send_telegram_message(msg)
 
     if not force and not force_tomorrow:
