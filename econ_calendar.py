@@ -1,13 +1,14 @@
 # =====================================================
-# econ_calendar.py — InvestX v3.1 (estable)
+# econ_calendar.py — InvestX v3.1
 # Calendario USA diario / semanal + resumen IA + control de envíos
+# + DETECCIÓN DE FESTIVOS USA
 # =====================================================
 
 import os
 import json
 import logging
 from datetime import datetime, timedelta, time
-from typing import List, Dict
+from typing import List, Dict, Optional
 
 import pandas as pd
 import investpy
@@ -89,6 +90,68 @@ def _safe_investpy_request(country: str, start_date: datetime, end_date: datetim
     df = df.sort_values("datetime")
 
     return df
+
+
+# =====================================================
+# DETECCIÓN DE FESTIVOS USA
+# =====================================================
+
+HOLIDAY_KEYWORDS = [
+    "holiday",
+    "bank holiday",
+    "thanksgiving",
+    "día de acción de gracias",
+    "independence day",
+    "labour day",
+    "labor day",
+    "christmas",
+    "christmas day",
+    "good friday",
+    "memorial day",
+    "martin luther king",
+    "presidents day",
+    "new year",
+    "new year's day",
+]
+
+def _detect_us_holiday_for_day(df: pd.DataFrame, target_date: datetime.date) -> Optional[str]:
+    """
+    Si en la fecha target_date hay un evento de tipo festivo para USA,
+    devuelve el nombre del festivo. Si no, devuelve None.
+    """
+    if df.empty:
+        return None
+
+    # Filtramos solo el día objetivo
+    same_day = df[df["datetime"].dt.date == target_date]
+    if same_day.empty:
+        return None
+
+    # Buscamos eventos cuyo título parezca un festivo
+    for _, row in same_day.iterrows():
+        ev = str(row.get("event", "")).strip()
+        ev_lower = ev.lower()
+        if any(k in ev_lower for k in HOLIDAY_KEYWORDS):
+            return ev or "Festivo en EE. UU."
+
+    return None
+
+
+def _build_holiday_message(holiday_name: str, title_date: datetime) -> str:
+    """
+    Mensaje específico para días festivos en EE. UU.
+    """
+    fecha = title_date.strftime("%a %d/%m").replace(".", "")
+
+    lines = [
+        f"📅 Calendario económico — {fecha}\n",
+        f"🇺🇸 Hoy el mercado USA está en <b>festivo</b>: {holiday_name}.",
+        "No se publican datos macro relevantes y el volumen en los mercados suele ser muy bajo.",
+        "⚠️ Ojo con la liquidez y posibles movimientos erráticos o gaps durante la sesión.",
+    ]
+
+    msg = "\n".join(lines)
+    return msg if len(msg) < 3900 else msg[:3900]
 
 
 # =====================================================
@@ -179,34 +242,29 @@ def _filter_and_group(df: pd.DataFrame) -> List[Dict]:
 
 
 # =====================================================
-# IA – INTERPRETACIÓN (mejorada, menos repetitiva)
+# IA – INTERPRETACIÓN
 # =====================================================
 
 def _interpret(ev: Dict) -> str:
     prompt = f"""
-Eres analista macro en un canal de trading (InvestX).
-Tu tarea: resumir el IMPACTO POTENCIAL sobre índices USA (S&P 500, Nasdaq) y el USD.
+Eres analista macro en un canal de trading. Resume el IMPACTO POTENCIAL PARA ÍNDICES USA Y EL USD:
 
-Datos:
-- Evento: {ev['event']}
-- Actual: {ev['actual']}
-- Previsión: {ev['forecast']}
-- Anterior: {ev['previous']}
+Evento: {ev['event']}
+Actual: {ev['actual']}
+Previsión: {ev['forecast']}
+Anterior: {ev['previous']}
 
-Instrucciones:
-- Escribe SOLO 1–3 líneas, máximo ~220 caracteres en total.
-- Comenta si el resultado es mejor/peor/neutro vs previsión/anterior (si se puede deducir).
-- Explica si tiende a ser alcista/bajista/neutro para índices USA y para el USD.
-- Varía el vocabulario, evita frases genéricas o repetidas entre eventos.
-- No menciones IA ni uses expresiones como "este dato" o "este indicador".
-- Responde solo con el texto final, sin viñetas ni títulos.
-    """.strip()
-
+Reglas:
+- SOLO 1–3 líneas, muy cortas.
+- Tono profesional.
+- Máximo 220 caracteres.
+- Sin mencionar IA ni "este dato".
+    """
     try:
         txt = call_gpt_mini(prompt, max_tokens=80)
         return txt.strip()
     except Exception:
-        return "Dato relevante que puede mover índices USA y el USD, según sorprenda frente a lo esperado."
+        return "Dato relevante para índices USA y el USD."
 
 
 # =====================================================
@@ -235,14 +293,11 @@ def _build_message(events: List[Dict], title_date: datetime) -> str:
         lines.append(block)
 
     # Resumen final
-    resumen_prompt = (
-        "Eres analista macro. Resume en 1 frase (máx. 160 caracteres) "
-        "la CLAVE del día para índices USA y USD a partir de estos eventos:\n"
-        + "\n".join(f"- {e['event']} ({'⭐'*e['stars']})" for e in events)
-    )
+    resumen_prompt = "Resume en 1 frase (máx 160 caracteres) cuál es la CLAVE del día para índices USA y USD:"
+    resumen_prompt += "\n".join(f"- {e['event']}" for e in events)
 
     try:
-        resumen = call_gpt_mini(resumen_prompt, max_tokens=50).strip()
+        resumen = call_gpt_mini(resumen_prompt, max_tokens=50)
     except Exception:
         resumen = "Los datos macro de hoy marcarán el tono para índices USA y el USD."
 
@@ -280,18 +335,20 @@ def run_econ_calendar(force: bool = False, force_tomorrow: bool = False):
     # ===========================
 
     if force_tomorrow:
-        start = datetime.combine(now.date() + timedelta(days=1), time.min)
+        target_date = now.date() + timedelta(days=1)
+        start = datetime.combine(target_date, time.min)
         end = start + timedelta(days=1)
         title_date = start
     else:
+        target_date = now.date()
         if weekday == 0:
             # LUNES → SEMANA ENTERA
-            start = datetime.combine(now.date(), time.min)
+            start = datetime.combine(target_date, time.min)
             end = start + timedelta(days=5)
             title_date = now
         else:
             # DÍA NORMAL
-            start = datetime.combine(now.date(), time.min)
+            start = datetime.combine(target_date, time.min)
             end = start + timedelta(days=1)
             title_date = now
 
@@ -305,6 +362,26 @@ def run_econ_calendar(force: bool = False, force_tomorrow: bool = False):
         send_telegram_message(f"⚠️ Error al obtener calendario económico: {e}")
         return
 
+    # ===========================
+    # FESTIVO USA -> MENSAJE ESPECÍFICO
+    # (se mira solo el día objetivo, aunque el rango sea semanal)
+    # ===========================
+    try:
+        holiday_name = _detect_us_holiday_for_day(df, target_date)
+    except Exception as e:
+        logger.warning("econ_calendar: error detectando festivo: %s", e)
+        holiday_name = None
+
+    if holiday_name:
+        msg = _build_holiday_message(holiday_name, title_date)
+        send_telegram_message(msg)
+        if not force and not force_tomorrow:
+            _mark_sent_today(day_key)
+        return
+
+    # ===========================
+    # Eventos normales
+    # ===========================
     events = _filter_and_group(df)
     msg = _build_message(events, title_date)
 
