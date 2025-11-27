@@ -1,44 +1,43 @@
 # === market_close.py ===
-# Cierre de mercado USA – InvestX (solo interpretación, sin imágenes)
+# Cierre de mercado USA – InvestX (solo texto, sin imágenes)
 
 import os
 from datetime import datetime
-
-import requests  # debe estar en requirements.txt
-
-
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+import requests  # ya lo usas en el resto de scripts
 
 
-# ---------------- TELEGRAM HELPERS ---------------- #
+# ⚠️ Usamos EXACTAMENTE las mismas variables que en tu premarket
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN") or os.getenv("INVESTX_TOKEN")
+CHAT_ID = os.getenv("TELEGRAM_CHAT_ID") or os.getenv("CHAT_ID")
+
 
 def send_telegram_message(text: str):
-    """Envía un mensaje de texto a Telegram usando la API directa."""
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        print("[TELEGRAM] Faltan TELEGRAM_TOKEN o TELEGRAM_CHAT_ID")
+    """Envía un mensaje de texto a Telegram usando la API directa (mismo patrón que premarket)."""
+    if not TELEGRAM_TOKEN or not CHAT_ID:
+        print("[TELEGRAM] Faltan TELEGRAM_TOKEN/INVESTX_TOKEN o CHAT_ID/TELEGRAM_CHAT_ID")
         return
 
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     data = {
-        "chat_id": TELEGRAM_CHAT_ID,
+        "chat_id": CHAT_ID,
         "text": text,
-        "parse_mode": "Markdown",  # o None si prefieres texto plano
+        "parse_mode": "Markdown",  # puedes cambiar a 'HTML' o quitarlo si quieres
     }
+
     try:
         resp = requests.post(url, data=data, timeout=30)
         if not resp.ok:
             print(f"[TELEGRAM] Error sendMessage: {resp.status_code} {resp.text}")
+        else:
+            print("[TELEGRAM] Mensaje de cierre enviado correctamente.")
     except Exception as e:
         print(f"[TELEGRAM] EXCEPTION sendMessage: {e}")
 
 
-# ---------------- LÓGICA DEL CIERRE ---------------- #
-
 def build_close_message() -> str:
     """
     Mensaje compacto tipo InvestX, apto para Telegram.
-    IMPORTANTE: no mencionar heatmaps ni imágenes porque ya no se envían.
+    Solo interpretación; no menciona imágenes ni heatmaps.
     """
     today = datetime.utcnow().strftime("%d/%m/%Y")
 
@@ -67,11 +66,11 @@ def build_close_message() -> str:
 def run_market_close(force: bool = False):
     """
     Envía el cierre de mercado (solo texto).
-    La lógica de 'force' se gestiona en main.py; aquí solo lo mostramos en logs.
+    La lógica de 'force' y la hora se controlan en main.py.
     """
     print(f"[MARKET_CLOSE] Ejecutando run_market_close(force={force})")
 
     msg = build_close_message()
     send_telegram_message(msg)
 
-    print("[MARKET_CLOSE] Cierre enviado correctamente (solo interpretación, sin imágenes).")
+    print("[MARKET_CLOSE] Cierre enviado (solo interpretación).")
