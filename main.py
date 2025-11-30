@@ -66,6 +66,7 @@ def main():
 
     # ======================================================
     # 1) "Buenos días / Premarket" -> SOLO una vez al día
+    #    (tolerancia: si Render se retrasa, minute >= 30)
     # ======================================================
     if FORCE_MORNING:
         print("INFO | __main__: FORCE_MORNING=1 -> enviando 'Buenos días' siempre.")
@@ -74,10 +75,10 @@ def main():
         if (
             weekday < 5
             and hour == PREMARKET_HOUR
-            and minute == PREMARKET_MINUTE
+            and minute >= PREMARKET_MINUTE
         ):
             print(
-                f"INFO | __main__: Activando 'Buenos días' SOLO en "
+                f"INFO | __main__: Activando 'Buenos días' SOLO a partir de "
                 f"{PREMARKET_HOUR:02d}:{PREMARKET_MINUTE:02d}."
             )
             run_premarket_morning(force=False)
@@ -88,28 +89,36 @@ def main():
             )
 
     # ======================================================
-    # 2) Earnings semanales (lunes 10–11h) -> se mantiene igual
+    # 2) Earnings semanales (lunes ~11:30) -> SOLO una vez a la semana
     # ======================================================
-    within_earnings_window = MORNING_START_HOUR <= hour < MORNING_END_HOUR
+    # Disparo previsto: lunes a las 11:30 hora local.
+    # Para absorber pequeños retrasos de Render, aceptamos minute >= 30.
+    EARNINGS_HOUR = 11
+    EARNINGS_MINUTE = 30
 
     if FORCE_EARNINGS:
         print("INFO | __main__: FORCE_EARNINGS=1 -> enviando earnings semanales sin restricciones.")
         run_weekly_earnings(force=True)
     else:
-        if weekday == 0 and within_earnings_window:
+        if (
+            weekday == 0   # solo lunes
+            and hour == EARNINGS_HOUR
+            and minute >= EARNINGS_MINUTE
+        ):
             print(
-                "INFO | __main__: Lunes y dentro de franja "
-                f"{MORNING_START_HOUR}-{MORNING_END_HOUR}h -> evaluando earnings semanales."
+                "INFO | __main__: Lunes y hora >= "
+                f"{EARNINGS_HOUR:02d}:{EARNINGS_MINUTE:02d} -> enviando earnings semanales."
             )
             run_weekly_earnings(force=False)
         else:
             print(
-                "INFO | __main__: No es lunes o fuera de franja para earnings semanales "
-                f"(hora={hour}, weekday={weekday}). No se envían."
+                "INFO | __main__: Earnings semanales NO enviados "
+                f"(weekday={weekday}, hour={hour}, minute={minute})."
             )
 
     # ======================================================
     # 3) Calendario económico -> SOLO una vez al día (11:30)
+    #    (tolerancia: minute >= 30)
     # ======================================================
     if FORCE_ECON:
         print("INFO | __main__: FORCE_ECON=1 -> enviando calendario económico sin restricciones.")
@@ -118,10 +127,10 @@ def main():
         if (
             weekday < 5
             and hour == ECON_HOUR
-            and minute == ECON_MINUTE
+            and minute >= ECON_MINUTE
         ):
             print(
-                f"INFO | __main__: Activando 'Calendario económico' SOLO en "
+                f"INFO | __main__: Activando 'Calendario económico' SOLO a partir de "
                 f"{ECON_HOUR:02d}:{ECON_MINUTE:02d}."
             )
             run_econ_calendar(force=False)
@@ -155,7 +164,7 @@ def main():
     else:
         if weekday < 5 and hour == 22 and minute >= 30:
             print("INFO | __main__: Última pasada del día (>=22:30) -> enviando Market Close.")
-            run_market_close(force=False)
+            run_market_close(force(False))
         else:
             print(
                 "INFO | __main__: Market Close NO enviado "
