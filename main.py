@@ -147,15 +147,14 @@ def main():
     # ======================================================
     # 5) Market Close USA -> SOLO última ejecución del día (noche)
     # ======================================================
-    # Cron: 15,30 9,10,21 * * 1-5 (UTC)
-    # Con TZ_OFFSET=1 -> 10:15, 10:30, 11:15, 11:30, 22:15, 22:30 local.
-    # Solo queremos enviar en la ÚLTIMA: 22:30 local (L-V).
+    # Última ejecución del cron: 22:30 hora Madrid (TZ_OFFSET=1)
+    # Para evitar problemas si Render arranca con 1–2 min de retraso, usamos minute >= 30
     if CLOSE_FORCE:
         print("INFO | __main__: CLOSE_FORCE=1 -> enviando Market Close sin restricciones.")
         run_market_close(force=True)
     else:
-        if weekday < 5 and hour == 22 and minute == 30:
-            print("INFO | __main__: Última pasada del día (22:30) -> enviando Market Close.")
+        if weekday < 5 and hour == 22 and minute >= 30:
+            print("INFO | __main__: Última pasada del día (>=22:30) -> enviando Market Close.")
             run_market_close(force=False)
         else:
             print(
