@@ -53,11 +53,16 @@ def main():
     minute = now.minute
     weekday = now.weekday()  # 0=lunes, 6=domingo
 
-    # Hora única de disparo de mañana (local Madrid)
-    # Render lanza a 9:15, 9:30, 10:15, 10:30 UTC -> 10:15, 10:30, 11:15, 11:30 local
-    # Elegimos SOLO la última de la mañana -> 11:30 local
-    SINGLE_MORNING_HOUR = 11
-    SINGLE_MORNING_MINUTE = 30
+    # Render lanza a 9:15, 9:30, 10:15, 10:30, 21:15, 21:30 UTC
+    # -> 10:15, 10:30, 11:15, 11:30, 22:15, 22:30 hora Madrid (TZ_OFFSET=1)
+
+    # Hora única de disparo para PREMARKET (10:30 local)
+    PREMARKET_HOUR = 10
+    PREMARKET_MINUTE = 30
+
+    # Hora única de disparo para CALENDARIO (11:30 local)
+    ECON_HOUR = 11
+    ECON_MINUTE = 30
 
     # ======================================================
     # 1) "Buenos días / Premarket" -> SOLO una vez al día
@@ -68,12 +73,12 @@ def main():
     else:
         if (
             weekday < 5
-            and hour == SINGLE_MORNING_HOUR
-            and minute == SINGLE_MORNING_MINUTE
+            and hour == PREMARKET_HOUR
+            and minute == PREMARKET_MINUTE
         ):
             print(
                 f"INFO | __main__: Activando 'Buenos días' SOLO en "
-                f"{SINGLE_MORNING_HOUR:02d}:{SINGLE_MORNING_MINUTE:02d}."
+                f"{PREMARKET_HOUR:02d}:{PREMARKET_MINUTE:02d}."
             )
             run_premarket_morning(force=False)
         else:
@@ -104,7 +109,7 @@ def main():
             )
 
     # ======================================================
-    # 3) Calendario económico -> SOLO una vez al día (misma hora única)
+    # 3) Calendario económico -> SOLO una vez al día (11:30)
     # ======================================================
     if FORCE_ECON:
         print("INFO | __main__: FORCE_ECON=1 -> enviando calendario económico sin restricciones.")
@@ -112,12 +117,12 @@ def main():
     else:
         if (
             weekday < 5
-            and hour == SINGLE_MORNING_HOUR
-            and minute == SINGLE_MORNING_MINUTE
+            and hour == ECON_HOUR
+            and minute == ECON_MINUTE
         ):
             print(
                 f"INFO | __main__: Activando 'Calendario económico' SOLO en "
-                f"{SINGLE_MORNING_HOUR:02d}:{SINGLE_MORNING_MINUTE:02d}."
+                f"{ECON_HOUR:02d}:{ECON_MINUTE:02d}."
             )
             run_econ_calendar(force=False)
         else:
