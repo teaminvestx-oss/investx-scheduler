@@ -74,11 +74,11 @@ def main():
         if (
             weekday < 5
             and hour == PREMARKET_HOUR
-            and minute == PREMARKET_MINUTE
+            and minute >= PREMARKET_MINUTE
         ):
             print(
-                f"INFO | __main__: Activando 'Buenos días' SOLO en "
-                f"{PREMARKET_HOUR:02d}:{PREMARKET_MINUTE:02d}."
+                f"INFO | __main__: Activando 'Buenos días' en "
+                f"{PREMARKET_HOUR:02d}:{PREMARKET_MINUTE:02d}+ (>= minuto)."
             )
             run_premarket_morning(force=False)
         else:
