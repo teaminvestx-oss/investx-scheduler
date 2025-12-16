@@ -118,11 +118,11 @@ def main():
         if (
             weekday < 5
             and hour == ECON_HOUR
-            and minute == ECON_MINUTE
+            and minute >= ECON_MINUTE
         ):
             print(
-                f"INFO | __main__: Activando 'Calendario económico' SOLO en "
-                f"{ECON_HOUR:02d}:{ECON_MINUTE:02d}."
+                f"INFO | __main__: Activando 'Calendario económico' en "
+                f"{ECON_HOUR:02d}:{ECON_MINUTE:02d}+ (>= minuto)."
             )
             run_econ_calendar(force=False)
         else:
