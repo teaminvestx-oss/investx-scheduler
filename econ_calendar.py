@@ -1,7 +1,12 @@
 # =====================================================
-# econ_calendar.py — InvestX v4.1 (Macro Brief PRO, estable)
-# Calendario USA diario/semanal + Macro Brief IA (estilo CNBC/Bloomberg, en español)
-# + control 1 envío + agenda agrupada (evita duplicados tipo CPI/Core CPI)
+# econ_calendar.py — InvestX v4.2 (Macro Brief PRO + Español total)
+# Fuente: investpy (igual)
+# Lógica: 1 envío/día (igual) + festivos (igual) + filtro 2-3⭐ (igual) + máx 6 (igual)
+# NUEVO:
+# - Macro Brief IA estilo CNBC/Bloomberg SIEMPRE en español
+# - Agenda agrupada + “detalle humano” (sin repetir CPI 4 veces)
+# - Traducción/adaptación de nombres (no mezcla inglés/español)
+# - Verificación de OPENAI_API_KEY (si falta, fallback digno)
 # =====================================================
 
 import os
@@ -149,7 +154,7 @@ def _process_events(df: pd.DataFrame) -> List[Dict]:
 
 
 # =====================================================
-# AGRUPACIÓN DE AGENDA (evita duplicados tipo CPI/Core CPI)
+# TRADUCCIÓN / ADAPTACIÓN DE NOMBRES (para que no salga inglés)
 # =====================================================
 def _normalize_event_name(name: str) -> str:
     if not isinstance(name, str):
@@ -157,38 +162,93 @@ def _normalize_event_name(name: str) -> str:
     return " ".join(name.strip().split()).lower()
 
 
+def _translate_event_name(ev_name: str) -> str:
+    """
+    Traduce/adapta los nombres más comunes a español entendible.
+    No pretende ser perfecto; prioriza claridad para Telegram.
+    """
+    if not isinstance(ev_name, str) or not ev_name.strip():
+        return ""
+
+    s = " ".join(ev_name.strip().split())
+    n = s.lower()
+
+    # Política
+    if ("president" in n or "u.s. president" in n) and ("speaks" in n or "speech" in n):
+        # Ej: "U.S. President Trump Speaks"
+        if "trump" in n:
+            return "El presidente Trump ofrece un discurso"
+        return "El presidente de EE. UU. ofrece un discurso"
+
+    # Empleo
+    if "initial jobless claims" in n or ("jobless" in n and "claims" in n):
+        return "Solicitudes semanales de subsidio por desempleo"
+
+    # Inflación - CPI
+    if "core cpi" in n:
+        return "IPC subyacente (sin energía ni alimentos)"
+    if "cpi" in n:
+        # Si viene con (MoM)/(YoY), lo simplificamos
+        if "mom" in n:
+            return "IPC (mensual)"
+        if "yoy" in n:
+            return "IPC (interanual)"
+        return "IPC (índice de precios al consumidor)"
+
+    # Inflación - PCE
+    if "pce" in n:
+        return "PCE (inflación preferida por la Fed)"
+
+    # Actividad - Philly Fed
+    if "philadelphia fed" in n and ("manufacturing" in n or "index" in n):
+        return "Índice manufacturero de la Fed de Filadelfia"
+
+    # Genéricos comunes
+    if "manufacturing" in n and "index" in n:
+        return "Índice manufacturero"
+
+    # Si no sabemos, devolvemos tal cual (pero intentaremos no mostrarlo como “clave”)
+    return s
+
+
+# =====================================================
+# AGRUPACIÓN DE AGENDA (evita duplicados + mantiene detalle)
+# =====================================================
 def _bucket_event(ev_name: str) -> str:
     n = _normalize_event_name(ev_name)
 
     # Inflación
+    if "core cpi" in n or ("cpi" in n and "core" in n):
+        return "Inflación: IPC e IPC subyacente"
     if "cpi" in n or "inflation" in n:
-        return "Inflación (CPI/Core CPI)"
+        return "Inflación: IPC e IPC subyacente"
     if "pce" in n:
-        return "Inflación (PCE)"
+        return "Inflación: PCE (Fed)"
 
     # Empleo
     if "jobless" in n or "unemployment" in n or "payroll" in n or "nonfarm" in n:
-        return "Empleo (mercado laboral)"
+        return "Empleo"
 
     # Actividad / crecimiento
-    if "manufacturing" in n or "ism" in n or "pmi" in n or "philadelphia fed" in n:
-        return "Actividad (PMI/ISM/Fed regional)"
+    if "philadelphia fed" in n:
+        return "Actividad: Fed de Filadelfia"
+    if "manufacturing" in n or "ism" in n or "pmi" in n:
+        return "Actividad"
 
     # Fed / discursos
     if "fed" in n and ("speech" in n or "speaks" in n or "chair" in n):
-        return "Fed (discursos)"
+        return "Fed: discursos"
 
     # Política / declaraciones
     if "president" in n and ("speaks" in n or "speech" in n):
-        return "Política (declaraciones)"
+        return "Política: declaraciones"
 
-    # Default
-    return ev_name.strip() if isinstance(ev_name, str) else ""
+    return "Otros"
 
 
 def _group_agenda(events: List[Dict]) -> List[Dict]:
     """
-    Agrupa eventos repetidos/relacionados para que la agenda sea entendible.
+    Agrupa eventos y conserva 1-2 ejemplos (traducidos) del nombre original.
     Mantiene hora mínima del grupo y máxima importancia (stars).
     """
     if not events:
@@ -196,12 +256,22 @@ def _group_agenda(events: List[Dict]) -> List[Dict]:
 
     groups = {}
     for ev in events:
-        bucket = _bucket_event(ev.get("event", ""))
+        raw_name = (ev.get("event") or "").strip()
+        bucket = _bucket_event(raw_name)
         dt = ev.get("datetime")
         stars = int(ev.get("stars", 1))
 
+        example_es = _translate_event_name(raw_name)
+        if not example_es:
+            example_es = raw_name
+
         if bucket not in groups:
-            groups[bucket] = {"datetime": dt, "stars": stars, "label": bucket}
+            groups[bucket] = {
+                "datetime": dt,
+                "stars": stars,
+                "label": bucket,
+                "examples": [example_es] if example_es else []
+            }
         else:
             # Hora: la más temprana
             if dt and groups[bucket]["datetime"] and dt < groups[bucket]["datetime"]:
@@ -209,63 +279,117 @@ def _group_agenda(events: List[Dict]) -> List[Dict]:
             # Estrellas: la más alta
             if stars > groups[bucket]["stars"]:
                 groups[bucket]["stars"] = stars
+            # Ejemplos: únicos (máximo 2)
+            if example_es and example_es not in groups[bucket]["examples"]:
+                groups[bucket]["examples"].append(example_es)
 
-    out = list(groups.values())
-    out = sorted(out, key=lambda x: x["datetime"] or datetime.max)
+    out = []
+    for g in groups.values():
+        ex = g["examples"][:2]
+        suffix = ""
+        if ex:
+            suffix = ": " + " / ".join(ex)
+        out.append({
+            "datetime": g["datetime"],
+            "stars": g["stars"],
+            "label": g["label"] + suffix
+        })
+
+    out.sort(key=lambda x: x["datetime"] or datetime.max)
     return out
 
 
 # =====================================================
 # MACRO BRIEF IA (estilo CNBC/Bloomberg) — SIEMPRE EN ESPAÑOL
+# + Verifica OPENAI_API_KEY (si falta → fallback digno)
 # =====================================================
 def _make_macro_brief(events: List[Dict]) -> str:
     if not events:
         return ""
 
-    event_names = [e.get("event", "") for e in events if e.get("event")]
-    event_block = "\n".join([f"- {n}" for n in event_names])
+    # Si no hay API key, no intentamos IA (evita “robot” por fallo silencioso)
+    api_key = os.getenv("OPENAI_API_KEY", "").strip()
+    if not api_key:
+        logger.warning("OPENAI_API_KEY no configurada. Macro Brief irá por fallback.")
+        return (
+            "Sesión marcada por datos macro capaces de mover expectativas de tipos. "
+            "Si sorprenden al alza, presión para la renta variable y apoyo al USD/yields; "
+            "si salen más suaves, alivio para el riesgo y para los bonos."
+        )
+
+    # Damos a la IA más contexto, pero sin forzar a listar: hora + nombres + (forecast/previous si existe)
+    lines = []
+    for e in events:
+        dt = e.get("datetime")
+        hr = dt.strftime("%H:%M") if dt else ""
+        stars = "⭐" * int(e.get("stars", 1))
+
+        evn_raw = e.get("event", "")
+        evn_es = _translate_event_name(evn_raw) or evn_raw
+
+        fc = e.get("forecast", "")
+        pv = e.get("previous", "")
+
+        extra = []
+        if fc:
+            extra.append(f"previsión: {fc}")
+        if pv:
+            extra.append(f"anterior: {pv}")
+
+        tail = f" ({' | '.join(extra)})" if extra else ""
+        lines.append(f"- {stars} {hr} — {evn_es}{tail}")
+
+    event_block = "\n".join(lines)
 
     prompt = (
-        "Eres analista macro senior en un desk institucional (estilo Bloomberg/CNBC).\n"
-        "Con los eventos de EE. UU. de hoy, redacta un 'Macro Brief' en español, claro y entendible.\n"
-        "Máximo 3 frases.\n"
+        "Eres analista macro senior en un desk institucional (estilo Bloomberg/CNBC) "
+        "y escribes para un canal de Telegram en español.\n\n"
+        "Redacta un 'Macro Brief' con personalidad (no robótico), en 2 a 4 frases.\n"
+        "Objetivo: que se entienda rápido qué puede mover hoy el mercado.\n\n"
         "Reglas:\n"
-        "- NO enumeres eventos ni horas.\n"
-        "- Agrupa mentalmente eventos repetidos (ej: CPI/Core CPI).\n"
-        "- Usa condicionales (si sale más alto/si sale más débil).\n"
-        "- Enfócate en impacto sobre: Fed/tipos, bonos (yields), dólar (USD) y renta variable.\n"
+        "- No enumeres eventos ni horas (eso va debajo en la agenda).\n"
+        "- Puedes mencionar 1 dato por su nombre si es el protagonista (ej: IPC, empleo, Fed).\n"
+        "- Agrupa mentalmente lo repetido (IPC general y subyacente, etc.).\n"
+        "- Usa condicionales claros: si sale por encima / por debajo de lo previsto.\n"
+        "- Conecta con: expectativas de la Fed/tipos, yields, USD y renta variable.\n"
+        "- No inventes resultados ni cifras que no estén en el contexto.\n"
         "- Prohibido escribir en inglés.\n\n"
-        "Eventos:\n"
+        "Contexto de eventos (solo para que entiendas el día):\n"
         f"{event_block}\n"
     )
 
     try:
-        out = call_gpt_mini(prompt, max_tokens=120).strip()
-    except:
+        out = call_gpt_mini(prompt, max_tokens=200).strip()
+    except Exception as e:
+        logger.warning(f"call_gpt_mini falló: {e}")
         out = ""
 
-    # Cinturón y tirantes: si aun así sale en inglés, traducimos sin añadir info
-    if out and any(w in out.lower() for w in ["markets", "ahead", "yields", "dollar", "stocks", "brace", "inflation", "fed"]):
+    # Si sale accidentalmente en inglés, lo traducimos (sin añadir info)
+    eng_hits = 0
+    low = out.lower() if isinstance(out, str) else ""
+    for w in ["markets", "ahead", "yields", "dollar", "stocks", "brace", "inflation", "fed", "rates"]:
+        if w in low:
+            eng_hits += 1
+
+    if out and eng_hits >= 3:
         try:
-            tr_prompt = (
-                "Traduce al español neutro y claro (máx 3 frases), sin añadir información:\n"
-                f"{out}"
-            )
-            out = call_gpt_mini(tr_prompt, max_tokens=140).strip()
-        except:
-            pass
+            tr_prompt = "Traduce al español claro (máx 4 frases), sin añadir información:\n" + out
+            out = call_gpt_mini(tr_prompt, max_tokens=240).strip()
+        except Exception as e:
+            logger.warning(f"Traducción falló: {e}")
 
     if not out:
         out = (
-            "Hoy el mercado ajusta expectativas de tipos en función de los datos macro; "
-            "atención al impacto en USD, yields y renta variable."
+            "Sesión marcada por datos macro capaces de mover expectativas de tipos. "
+            "Si sorprenden al alza, presión para la renta variable y apoyo al USD/yields; "
+            "si salen más suaves, alivio para el riesgo y para los bonos."
         )
 
     return out
 
 
 # =====================================================
-# CREAR MENSAJE FINAL (Macro Brief arriba + agenda agrupada)
+# CREAR MENSAJE FINAL (Macro Brief arriba + agenda agrupada y entendible)
 # =====================================================
 def _build_message(events: List[Dict], date_ref: datetime) -> str:
     fecha = date_ref.strftime("%a %d/%m").replace(".", "")
@@ -285,20 +409,20 @@ def _build_message(events: List[Dict], date_ref: datetime) -> str:
             "Hoy no hay datos macro relevantes en EE. UU."
         )
 
-    # Macro brief IA
     brief = _make_macro_brief(events)
-
-    # Agenda agrupada (evita CPI x4)
     agenda = _group_agenda(events)
 
-    lines = [f"🧠 Macro Brief — {fecha} (EE. UU.)\n", brief, "\nAgenda clave:"]
+    lines = [f"🧠 Macro Brief (EE. UU.) — {fecha}\n", brief, "\nAgenda clave:"]
 
     for a in agenda:
         dt = a.get("datetime")
         hr = dt.strftime("%H:%M") if dt else ""
         stars = "⭐" * int(a.get("stars", 1))
         label = a.get("label", "")
-        lines.append(f"{stars} {hr} — {label}".strip())
+
+        # Limpieza: evita líneas vacías raras
+        item = f"{stars} {hr} — {label}".strip()
+        lines.append(item)
 
     return "\n".join(lines)
 
