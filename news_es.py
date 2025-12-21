@@ -113,7 +113,6 @@ def deepl_translate(text: str) -> str:
         if DEEPL_PLAN:
             base = "https://api-free.deepl.com" if DEEPL_PLAN == "free" else "https://api.deepl.com"
         else:
-            # auto: probar ambas
             for base in ("https://api.deepl.com", "https://api-free.deepl.com"):
                 try:
                     r = SESSION.post(
@@ -152,33 +151,27 @@ def score_item(title: str, link: str, published_utc: datetime) -> float:
     t = (title or "").lower()
     score = 0.0
 
-    # Keywords generales
     for k in KEYWORDS:
         if k and k in t:
             score += 2.0
 
-    # Tickers
     up = (title or "").upper()
     for pat in _TICKER_PATTERNS:
         if pat.search(up):
             score += 3.0
 
-    # Entidades importantes (Trump, tarifas, elecciones, etc.)
     for pat in _IMPORTANT_PATTERNS:
         if pat.search(title or ""):
             score += 3.5
             break
 
-    # Palabras tipo "breaking"
     for k in ("breaking", "urgent", "profit warning"):
         if k in t:
             score += 4.0
 
-    # Preferir CNBC un poco
     if "cnbc.com" in (link or "").lower():
         score += 2.5
 
-    # Bonus por frescura (últimas 3h)
     age_minutes = (datetime.now(timezone.utc) - published_utc).total_seconds() / 60.0
     if age_minutes <= 180:
         score += 2.0 * (1.0 - (age_minutes / 180.0))
@@ -221,10 +214,8 @@ def fetch_items():
         except Exception:
             continue
 
-    # Ordenar por score y fecha (desc)
     items.sort(key=lambda x: (x[0], x[1]), reverse=True)
 
-    # Deduplicar por (titulo+dominio) y URL normalizada
     seen_title_dom = set()
     seen_url = set()
     uniq = []
@@ -288,53 +279,24 @@ def build_bullet(
         line += f"\n   {html_escape(d)}"
     return line
 
-# ========= Control de cuándo enviar (sin estado externo) =========
-
-def should_send_automatically(now_local: datetime) -> bool:
-    """
-    - Solo lunes a viernes.
-    - Mañana: hora 11, minutos < 20  (con tu cron: 11:15 sí, 11:30 no).
-    - Noche:  hora 22, minutos < 20  (22:15 sí, 22:30 no).
-    """
-    # Solo días laborables
-    if now_local.weekday() >= 5:  # 5 = sábado, 6 = domingo
-        return False
-
-    h = now_local.hour
-    m = now_local.minute
-
-    if h == 11 and m < 20:
-        return True
-
-    if h == 22 and m < 20:
-        return True
-
-    return False
-
 # ========= Lógica principal =========
 
 def run_news_once(force: bool = False):
     """
     Ejecuta el envío de noticias.
-    - force=False -> solo horarios válidos (L-V, 11:15 y 22:15 aprox, según cron).
-    - force=True  -> ignora horarios y ENVÍA SIEMPRE.
+    - force=False -> el horario lo gobierna main.py
+    - force=True  -> ignora cualquier restricción y envía siempre
     """
-    # Usamos el mismo sistema que main.py: UTC + TZ_OFFSET
     now_local = datetime.utcnow() + timedelta(hours=TZ_OFFSET)
 
     if not force:
-        if not should_send_automatically(now_local):
-            print(f"{now_local} | NEWS | No se envía (fuera de ventana).")
-            return
-        else:
-            print(f"{now_local} | NEWS | Envío automático dentro de ventana válida.")
+        print(f"{now_local} | NEWS | Ejecutado por main.py (sin validación de ventana en news_es.py).")
     else:
         print(f"{now_local} | NEWS | Envío forzado (force=True).")
 
     items = fetch_items()
-    items = items[:MAX_ITEMS]  # Tope final de seguridad (máx 5)
+    items = items[:MAX_ITEMS]
 
-    # Para mostrar la hora al usuario usamos la zona local "real"
     now_for_header = datetime.now(LOCAL_TZ)
     header = f"🗞️ <b>Noticias clave — {fecha_es(now_for_header)}</b>\n\n"
 
