@@ -7,7 +7,10 @@
 # - Agenda agrupada + “detalle humano” (sin repetir CPI 4 veces)
 # - Traducción/adaptación de nombres (no mezcla inglés/español)
 # - Verificación de OPENAI_API_KEY (si falta, fallback digno)
-# - FIX: call_gpt_mini(system_prompt, user_prompt, max_tokens=...)
+# MEJORAS:
+# - FIX: call_gpt_mini(system_prompt, user_prompt, ...)
+# - Traducción "instantánea": reglas + fallback IA para eventos no cubiertos
+# - Caché persistente de traducciones (evita gastar tokens repetidos)
 # =====================================================
 
 import os
@@ -26,6 +29,9 @@ logger.setLevel(logging.INFO)
 
 STATE_FILE = "econ_calendar_state.json"
 DEFAULT_COUNTRY = "United States"
+
+# Caché de traducciones (para no llamar a IA cada día por los mismos nombres)
+TRANSLATION_CACHE_FILE = "econ_translation_cache.json"
 
 
 # ================================
@@ -58,6 +64,27 @@ def _mark_sent(day_key: str):
     st = _load_state()
     st["sent_day"] = day_key
     _save_state(st)
+
+
+# ================================
+# CACHÉ DE TRADUCCIÓN
+# ================================
+def _load_translation_cache() -> Dict[str, str]:
+    if not os.path.exists(TRANSLATION_CACHE_FILE):
+        return {}
+    try:
+        with open(TRANSLATION_CACHE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except:
+        return {}
+
+
+def _save_translation_cache(d: Dict[str, str]):
+    try:
+        with open(TRANSLATION_CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump(d, f, ensure_ascii=False)
+    except:
+        pass
 
 
 # =====================================================
@@ -155,7 +182,7 @@ def _process_events(df: pd.DataFrame) -> List[Dict]:
 
 
 # =====================================================
-# TRADUCCIÓN / ADAPTACIÓN DE NOMBRES (para que no salga inglés)
+# TRADUCCIÓN / ADAPTACIÓN (reglas rápidas)
 # =====================================================
 def _normalize_event_name(name: str) -> str:
     if not isinstance(name, str):
@@ -166,7 +193,7 @@ def _normalize_event_name(name: str) -> str:
 def _translate_event_name(ev_name: str) -> str:
     """
     Traduce/adapta los nombres más comunes a español entendible.
-    No pretende ser perfecto; prioriza claridad para Telegram.
+    Regla rápida; si no hay match, devuelve el original.
     """
     if not isinstance(ev_name, str) or not ev_name.strip():
         return ""
@@ -176,16 +203,15 @@ def _translate_event_name(ev_name: str) -> str:
 
     # Política
     if ("president" in n or "u.s. president" in n) and ("speaks" in n or "speech" in n):
-        # Ej: "U.S. President Trump Speaks"
         if "trump" in n:
             return "El presidente Trump ofrece un discurso"
         return "El presidente de EE. UU. ofrece un discurso"
 
-    # Empleo - claims
+    # Empleo (claims)
     if "initial jobless claims" in n or ("jobless" in n and "claims" in n):
         return "Solicitudes semanales de subsidio por desempleo"
 
-    # Empleo - NFP / paro / salarios (MEJORA)
+    # Empleo (NFP / paro / salarios)
     if "nonfarm payrolls" in n or "non-farm payrolls" in n:
         return "Nóminas no agrícolas (NFP)"
     if "unemployment rate" in n:
@@ -197,17 +223,10 @@ def _translate_event_name(ev_name: str) -> str:
             return "Salario medio por hora (interanual)"
         return "Salario medio por hora"
 
-    # Variantes frecuentes (por si investpy devuelve otras etiquetas)
-    if "payroll" in n and "nonfarm" in n:
-        return "Nóminas no agrícolas (NFP)"
-    if "hourly earnings" in n:
-        return "Salario medio por hora"
-
     # Inflación - CPI
     if "core cpi" in n:
         return "IPC subyacente (sin energía ni alimentos)"
     if "cpi" in n:
-        # Si viene con (MoM)/(YoY), lo simplificamos
         if "mom" in n:
             return "IPC (mensual)"
         if "yoy" in n:
@@ -226,8 +245,72 @@ def _translate_event_name(ev_name: str) -> str:
     if "manufacturing" in n and "index" in n:
         return "Índice manufacturero"
 
-    # Si no sabemos, devolvemos tal cual
     return s
+
+
+def _gpt_translate_event_name(raw: str) -> str:
+    """
+    Traducción IA SOLO si la regla no cubre el evento.
+    Usa caché persistente para evitar llamadas repetidas.
+    """
+    if not isinstance(raw, str) or not raw.strip():
+        return ""
+
+    raw_clean = " ".join(raw.strip().split())
+    key = raw_clean.lower()
+
+    cache = _load_translation_cache()
+    if key in cache and cache[key]:
+        return cache[key]
+
+    api_key = os.getenv("OPENAI_API_KEY", "").strip()
+    if not api_key:
+        return raw_clean
+
+    system_prompt = (
+        "Eres traductor/editor macro. Devuelve SOLO la traducción al español, "
+        "corta y natural para un canal de trading. Sin comillas."
+    )
+    user_prompt = (
+        "Traduce este nombre de evento macro al español claro.\n"
+        "- Mantén siglas útiles (Fed, FOMC, IPC, PCE, NFP, PMI).\n"
+        "- Si es una subasta, dilo como 'Subasta del Tesoro USA (10 años)' etc.\n"
+        "- Si es un discurso, dilo como 'Discurso de X (FOMC)' si aparece el nombre.\n"
+        "- No añadas datos que no estén.\n\n"
+        f"Evento: {raw_clean}"
+    )
+
+    try:
+        out = call_gpt_mini(system_prompt, user_prompt, max_tokens=40).strip()
+    except Exception as e:
+        logger.warning(f"GPT translate falló: {e}")
+        out = ""
+
+    if not out or out.lower() == raw_clean.lower():
+        out = raw_clean
+
+    cache[key] = out
+    _save_translation_cache(cache)
+    return out
+
+
+def _translate_event_name_smart(raw: str) -> str:
+    """
+    Traducción inteligente:
+    - Primero reglas (rápido y consistente)
+    - Si no cambia nada (inglés), fallback IA + caché
+    """
+    if not isinstance(raw, str) or not raw.strip():
+        return ""
+
+    raw_clean = " ".join(raw.strip().split())
+    rule_es = _translate_event_name(raw_clean)
+
+    # Si la regla no cambió el texto, usamos IA para traducir
+    if rule_es.strip().lower() == raw_clean.strip().lower():
+        return _gpt_translate_event_name(raw_clean)
+
+    return rule_es
 
 
 # =====================================================
@@ -247,24 +330,24 @@ def _bucket_event(ev_name: str) -> str:
     # Empleo
     if "jobless" in n or "unemployment" in n or "payroll" in n or "nonfarm" in n:
         return "Empleo"
-    # Salarios ligados a empleo (MEJORA: evita que caiga en 'Otros')
     if "average hourly earnings" in n or ("hourly" in n and "earnings" in n):
         return "Empleo"
 
-    # Actividad / crecimiento
+    # Actividad
     if "philadelphia fed" in n:
         return "Actividad: Fed de Filadelfia"
     if "manufacturing" in n or "ism" in n or "pmi" in n:
         return "Actividad"
 
     # Fed / discursos
-    if "fed" in n and ("speech" in n or "speaks" in n or "chair" in n):
+    if ("speaks" in n or "speech" in n) and ("fed" in n or "fomc" in n or "chair" in n or "member" in n):
         return "Fed: discursos"
 
-    # Política / declaraciones
+    # Política
     if "president" in n and ("speaks" in n or "speech" in n):
         return "Política: declaraciones"
 
+    # (Mantenemos 'Otros' como fallback)
     return "Otros"
 
 
@@ -283,9 +366,7 @@ def _group_agenda(events: List[Dict]) -> List[Dict]:
         dt = ev.get("datetime")
         stars = int(ev.get("stars", 1))
 
-        example_es = _translate_event_name(raw_name)
-        if not example_es:
-            example_es = raw_name
+        example_es = _translate_event_name_smart(raw_name) or raw_name
 
         if bucket not in groups:
             groups[bucket] = {
@@ -324,13 +405,11 @@ def _group_agenda(events: List[Dict]) -> List[Dict]:
 # =====================================================
 # MACRO BRIEF IA (estilo CNBC/Bloomberg) — SIEMPRE EN ESPAÑOL
 # + Verifica OPENAI_API_KEY (si falta → fallback digno)
-# + FIX: call_gpt_mini(system_prompt, user_prompt, ...)
 # =====================================================
 def _make_macro_brief(events: List[Dict]) -> str:
     if not events:
         return ""
 
-    # Si no hay API key, no intentamos IA
     api_key = os.getenv("OPENAI_API_KEY", "").strip()
     if not api_key:
         logger.warning("OPENAI_API_KEY no configurada. Macro Brief irá por fallback.")
@@ -340,7 +419,7 @@ def _make_macro_brief(events: List[Dict]) -> str:
             "si salen más suaves, alivio para el riesgo y para los bonos."
         )
 
-    # Contexto (sin obligar a listar en el brief)
+    # Contexto para IA (pero sin obligar a listar)
     lines = []
     for e in events:
         dt = e.get("datetime")
@@ -348,7 +427,8 @@ def _make_macro_brief(events: List[Dict]) -> str:
         stars = "⭐" * int(e.get("stars", 1))
 
         evn_raw = e.get("event", "")
-        evn_es = _translate_event_name(evn_raw) or evn_raw
+        # Aquí también usamos smart para que la IA lea el contexto ya en español
+        evn_es = _translate_event_name_smart(evn_raw) or evn_raw
 
         fc = e.get("forecast", "")
         pv = e.get("previous", "")
@@ -391,7 +471,7 @@ def _make_macro_brief(events: List[Dict]) -> str:
         logger.warning(f"call_gpt_mini falló: {e}")
         out = ""
 
-    # Si sale accidentalmente en inglés, lo traducimos (sin añadir info)
+    # Si sale accidentalmente en inglés, lo traducimos
     eng_hits = 0
     low = out.lower() if isinstance(out, str) else ""
     for w in ["markets", "ahead", "yields", "dollar", "stocks", "brace", "inflation", "fed", "rates"]:
