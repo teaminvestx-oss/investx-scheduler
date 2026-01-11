@@ -5,7 +5,7 @@ import datetime as dt
 import requests
 import yfinance as yf
 
-from utils import call_gpt_mini  # unificamos llamadas a OpenAI (gpt-4.1-mini)
+from utils import call_gpt_mini  # unificamos OpenAI
 
 
 # ================================
@@ -57,11 +57,10 @@ def _mark_sent_today(today_str: str) -> None:
 # TELEGRAM (con troceo)
 # ================================
 def send_telegram(text: str):
-    if not TELEGRAM_TOKEN or not CHAT_ID:
-        print("[ERROR] Faltan TELEGRAM_TOKEN / CHAT_ID para enviar mensaje.")
+    if not TELELEGRAM_TOKEN_OK():
         return
 
-    max_len = 3900  # margen bajo los 4096 de Telegram
+    max_len = 3900  # margen bajo 4096
     chunks = [text[i:i + max_len] for i in range(0, len(text), max_len)] or [""]
 
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
@@ -78,16 +77,23 @@ def send_telegram(text: str):
             if r.status_code >= 400:
                 print(f"[WARN] Error Telegram HTTP {r.status_code} (chunk {idx}/{len(chunks)}): {r.text}")
         except Exception as e:
-            print(f"[ERROR] Excepción enviando mensaje Telegram (chunk {idx}/{len(chunks)}): {e}")
+            print(f"[ERROR] Excepción enviando Telegram (chunk {idx}/{len(chunks)}): {e}")
+
+
+def TELELEGRAM_TOKEN_OK() -> bool:
+    if not TELEGRAM_TOKEN or not CHAT_ID:
+        print("[ERROR] Faltan TELEGRAM_TOKEN / CHAT_ID para enviar mensaje.")
+        return False
+    return True
 
 
 # ================================
-# CÁLCULO PREMARKET
+# UTILIDADES YFINANCE
 # ================================
 def _get_last_price(t: yf.Ticker) -> float:
     """
-    Intenta obtener último precio con intradía (pre/post).
-    Fallback: interval 5m si 1m está vacío.
+    Último precio intradía (incluye pre/post si existe).
+    Fallback: 5m si 1m está vacío.
     """
     intraday = t.history(period="1d", interval="1m", prepost=True)
     if intraday is None or intraday.empty:
@@ -99,9 +105,25 @@ def _get_last_price(t: yf.Ticker) -> float:
     return float("nan")
 
 
+def _compute_close(daily, is_crypto: bool) -> float:
+    closes = daily["Close"].dropna()
+    if closes.empty:
+        return float("nan")
+
+    if is_crypto:
+        # Cierre fijo del día anterior
+        return float(closes.iloc[-2]) if len(closes) >= 2 else float(closes.iloc[-1])
+
+    # Último cierre disponible para acciones/índices/ETFs/futuros
+    return float(closes.iloc[-1])
+
+
+# ================================
+# CÁLCULO PREMARKET (con fallback de tickers)
+# ================================
 def _get_premarket_data(ticker_map: dict, is_crypto: bool = False):
     """
-    ticker_map: { nombre_mostrar: ticker_yfinance }
+    ticker_map: { nombre_mostrar: ticker OR [ticker1, ticker2, ticker3...] }
 
     Devuelve lista de dicts:
       {
@@ -111,58 +133,57 @@ def _get_premarket_data(ticker_map: dict, is_crypto: bool = False):
         'change_pct': float
       }
 
-    NOTA:
-    - Para CRIPTO: last_close = cierre del día anterior (evita close parcial del día en curso)
-    - Para resto: last_close = último cierre regular disponible
+    Fallback de tickers: usa el primer ticker que devuelva datos válidos.
     """
     results = []
 
-    for name, yf_ticker in ticker_map.items():
-        try:
-            t = yf.Ticker(yf_ticker)
+    for name, yf_tickers in ticker_map.items():
+        if isinstance(yf_tickers, str):
+            yf_tickers = [yf_tickers]
 
-            # Daily para "close"
-            daily = t.history(period="7d", interval="1d", prepost=False)
-            if daily is None or daily.empty:
-                continue
+        best = None
 
-            closes = daily["Close"].dropna()
-            if closes.empty:
-                continue
+        for yf_ticker in yf_tickers:
+            try:
+                t = yf.Ticker(yf_ticker)
 
-            if is_crypto:
-                # Cripto es 24/7: usamos el cierre del día ANTERIOR para tener referencia fija
-                last_close = float(closes.iloc[-2]) if len(closes) >= 2 else float(closes.iloc[-1])
-            else:
-                # Índices/futuros/acciones: último cierre disponible
-                last_close = float(closes.iloc[-1])
+                daily = t.history(period="10d", interval="1d", prepost=False)
+                if daily is None or daily.empty:
+                    continue
 
-            if last_close == 0:
-                continue
+                last_close = _compute_close(daily, is_crypto=is_crypto)
+                if last_close != last_close or last_close == 0:  # NaN o 0
+                    continue
 
-            last_price = _get_last_price(t)
-            if last_price != last_price:  # NaN check
-                last_price = last_close
+                last_price = _get_last_price(t)
+                if last_price != last_price:  # NaN
+                    last_price = last_close
 
-            change_pct = (last_price - last_close) / last_close * 100.0
+                change_pct = (last_price - last_close) / last_close * 100.0
 
-            results.append(
-                {
+                best = {
                     "name": name,
                     "last_price": round(float(last_price), 2),
                     "last_close": round(float(last_close), 2),
                     "change_pct": round(float(change_pct), 2),
                 }
-            )
-        except Exception as e:
-            print(f"[WARN] Error obteniendo datos de {name} ({yf_ticker}): {e}")
-            continue
+                break  # ✅ si funciona, paramos
+
+            except Exception as e:
+                print(f"[WARN] Error {name} ({yf_ticker}): {e}")
+                continue
+
+        if best:
+            results.append(best)
 
     return results
 
 
 def get_crypto_changes():
-    cryptos = {"BTC": "BTC-USD", "ETH": "ETH-USD"}
+    cryptos = {
+        "BTC": "BTC-USD",
+        "ETH": "ETH-USD",
+    }
     return _get_premarket_data(cryptos, is_crypto=True)
 
 
@@ -170,9 +191,6 @@ def get_crypto_changes():
 # FORMATEO CON COLORES Y FLECHAS
 # ================================
 def style_change(change_pct: float):
-    """
-    Devuelve (icono, flecha) según si sube, baja o está plano.
-    """
     if change_pct > 0.3:
         return "🟢", "↑"
     elif change_pct < -0.3:
@@ -182,11 +200,6 @@ def style_change(change_pct: float):
 
 
 def format_premarket_lines(indices, megacaps, sectors, cryptos):
-    """
-    Devuelve:
-    - texto formateado para Telegram (HTML)
-    - texto plano para interpretación
-    """
     display_lines = []
     plain_lines = []
 
@@ -209,41 +222,36 @@ def format_premarket_lines(indices, megacaps, sectors, cryptos):
     add_block("🏦 <b>Otros sectores clave</b>", sectors)
     add_block("💰 <b>Criptomonedas</b>", cryptos)
 
-    display_text = "\n".join(display_lines).strip()
-    plain_text = "\n".join(plain_lines).strip()
-    return display_text, plain_text
+    return "\n".join(display_lines).strip(), "\n".join(plain_lines).strip()
 
 
 # ================================
-# INTERPRETACIÓN DEL DÍA (OpenAI unificado)
+# INTERPRETACIÓN DEL DÍA (IA unificada)
 # ================================
 def interpret_premarket(plain_text: str) -> str:
-    """
-    Comentario breve (2–4 frases) en español institucional.
-    Si falla OpenAI o no hay key, devuelve "".
-    """
     if not plain_text:
         return ""
 
     system_prompt = (
-        "Eres un analista de mercados. Escribes en español, claro y neutro, para un canal de trading.\n"
-        "No menciones IA, modelos ni 'ChatGPT'.\n"
+        "Eres un analista de mercados. Escribes en español claro, neutral e institucional para un canal de trading.\n"
+        "No menciones IA ni modelos.\n"
         "Requisitos:\n"
-        "- 2–4 frases cortas.\n"
-        "- Explica el tono general (alcista/bajista/mixto).\n"
-        "- Di si la tecnología lidera o no.\n"
-        "- Di si BTC/ETH acompañan o divergen.\n"
+        "- 4–6 frases cortas.\n"
+        "- Explica el tono general (alcista/bajista/mixto) y por qué.\n"
+        "- Menciona si tecnología lidera o no.\n"
+        "- Indica si BTC/ETH acompañan o divergen.\n"
+        "- Si casi todo se mueve <0.3%, di que el arranque es plano/mixto.\n"
         "- Termina con 'En resumen, ...'."
     )
 
     user_prompt = (
-        "Movimientos aproximados del premarket (precio actual y cambio vs cierre previo):\n\n"
+        "Movimientos del premarket (precio actual y cambio vs cierre previo):\n\n"
         f"{plain_text}\n\n"
         "Redacta el comentario siguiendo estrictamente los requisitos."
     )
 
     try:
-        return (call_gpt_mini(system_prompt, user_prompt, max_tokens=180) or "").strip()
+        return (call_gpt_mini(system_prompt, user_prompt, max_tokens=260) or "").strip()
     except Exception:
         return ""
 
@@ -252,7 +260,6 @@ def interpret_premarket(plain_text: str) -> str:
 # FUNCIÓN PRINCIPAL: BUENOS DÍAS
 # ================================
 def run_premarket_morning(force: bool = False):
-    # Fecha "Madrid" consistente con main.py
     now_local = dt.datetime.utcnow() + dt.timedelta(hours=TZ_OFFSET)
     today = now_local.date()
     today_str = today.isoformat()
@@ -262,24 +269,24 @@ def run_premarket_morning(force: bool = False):
         print("[INFO] Es fin de semana, no se envía 'Buenos días'.")
         return
 
-    # Control "solo una vez al día" si no es forzado
+    # Solo 1 vez al día si no es force
     if not force and _already_sent_today(today_str):
         print("[INFO] Premarket ya enviado hoy, no se repite (force=False).")
         return
 
     # ====================================================
-    # ÍNDICES / FUTUROS (premarket real)
+    # ÍNDICES / FUTUROS con fallback (garantiza SP500)
     # ====================================================
     indices_map = {
-        "S&P 500 (ES)": "ES=F",
-        "Nasdaq 100 (NQ)": "NQ=F",
-        "Russell 2000 (RTY)": "RTY=F",
+        "S&P 500": ["ES=F", "^GSPC", "SPY"],
+        "Nasdaq 100": ["NQ=F", "^NDX", "QQQ"],
+        "Russell 2000": ["RTY=F", "^RUT", "IWM"],
         # opcional:
-        # "Dow (YM)": "YM=F",
+        # "Dow": ["YM=F", "^DJI", "DIA"],
     }
     indices = _get_premarket_data(indices_map, is_crypto=False)
 
-    # Mega-caps
+    # Mega-caps USA
     mega_map = {
         "AAPL": "AAPL",
         "MSFT": "MSFT",
@@ -291,7 +298,7 @@ def run_premarket_morning(force: bool = False):
     }
     megacaps = _get_premarket_data(mega_map, is_crypto=False)
 
-    # Otros sectores
+    # Otros sectores clave
     sectors_map = {
         "JPM": "JPM",
         "XOM": "XOM",
