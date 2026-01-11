@@ -7,6 +7,7 @@
 # - Agenda agrupada + “detalle humano” (sin repetir CPI 4 veces)
 # - Traducción/adaptación de nombres (no mezcla inglés/español)
 # - Verificación de OPENAI_API_KEY (si falta, fallback digno)
+# - FIX: call_gpt_mini(system_prompt, user_prompt, max_tokens=...)
 # =====================================================
 
 import os
@@ -180,9 +181,27 @@ def _translate_event_name(ev_name: str) -> str:
             return "El presidente Trump ofrece un discurso"
         return "El presidente de EE. UU. ofrece un discurso"
 
-    # Empleo
+    # Empleo - claims
     if "initial jobless claims" in n or ("jobless" in n and "claims" in n):
         return "Solicitudes semanales de subsidio por desempleo"
+
+    # Empleo - NFP / paro / salarios (MEJORA)
+    if "nonfarm payrolls" in n or "non-farm payrolls" in n:
+        return "Nóminas no agrícolas (NFP)"
+    if "unemployment rate" in n:
+        return "Tasa de desempleo"
+    if "average hourly earnings" in n:
+        if "mom" in n:
+            return "Salario medio por hora (mensual)"
+        if "yoy" in n:
+            return "Salario medio por hora (interanual)"
+        return "Salario medio por hora"
+
+    # Variantes frecuentes (por si investpy devuelve otras etiquetas)
+    if "payroll" in n and "nonfarm" in n:
+        return "Nóminas no agrícolas (NFP)"
+    if "hourly earnings" in n:
+        return "Salario medio por hora"
 
     # Inflación - CPI
     if "core cpi" in n:
@@ -207,7 +226,7 @@ def _translate_event_name(ev_name: str) -> str:
     if "manufacturing" in n and "index" in n:
         return "Índice manufacturero"
 
-    # Si no sabemos, devolvemos tal cual (pero intentaremos no mostrarlo como “clave”)
+    # Si no sabemos, devolvemos tal cual
     return s
 
 
@@ -227,6 +246,9 @@ def _bucket_event(ev_name: str) -> str:
 
     # Empleo
     if "jobless" in n or "unemployment" in n or "payroll" in n or "nonfarm" in n:
+        return "Empleo"
+    # Salarios ligados a empleo (MEJORA: evita que caiga en 'Otros')
+    if "average hourly earnings" in n or ("hourly" in n and "earnings" in n):
         return "Empleo"
 
     # Actividad / crecimiento
@@ -302,12 +324,13 @@ def _group_agenda(events: List[Dict]) -> List[Dict]:
 # =====================================================
 # MACRO BRIEF IA (estilo CNBC/Bloomberg) — SIEMPRE EN ESPAÑOL
 # + Verifica OPENAI_API_KEY (si falta → fallback digno)
+# + FIX: call_gpt_mini(system_prompt, user_prompt, ...)
 # =====================================================
 def _make_macro_brief(events: List[Dict]) -> str:
     if not events:
         return ""
 
-    # Si no hay API key, no intentamos IA (evita “robot” por fallo silencioso)
+    # Si no hay API key, no intentamos IA
     api_key = os.getenv("OPENAI_API_KEY", "").strip()
     if not api_key:
         logger.warning("OPENAI_API_KEY no configurada. Macro Brief irá por fallback.")
@@ -317,7 +340,7 @@ def _make_macro_brief(events: List[Dict]) -> str:
             "si salen más suaves, alivio para el riesgo y para los bonos."
         )
 
-    # Damos a la IA más contexto, pero sin forzar a listar: hora + nombres + (forecast/previous si existe)
+    # Contexto (sin obligar a listar en el brief)
     lines = []
     for e in events:
         dt = e.get("datetime")
@@ -341,9 +364,13 @@ def _make_macro_brief(events: List[Dict]) -> str:
 
     event_block = "\n".join(lines)
 
-    prompt = (
+    system_prompt = (
         "Eres analista macro senior en un desk institucional (estilo Bloomberg/CNBC) "
-        "y escribes para un canal de Telegram en español.\n\n"
+        "y escribes para un canal de Telegram en español. "
+        "Tono humano, directo y con criterio; cero relleno."
+    )
+
+    user_prompt = (
         "Redacta un 'Macro Brief' con personalidad (no robótico), en 2 a 4 frases.\n"
         "Objetivo: que se entienda rápido qué puede mover hoy el mercado.\n\n"
         "Reglas:\n"
@@ -359,7 +386,7 @@ def _make_macro_brief(events: List[Dict]) -> str:
     )
 
     try:
-        out = call_gpt_mini(prompt, max_tokens=200).strip()
+        out = call_gpt_mini(system_prompt, user_prompt, max_tokens=200).strip()
     except Exception as e:
         logger.warning(f"call_gpt_mini falló: {e}")
         out = ""
@@ -373,8 +400,9 @@ def _make_macro_brief(events: List[Dict]) -> str:
 
     if out and eng_hits >= 3:
         try:
-            tr_prompt = "Traduce al español claro (máx 4 frases), sin añadir información:\n" + out
-            out = call_gpt_mini(tr_prompt, max_tokens=240).strip()
+            tr_system = "Eres un editor senior. Traduce y adapta al español claro sin añadir información."
+            tr_user = "Traduce al español claro (máx 4 frases), sin añadir información:\n" + out
+            out = call_gpt_mini(tr_system, tr_user, max_tokens=240).strip()
         except Exception as e:
             logger.warning(f"Traducción falló: {e}")
 
@@ -420,7 +448,6 @@ def _build_message(events: List[Dict], date_ref: datetime) -> str:
         stars = "⭐" * int(a.get("stars", 1))
         label = a.get("label", "")
 
-        # Limpieza: evita líneas vacías raras
         item = f"{stars} {hr} — {label}".strip()
         lines.append(item)
 
