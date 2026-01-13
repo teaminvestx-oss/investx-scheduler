@@ -56,6 +56,13 @@ def _mark_sent_today(today_str: str) -> None:
 # ================================
 # TELEGRAM (con troceo)
 # ================================
+def TELELEGRAM_TOKEN_OK() -> bool:
+    if not TELEGRAM_TOKEN or not CHAT_ID:
+        print("[ERROR] Faltan TELEGRAM_TOKEN / CHAT_ID para enviar mensaje.")
+        return False
+    return True
+
+
 def send_telegram(text: str):
     if not TELELEGRAM_TOKEN_OK():
         return
@@ -80,13 +87,6 @@ def send_telegram(text: str):
             print(f"[ERROR] Excepción enviando Telegram (chunk {idx}/{len(chunks)}): {e}")
 
 
-def TELELEGRAM_TOKEN_OK() -> bool:
-    if not TELEGRAM_TOKEN or not CHAT_ID:
-        print("[ERROR] Faltan TELEGRAM_TOKEN / CHAT_ID para enviar mensaje.")
-        return False
-    return True
-
-
 # ================================
 # UTILIDADES YFINANCE
 # ================================
@@ -106,15 +106,27 @@ def _get_last_price(t: yf.Ticker) -> float:
 
 
 def _compute_close(daily, is_crypto: bool) -> float:
+    """
+    Cierre de referencia:
+    - Cripto: cierre del día anterior (para variabilidad real)
+    - No cripto: si el último daily es "hoy" (parcial), usar el de "ayer"
+    """
     closes = daily["Close"].dropna()
     if closes.empty:
         return float("nan")
 
     if is_crypto:
-        # Cierre fijo del día anterior
         return float(closes.iloc[-2]) if len(closes) >= 2 else float(closes.iloc[-1])
 
-    # Último cierre disponible para acciones/índices/ETFs/futuros
+    # Evitar que el "close" sea el de HOY (parcial) y te deje en 0.00%
+    try:
+        last_day = closes.index[-1].date()
+        today_utc = dt.datetime.utcnow().date()
+        if last_day == today_utc and len(closes) >= 2:
+            return float(closes.iloc[-2])
+    except Exception:
+        pass
+
     return float(closes.iloc[-1])
 
 
@@ -275,14 +287,15 @@ def run_premarket_morning(force: bool = False):
         return
 
     # ====================================================
-    # ÍNDICES / FUTUROS con fallback (garantiza SP500)
+    # ÍNDICES / FUTUROS (FUTUROS -> ETF -> ÍNDICE CASH)
+    # Esto evita 0.00% por caer en ^GSPC/^NDX/^RUT (sin premarket)
     # ====================================================
     indices_map = {
-        "S&P 500": ["ES=F", "^GSPC", "SPY"],
-        "Nasdaq 100": ["NQ=F", "^NDX", "QQQ"],
-        "Russell 2000": ["RTY=F", "^RUT", "IWM"],
+        "S&P 500": ["ES=F", "SPY", "^GSPC"],
+        "Nasdaq 100": ["NQ=F", "QQQ", "^NDX"],
+        "Russell 2000": ["RTY=F", "IWM", "^RUT"],
         # opcional:
-        # "Dow": ["YM=F", "^DJI", "DIA"],
+        # "Dow": ["YM=F", "DIA", "^DJI"],
     }
     indices = _get_premarket_data(indices_map, is_crypto=False)
 
