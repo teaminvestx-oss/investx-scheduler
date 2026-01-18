@@ -8,3 +8,4 @@ pandas
 numpy
 openai
 investpy
+pandas-market-calendars
