@@ -7,17 +7,20 @@
 # - Agenda agrupada + “detalle humano” (sin repetir CPI 4 veces)
 # - Traducción/adaptación de nombres (no mezcla inglés/español)
 # - Verificación de OPENAI_API_KEY (si falta, fallback digno)
-# MEJORAS:
-# - FIX: call_gpt_mini(system_prompt, user_prompt, ...)
-# - Traducción "instantánea": reglas + fallback IA para eventos no cubiertos
-# - Caché persistente de traducciones (evita gastar tokens repetidos)
+# ROBUSTEZ NUEVA (INVESTPY):
+# - Reintentos con backoff (por vacíos/bloqueos intermitentes)
+# - No decir "no hay datos" si la fuente falla: mensaje "fuente no disponible"
+# - No tirar eventos por horas raras (All Day/Tentative/--:--) -> 00:00
+# - Filtro de importancia más tolerante + fallback si cambia el formato
 # =====================================================
 
 import os
 import json
 import logging
+import time as _time
+import random as _random
 from datetime import datetime, timedelta, time
-from typing import List, Dict
+from typing import List, Dict, Tuple, Optional
 
 import pandas as pd
 import investpy
@@ -88,26 +91,71 @@ def _save_translation_cache(d: Dict[str, str]):
 
 
 # =====================================================
-# REQUEST SAFE A INVESTPY (arregla error rango)
+# HELPERS: parsing hora + status fuente
 # =====================================================
-def _safe_request(country, start: datetime, end: datetime):
+def _clean_time(s: str) -> str:
+    """
+    investpy a veces devuelve time como 'All Day', 'Tentative', '--:--', vacío...
+    Para no perder el evento, lo normalizamos a '00:00'.
+    """
+    if s is None:
+        return "00:00"
+    x = str(s).strip()
+    low = x.lower()
+    if low in ["", "all day", "tentative", "tbd", "--:--", "na", "n/a", "null"]:
+        return "00:00"
+    # algunas veces viene "All Day " con espacios o similar
+    if "all day" in low or "tentative" in low:
+        return "00:00"
+    return x
+
+
+def _source_unavailable_message(date_ref: datetime) -> str:
+    fecha = date_ref.strftime("%a %d/%m").replace(".", "")
+    return (
+        f"📅 Calendario económico — {fecha}\n\n"
+        "⚠️ Hoy no puedo obtener el calendario macro (fuente sin respuesta o bloqueada).\n"
+        "En cuanto vuelva la conexión, lo publico con normalidad."
+    )
+
+
+# =====================================================
+# REQUEST SAFE A INVESTPY (arregla error rango + robustez)
+# =====================================================
+def _safe_request(country, start: datetime, end: datetime) -> pd.DataFrame:
     if end <= start:
         end = start + timedelta(days=1)
 
     f = start.strftime("%d/%m/%Y")
     t = end.strftime("%d/%m/%Y")
 
-    try:
-        df = investpy.economic_calendar(
-            from_date=f,
-            to_date=t,
-            countries=[country]
-        )
-    except Exception as e:
-        logger.error(f"Error investpy: {e}")
-        return pd.DataFrame()
+    df: Optional[pd.DataFrame] = None
+    last_err: Optional[Exception] = None
+
+    # 3 intentos (vacíos/bloqueos intermitentes)
+    for attempt in range(3):
+        try:
+            df = investpy.economic_calendar(
+                from_date=f,
+                to_date=t,
+                countries=[country]
+            )
+            if df is None:
+                df = pd.DataFrame()
+
+            # Si viene vacío, reintenta (muchas veces es intermitente)
+            if not df.empty:
+                break
+        except Exception as e:
+            last_err = e
+            logger.error(f"Error investpy (attempt {attempt+1}/3): {e}")
+
+        # backoff suave
+        _time.sleep(0.8 + _random.random() * 0.8)
 
     if df is None or df.empty:
+        if last_err:
+            logger.error(f"investpy vacío tras reintentos: {last_err}")
         return pd.DataFrame()
 
     # Normalizamos columnas
@@ -115,23 +163,40 @@ def _safe_request(country, start: datetime, end: datetime):
         if col not in df.columns:
             df[col] = ""
 
-    df["datetime"] = pd.to_datetime(df["date"] + " " + df["time"], errors="coerce")
+    # Limpiamos hora para no perder eventos
+    df["time"] = df["time"].astype(str).apply(_clean_time)
+
+    # Parse datetime
+    df["datetime"] = pd.to_datetime(
+        df["date"].astype(str) + " " + df["time"].astype(str),
+        errors="coerce"
+    )
+
+    # Quitamos solo lo realmente roto
     df = df.dropna(subset=["datetime"]).sort_values("datetime")
 
     return df
 
 
 # =====================================================
-# IMPORTANCIA → ESTRELLAS
+# IMPORTANCIA → ESTRELLAS (más tolerante)
 # =====================================================
 def _stars(imp: str) -> int:
-    if not isinstance(imp, str):
+    if imp is None:
         return 1
-    imp = imp.lower()
-    if "high" in imp or "3" in imp:
+
+    s = str(imp).strip().lower()
+
+    # formatos típicos
+    if "high" in s or "3" in s or "★★★" in s or "bull3" in s:
         return 3
-    if "medium" in imp or "2" in imp:
+    if "medium" in s or "2" in s or "★★" in s or "bull2" in s:
         return 2
+
+    # si llega algo raro/no vacío, preferimos no perder el día por cambios de formato
+    if s and s not in ["low", "1", "★", "bull1"]:
+        return 2
+
     return 1
 
 
@@ -148,7 +213,7 @@ def _is_holiday(df: pd.DataFrame) -> bool:
 
 
 # =====================================================
-# FILTRADO PRINCIPAL
+# FILTRADO PRINCIPAL (con fallback si el filtro mata todo)
 # =====================================================
 def _process_events(df: pd.DataFrame) -> List[Dict]:
     if df.empty:
@@ -158,24 +223,28 @@ def _process_events(df: pd.DataFrame) -> List[Dict]:
     df["stars"] = df["importance"].apply(_stars)
 
     # Solo 2 y 3 estrellas
-    df = df[df["stars"] >= 2]
-    if df.empty:
-        return []
+    df2 = df[df["stars"] >= 2].copy()
+
+    # Fallback: si había eventos pero ninguno pasó el filtro, no publiques "no hay datos"
+    if df2.empty and not df.empty:
+        df2 = df.copy()
+        # elevamos el mínimo a 2 para mantener coherencia del canal
+        df2["stars"] = df2["stars"].clip(lower=2)
 
     # Reducimos a máximo 6 eventos
-    df = df.sort_values(["stars", "datetime"], ascending=[False, True]).head(6)
-    df = df.sort_values("datetime")
+    df2 = df2.sort_values(["stars", "datetime"], ascending=[False, True]).head(6)
+    df2 = df2.sort_values("datetime")
 
     events = []
-    for _, r in df.iterrows():
+    for _, r in df2.iterrows():
         events.append(
             {
                 "datetime": r["datetime"],
                 "event": r["event"],
                 "stars": int(r["stars"]),
-                "actual": r["actual"] or "",
-                "forecast": r["forecast"] or "",
-                "previous": r["previous"] or "",
+                "actual": r.get("actual", "") or "",
+                "forecast": r.get("forecast", "") or "",
+                "previous": r.get("previous", "") or "",
             }
         )
     return events
@@ -347,7 +416,6 @@ def _bucket_event(ev_name: str) -> str:
     if "president" in n and ("speaks" in n or "speech" in n):
         return "Política: declaraciones"
 
-    # (Mantenemos 'Otros' como fallback)
     return "Otros"
 
 
@@ -419,7 +487,6 @@ def _make_macro_brief(events: List[Dict]) -> str:
             "si salen más suaves, alivio para el riesgo y para los bonos."
         )
 
-    # Contexto para IA (pero sin obligar a listar)
     lines = []
     for e in events:
         dt = e.get("datetime")
@@ -427,7 +494,6 @@ def _make_macro_brief(events: List[Dict]) -> str:
         stars = "⭐" * int(e.get("stars", 1))
 
         evn_raw = e.get("event", "")
-        # Aquí también usamos smart para que la IA lea el contexto ya en español
         evn_es = _translate_event_name_smart(evn_raw) or evn_raw
 
         fc = e.get("forecast", "")
@@ -499,7 +565,7 @@ def _make_macro_brief(events: List[Dict]) -> str:
 # =====================================================
 # CREAR MENSAJE FINAL (Macro Brief arriba + agenda agrupada y entendible)
 # =====================================================
-def _build_message(events: List[Dict], date_ref: datetime) -> str:
+def _build_message(events, date_ref: datetime) -> str:
     fecha = date_ref.strftime("%a %d/%m").replace(".", "")
 
     # Caso: festividad
@@ -510,7 +576,7 @@ def _build_message(events: List[Dict], date_ref: datetime) -> str:
             f"No hay referencias macroeconómicas relevantes."
         )
 
-    # Caso: no eventos
+    # Caso: no eventos (reales)
     if not events:
         return (
             f"📅 Calendario económico — {fecha}\n\n"
@@ -558,8 +624,16 @@ def run_econ_calendar(force: bool = False, force_tomorrow: bool = False):
         end = start + timedelta(days=1)
         title_date = now
 
-    # Descarga
+    # Descarga (investpy robusto)
     df = _safe_request(DEFAULT_COUNTRY, start, end)
+
+    # Si la fuente falla/vacía -> NO digas "no hay datos"
+    if df.empty:
+        msg = _source_unavailable_message(title_date)
+        send_telegram_message(msg)
+        if not force and not force_tomorrow:
+            _mark_sent(day_key)
+        return
 
     # Detectar festividad
     if _is_holiday(df):
