@@ -1,6 +1,6 @@
 # =====================================================
 # econ_calendar.py — InvestX v4.2 (Macro Brief PRO + Español total)
-# Fuente: investpy (igual)
+# Fuente: FINNHUB (sustituye investpy por bloqueos)
 # Lógica: 1 envío/día (igual) + festivos (igual) + filtro 2-3⭐ (igual) + máx 6 (igual)
 # NUEVO:
 # - Macro Brief IA estilo CNBC/Bloomberg SIEMPRE en español
@@ -14,7 +14,7 @@
 #
 # FIX MÍNIMO PARA QUE DEVUELVA DATOS:
 # - Timezone Europe/Madrid (evita desfase UTC que te pedía domingo cuando era lunes)
-# - _safe_request robusto: reintentos + limpiar time (All Day/Tentative) + logs
+# - _safe_request robusto: reintentos + logs
 # =====================================================
 
 import os
@@ -27,7 +27,7 @@ from typing import List, Dict
 from zoneinfo import ZoneInfo
 
 import pandas as pd
-import investpy
+import requests
 
 from utils import send_telegram_message, call_gpt_mini
 
@@ -98,71 +98,90 @@ def _save_translation_cache(d: Dict[str, str]):
 
 
 # =====================================================
-# REQUEST SAFE A INVESTPY (arregla error rango + evita vacíos silenciosos)
+# REQUEST SAFE A FINNHUB (sustituye investpy bloqueado)
+# Devuelve DF compatible con tu pipeline: date/time/event/importance/actual/forecast/previous/datetime
 # =====================================================
 def _safe_request(country, start: datetime, end: datetime):
+    api_key = os.getenv("FINNHUB_API_KEY", "").strip()
+    if not api_key:
+        logger.error("[econ] FINNHUB_API_KEY no configurada")
+        return pd.DataFrame()
+
     if end <= start:
         end = start + timedelta(days=1)
 
-    f = start.strftime("%d/%m/%Y")
-    t = end.strftime("%d/%m/%Y")
+    # Finnhub usa rango por fecha ISO
+    f = start.strftime("%Y-%m-%d")
+    t = end.strftime("%Y-%m-%d")
+
+    url = "https://finnhub.io/api/v1/calendar/economic"
+    params = {"from": f, "to": t, "token": api_key}
 
     df = None
     last_err = None
 
-    logger.info(f"[econ] investpy request country={country} from={f} to={t}")
+    logger.info(f"[econ] finnhub request country={country} from={f} to={t}")
 
-    # 3 intentos: investpy a veces devuelve vacío intermitente (o capado en datacenter)
+    # 3 intentos: por robustez (timeouts / rate / fallos puntuales)
     for attempt in range(3):
         try:
-            df = investpy.economic_calendar(
-                from_date=f,
-                to_date=t,
-                countries=[country]
-            )
+            r = requests.get(url, params=params, timeout=12)
+            r.raise_for_status()
+            data = r.json()
+
+            items = data.get("economicCalendar", []) or []
+            logger.info(f"[econ] attempt {attempt+1}/3 -> items={len(items)}")
+
+            rows = []
+            for ev in items:
+                ts = ev.get("time")
+                if not ts:
+                    continue
+
+                # Finnhub devuelve epoch (segundos). Convertimos a TZ Madrid
+                dt = datetime.fromtimestamp(int(ts), TZ)
+
+                rows.append(
+                    {
+                        "date": dt.strftime("%d/%m/%Y"),
+                        "time": dt.strftime("%H:%M"),
+                        "event": ev.get("event", "") or "",
+                        "importance": ev.get("impact", "") or "",  # low/medium/high
+                        "actual": ev.get("actual", "") or "",
+                        "forecast": ev.get("forecast", "") or "",
+                        "previous": ev.get("previous", "") or "",
+                        "datetime": dt,
+                    }
+                )
+
+            df = pd.DataFrame(rows)
             if df is None:
                 df = pd.DataFrame()
 
-            logger.info(f"[econ] attempt {attempt+1}/3 -> rows={len(df)} cols={list(df.columns)[:8]}")
-
             if not df.empty:
+                df = df.sort_values("datetime")
+                logger.info(
+                    f"[econ] after parse -> rows={len(df)} sample_event={df.iloc[0]['event'] if len(df) else 'n/a'}"
+                )
                 break
 
         except Exception as e:
             last_err = e
-            logger.error(f"[econ] investpy exception attempt {attempt+1}/3: {e}")
+            logger.error(f"[econ] finnhub exception attempt {attempt+1}/3: {e}")
 
         _time.sleep(0.8 + _random.random() * 0.8)
 
     if df is None or df.empty:
         if last_err:
-            logger.error(f"[econ] investpy returned EMPTY after retries (with error): {last_err}")
+            logger.error(f"[econ] finnhub returned EMPTY after retries (with error): {last_err}")
         else:
-            logger.warning("[econ] investpy returned EMPTY after retries (NO exception). Possible block/change/no events.")
+            logger.warning("[econ] finnhub returned EMPTY after retries (NO exception). Possible no events.")
         return pd.DataFrame()
 
-    # Normalizamos columnas
-    for col in ["date", "time", "event", "importance", "actual", "forecast", "previous"]:
+    # Normalizamos columnas por si falta alguna
+    for col in ["date", "time", "event", "importance", "actual", "forecast", "previous", "datetime"]:
         if col not in df.columns:
             df[col] = ""
-
-    # FIX CRÍTICO: investpy a veces trae time = 'All Day', 'Tentative', '--:--' o vacío.
-    # Eso rompe el pd.to_datetime(..., errors="coerce") y luego dropna se carga todo.
-    def _clean_time(x):
-        s = str(x).strip()
-        low = s.lower()
-        if low in ["", "all day", "tentative", "tbd", "--:--", "na", "n/a", "null"]:
-            return "00:00"
-        if "all day" in low or "tentative" in low:
-            return "00:00"
-        return s
-
-    df["time"] = df["time"].apply(_clean_time)
-
-    df["datetime"] = pd.to_datetime(df["date"].astype(str) + " " + df["time"].astype(str), errors="coerce")
-    df = df.dropna(subset=["datetime"]).sort_values("datetime")
-
-    logger.info(f"[econ] after parse -> rows={len(df)} sample_event={df.iloc[0]['event'] if len(df) else 'n/a'}")
 
     return df
 
@@ -419,7 +438,7 @@ def _group_agenda(events: List[Dict]) -> List[Dict]:
                 "datetime": dt,
                 "stars": stars,
                 "label": bucket,
-                "examples": [example_es] if example_es else []
+                "examples": [example_es] if example_es else [],
             }
         else:
             # Hora: la más temprana
@@ -438,11 +457,7 @@ def _group_agenda(events: List[Dict]) -> List[Dict]:
         suffix = ""
         if ex:
             suffix = ": " + " / ".join(ex)
-        out.append({
-            "datetime": g["datetime"],
-            "stars": g["stars"],
-            "label": g["label"] + suffix
-        })
+        out.append({"datetime": g["datetime"], "stars": g["stars"], "label": g["label"] + suffix})
 
     out.sort(key=lambda x: x["datetime"] or datetime.max)
     return out
@@ -595,15 +610,15 @@ def run_econ_calendar(force: bool = False, force_tomorrow: bool = False):
 
     # Rangos
     if force_tomorrow:
-        start = datetime.combine(now.date() + timedelta(days=1), time.min)
+        start = datetime.combine(now.date() + timedelta(days=1), time.min, tzinfo=TZ)
         end = start + timedelta(days=1)
         title_date = start
     else:
-        start = datetime.combine(now.date(), time.min)
+        start = datetime.combine(now.date(), time.min, tzinfo=TZ)
         end = start + timedelta(days=1)
         title_date = now
 
-    # Descarga
+    # Descarga (Finnhub)
     df = _safe_request(DEFAULT_COUNTRY, start, end)
 
     # Detectar festividad
