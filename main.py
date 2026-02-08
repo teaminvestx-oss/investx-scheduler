@@ -17,7 +17,7 @@ import os
 import json
 from datetime import datetime, timedelta
 
-import pkg_resources  # lo usa investpy por debajo, NO BORRAR
+#import pkg_resources  # lo usa investpy por debajo, NO BORRAR
 
 from zoneinfo import ZoneInfo
 from us_market_calendar import is_nyse_trading_day  # NUEVO helper
