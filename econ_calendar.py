@@ -1,13 +1,19 @@
 # =====================================================
 # econ_calendar.py — InvestX v4.2 (Macro Brief PRO + Español total)
-# Fuente: investpy (Investing.com) — SCRAPING (puede fallar por bloqueos)
+# Fuente: CME Economic Releases Calendar (web pública) ✅
+# URL: https://www.cmegroup.com/education/events/economic-releases-calendar.html
 #
-# Objetivo: 1 envío/día + festivos + filtro 2-3⭐ + máx 6
-# Robustez:
+# Lógica (igual):
+# - 1 envío/día + festivos
+# - filtro 2-3⭐ + máx 6
+# - Macro Brief IA SIEMPRE en español (fallback si falta OPENAI_API_KEY)
+# - Agenda agrupada + “detalle humano”
+# - Traducción/adaptación de nombres + caché persistente
 # - Timezone Europe/Madrid
-# - _safe_request con reintentos + limpieza de time
-# - Caché diaria: si hoy Investing bloquea, usamos el último resultado guardado
-# - Si no hay datos y no hay caché: se avisa (NO se miente con “no hay macro”)
+# Robustez:
+# - Scrape estable (pd.read_html) + reintentos
+# - Caché diaria: si CME cae, se usa el último resultado guardado
+# - Si no hay datos y no hay caché: se avisa (NO se miente)
 # =====================================================
 
 import os
@@ -15,12 +21,13 @@ import json
 import logging
 import time as _time
 import random as _random
+import re
 from datetime import datetime, timedelta, time
 from typing import List, Dict
 from zoneinfo import ZoneInfo
 
 import pandas as pd
-import investpy
+import requests
 
 from utils import send_telegram_message, call_gpt_mini
 
@@ -28,13 +35,12 @@ logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
 STATE_FILE = "econ_calendar_state.json"
-DEFAULT_COUNTRY = "United States"
 TZ = ZoneInfo("Europe/Madrid")
 
 TRANSLATION_CACHE_FILE = "econ_translation_cache.json"
-
-# Caché diaria de eventos (para aguantar bloqueos de Investing)
 DAILY_CACHE_DIR = "econ_daily_cache"
+
+CME_URL = "https://www.cmegroup.com/education/events/economic-releases-calendar.html"
 
 
 # ================================
@@ -49,7 +55,6 @@ def _load_state():
     except:
         return {}
 
-
 def _save_state(d):
     try:
         with open(STATE_FILE, "w", encoding="utf-8") as f:
@@ -57,11 +62,9 @@ def _save_state(d):
     except:
         pass
 
-
 def _already_sent(day_key: str) -> bool:
     st = _load_state()
     return st.get("sent_day") == day_key
-
 
 def _mark_sent(day_key: str):
     st = _load_state()
@@ -81,7 +84,6 @@ def _load_translation_cache() -> Dict[str, str]:
     except:
         return {}
 
-
 def _save_translation_cache(d: Dict[str, str]):
     try:
         with open(TRANSLATION_CACHE_FILE, "w", encoding="utf-8") as f:
@@ -91,7 +93,7 @@ def _save_translation_cache(d: Dict[str, str]):
 
 
 # ================================
-# CACHÉ DIARIA (RAW EVENTS)
+# CACHÉ DIARIA (RAW)
 # ================================
 def _cache_path(day_key: str) -> str:
     if not os.path.exists(DAILY_CACHE_DIR):
@@ -101,21 +103,15 @@ def _cache_path(day_key: str) -> str:
             pass
     return os.path.join(DAILY_CACHE_DIR, f"econ_{day_key}.json")
 
-
 def _save_daily_cache(day_key: str, df: pd.DataFrame):
     try:
         p = _cache_path(day_key)
-        # guardamos solo columnas relevantes
         cols = [c for c in ["date", "time", "event", "importance", "actual", "forecast", "previous"] if c in df.columns]
-        out = df[cols].copy()
-
-        # datetime no lo guardamos (lo recomputamos)
-        out = out.fillna("")
+        out = df[cols].copy().fillna("")
         out.to_json(p, orient="records", force_ascii=False)
         logger.info(f"[econ] daily cache saved -> {p} rows={len(out)}")
     except Exception as e:
         logger.warning(f"[econ] daily cache save failed: {e}")
-
 
 def _load_daily_cache(day_key: str) -> pd.DataFrame:
     try:
@@ -132,89 +128,189 @@ def _load_daily_cache(day_key: str) -> pd.DataFrame:
 
 
 # =====================================================
-# REQUEST SAFE A INVESTPY
+# IMPORTANCIA HEURÍSTICA (CME no trae ⭐)
 # =====================================================
-def _safe_request(country, start: datetime, end: datetime) -> pd.DataFrame:
-    if end <= start:
-        end = start + timedelta(days=1)
+def _infer_importance(event_name: str) -> str:
+    n = (event_name or "").lower()
 
-    f = start.strftime("%d/%m/%Y")
-    t = end.strftime("%d/%m/%Y")
+    high = [
+        "cpi", "consumer price", "inflation", "pce", "core pce",
+        "nonfarm", "payroll", "employment situation", "jobs report",
+        "fomc", "fed", "interest rate", "powell",
+        "gdp", "gross domestic product",
+        "ism manufacturing", "ism non-manufacturing", "ism services",
+        "ppi", "producer price",
+        "retail sales"  # a veces mueve mucho
+    ]
+    medium = [
+        "jobless", "claims",
+        "housing starts", "building permits",
+        "existing home", "new home",
+        "durable goods",
+        "consumer confidence", "sentiment",
+        "philly fed", "empire state",
+        "core retail",
+        "personal income", "personal spending",
+        "trade balance",
+        "business inventories"
+    ]
 
-    df = None
-    last_err = None
+    if any(k in n for k in high):
+        return "high"
+    if any(k in n for k in medium):
+        return "medium"
+    return "low"
 
-    logger.info(f"[econ] investpy request country={country} from={f} to={t}")
-
-    # Jitter pequeño para evitar patrones “clavados” (no es bypass; reduce colisiones)
-    _time.sleep(0.4 + _random.random() * 0.8)
-
-    for attempt in range(3):
-        try:
-            df = investpy.economic_calendar(
-                from_date=f,
-                to_date=t,
-                countries=[country]
-            )
-            if df is None:
-                df = pd.DataFrame()
-
-            logger.info(f"[econ] attempt {attempt+1}/3 -> rows={len(df)} cols={list(df.columns)[:8]}")
-
-            if not df.empty:
-                break
-
-        except Exception as e:
-            last_err = e
-            logger.error(f"[econ] investpy exception attempt {attempt+1}/3: {e}")
-
-        # backoff suave
-        _time.sleep(1.0 + attempt * 1.2 + _random.random() * 0.8)
-
-    if df is None or df.empty:
-        if last_err:
-            logger.error(f"[econ] investpy returned EMPTY after retries (with error): {last_err}")
-        else:
-            logger.warning("[econ] investpy returned EMPTY after retries (NO exception). Possible block/change/no events.")
-        return pd.DataFrame()
-
-    # Normalizamos columnas
-    for col in ["date", "time", "event", "importance", "actual", "forecast", "previous"]:
-        if col not in df.columns:
-            df[col] = ""
-
-    # Limpiar time
-    def _clean_time(x):
-        s = str(x).strip()
-        low = s.lower()
-        if low in ["", "all day", "tentative", "tbd", "--:--", "na", "n/a", "null", "none", "nan"]:
-            return "00:00"
-        if "all day" in low or "tentative" in low:
-            return "00:00"
-        # recorta HH:MM
-        return s[:5] if len(s) >= 5 else s
-
-    df["time"] = df["time"].apply(_clean_time)
-
-    df["datetime"] = pd.to_datetime(df["date"].astype(str) + " " + df["time"].astype(str), errors="coerce")
-    df = df.dropna(subset=["datetime"]).sort_values("datetime")
-
-    logger.info(f"[econ] after parse -> rows={len(df)} sample_event={df.iloc[0]['event'] if len(df) else 'n/a'}")
-    return df
-
-
-# =====================================================
-# IMPORTANCIA → ESTRELLAS
-# =====================================================
 def _stars(imp: str) -> int:
-    if not isinstance(imp, str):
-        return 1
-    imp = imp.lower()
+    imp = (imp or "").lower()
     if "high" in imp or "3" in imp:
         return 3
     if "medium" in imp or "2" in imp:
         return 2
     return 1
+
+
+# =====================================================
+# PARSE FECHA/HORA (CME)
+# =====================================================
+def _clean_time_str(s: str) -> str:
+    s = (s or "").strip()
+    if not s:
+        return "00:00"
+
+    low = s.lower()
+    if low in ["tbd", "all day", "na", "n/a", "--", "--:--"]:
+        return "00:00"
+
+    # Normaliza "8:30 a.m." / "8:30 AM" / "08:30"
+    s2 = s.replace(".", "").replace("a m", "am").replace("p m", "pm")
+    s2 = re.sub(r"\s+", " ", s2).strip()
+
+    m = re.match(r"^(\d{1,2}):(\d{2})\s*(am|pm)$", s2, re.IGNORECASE)
+    if m:
+        hh = int(m.group(1))
+        mm = int(m.group(2))
+        ap = m.group(3).lower()
+        if ap == "pm" and hh != 12:
+            hh += 12
+        if ap == "am" and hh == 12:
+            hh = 0
+        return f"{hh:02d}:{mm:02d}"
+
+    m2 = re.match(r"^(\d{1,2}):(\d{2})$", s2)
+    if m2:
+        return f"{int(m2.group(1)):02d}:{int(m2.group(2)):02d}"
+
+    return "00:00"
+
+
+# =====================================================
+# REQUEST + SCRAPE CME (robusto)
+# =====================================================
+def _safe_request_cme(start: datetime, end: datetime) -> pd.DataFrame:
+    if end <= start:
+        end = start + timedelta(days=1)
+
+    df_final = pd.DataFrame()
+    last_err = None
+
+    logger.info(f"[econ] CME request date_range={start.date()}->{end.date()}")
+
+    # jitter suave
+    _time.sleep(0.4 + _random.random() * 0.8)
+
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/121.0.0.0 Safari/537.36"
+        ),
+        "Accept-Language": "es-ES,es;q=0.9,en;q=0.8",
+    }
+
+    for attempt in range(3):
+        try:
+            r = requests.get(CME_URL, headers=headers, timeout=25)
+            r.raise_for_status()
+
+            html = r.text or ""
+            if len(html) < 2000:
+                raise ValueError("CME HTML demasiado corto (posible error/transitorio)")
+
+            # pd.read_html necesita lxml
+            tables = pd.read_html(html)
+            logger.info(f"[econ] CME tables found: {len(tables)}")
+
+            # Buscamos una tabla que contenga columnas tipo Release/Event y Time/Date
+            candidates = []
+            for t in tables:
+                cols = [str(c).strip().lower() for c in t.columns]
+                if any("release" in c or "event" in c for c in cols) and any("time" in c for c in cols):
+                    candidates.append(t)
+
+            if not candidates:
+                # fallback: la primera con al menos 3 columnas
+                candidates = [t for t in tables if len(t.columns) >= 3]
+
+            if not candidates:
+                raise ValueError("No se detectaron tablas parseables en CME")
+
+            # Unimos candidates y normalizamos nombres
+            df = pd.concat(candidates, ignore_index=True)
+
+            # Normaliza nombres de columnas
+            cols_map = {}
+            for c in df.columns:
+                cl = str(c).strip().lower()
+                if "release" in cl or "event" in cl:
+                    cols_map[c] = "event"
+                elif "time" in cl:
+                    cols_map[c] = "time"
+                elif "date" in cl:
+                    cols_map[c] = "date"
+            df = df.rename(columns=cols_map)
+
+            # Asegura columnas mínimas
+            for col in ["date", "time", "event"]:
+                if col not in df.columns:
+                    df[col] = ""
+
+            # Limpieza
+            df["event"] = df["event"].astype(str).str.strip()
+            df["time"] = df["time"].astype(str).apply(_clean_time_str)
+
+            # La fecha puede venir en formatos variados; intentamos parse general
+            df["date_raw"] = df["date"].astype(str).str.strip()
+            # pd.to_datetime con inferencia; luego formateamos YYYY-MM-DD
+            dt_date = pd.to_datetime(df["date_raw"], errors="coerce", infer_datetime_format=True)
+            df["date"] = dt_date.dt.strftime("%Y-%m-%d")
+
+            # Crea datetime y filtra rango
+            df["datetime"] = pd.to_datetime(df["date"].astype(str) + " " + df["time"].astype(str), errors="coerce")
+            df = df.dropna(subset=["datetime"])
+
+            df = df[(df["datetime"] >= start) & (df["datetime"] < end)]
+
+            # Añade campos esperados por tu pipeline
+            df["importance"] = df["event"].apply(_infer_importance)
+            df["actual"] = ""
+            df["forecast"] = ""
+            df["previous"] = ""
+
+            df = df.sort_values("datetime")
+            df_final = df[["date", "time", "event", "importance", "actual", "forecast", "previous", "datetime"]].copy()
+
+            logger.info(f"[econ] CME parsed rows_in_range={len(df_final)}")
+            break
+
+        except Exception as e:
+            last_err = e
+            logger.error(f"[econ] CME exception attempt {attempt+1}/3: {e}")
+            _time.sleep(1.0 + attempt * 1.2 + _random.random() * 0.8)
+
+    if df_final.empty:
+        logger.error(f"[econ] CME returned EMPTY after retries: {last_err}")
+    return df_final
 
 
 # =====================================================
@@ -224,7 +320,7 @@ def _is_holiday(df: pd.DataFrame) -> bool:
     if df.empty:
         return False
     for ev in df["event"].astype(str).str.lower():
-        if "holiday" in ev or "festividad" in ev or "thanksgiving" in ev:
+        if "holiday" in ev or "market holiday" in ev or "christmas" in ev or "thanksgiving" in ev:
             return True
     return False
 
@@ -239,90 +335,72 @@ def _process_events(df: pd.DataFrame) -> List[Dict]:
     df = df.copy()
     df["stars"] = df["importance"].apply(_stars)
 
-    # Solo 2 y 3 estrellas
     df = df[df["stars"] >= 2]
     if df.empty:
         return []
 
-    # Reducimos a máximo 6 eventos
     df = df.sort_values(["stars", "datetime"], ascending=[False, True]).head(6)
     df = df.sort_values("datetime")
 
-    events = []
+    out = []
     for _, r in df.iterrows():
-        events.append(
+        out.append(
             {
                 "datetime": r["datetime"],
                 "event": r["event"],
                 "stars": int(r["stars"]),
-                "actual": r["actual"] or "",
-                "forecast": r["forecast"] or "",
-                "previous": r["previous"] or "",
+                "actual": "",
+                "forecast": "",
+                "previous": "",
             }
         )
-    return events
+    return out
 
 
 # =====================================================
-# TRADUCCIÓN / ADAPTACIÓN (reglas rápidas)
+# TRADUCCIÓN / ADAPTACIÓN (reglas rápidas + IA opcional)
 # =====================================================
 def _normalize_event_name(name: str) -> str:
     if not isinstance(name, str):
         return ""
     return " ".join(name.strip().split()).lower()
 
-
 def _translate_event_name(ev_name: str) -> str:
     if not isinstance(ev_name, str) or not ev_name.strip():
         return ""
-
     s = " ".join(ev_name.strip().split())
     n = s.lower()
 
-    if ("president" in n or "u.s. president" in n) and ("speaks" in n or "speech" in n):
-        if "trump" in n:
-            return "El presidente Trump ofrece un discurso"
-        return "El presidente de EE. UU. ofrece un discurso"
-
-    if "initial jobless claims" in n or ("jobless" in n and "claims" in n):
+    if "jobless" in n and "claims" in n:
         return "Solicitudes semanales de subsidio por desempleo"
-
-    if "nonfarm payrolls" in n or "non-farm payrolls" in n:
+    if "nonfarm" in n or "payroll" in n:
         return "Nóminas no agrícolas (NFP)"
-    if "unemployment rate" in n:
+    if "unemployment" in n:
         return "Tasa de desempleo"
-    if "average hourly earnings" in n:
-        if "mom" in n:
-            return "Salario medio por hora (mensual)"
-        if "yoy" in n:
-            return "Salario medio por hora (interanual)"
-        return "Salario medio por hora"
-
-    if "core cpi" in n:
-        return "IPC subyacente (sin energía ni alimentos)"
-    if "cpi" in n:
-        if "mom" in n:
-            return "IPC (mensual)"
-        if "yoy" in n:
-            return "IPC (interanual)"
-        return "IPC (índice de precios al consumidor)"
-
+    if "cpi" in n or "consumer price" in n:
+        return "IPC (inflación)"
     if "pce" in n:
         return "PCE (inflación preferida por la Fed)"
-
-    if "philadelphia fed" in n and ("manufacturing" in n or "index" in n):
-        return "Índice manufacturero de la Fed de Filadelfia"
-
-    if "manufacturing" in n and "index" in n:
-        return "Índice manufacturero"
+    if "fomc" in n or ("fed" in n and "meeting" in n):
+        return "Fed / FOMC (decisión o evento)"
+    if "gdp" in n:
+        return "PIB (GDP)"
+    if "retail sales" in n:
+        return "Ventas minoristas"
+    if "ppi" in n:
+        return "PPI (precios productor)"
+    if "ism" in n and "manufact" in n:
+        return "ISM manufacturero"
+    if "ism" in n and ("services" in n or "non-manufact" in n):
+        return "ISM servicios"
+    if "philly" in n:
+        return "Índice manufacturero Fed de Filadelfia"
 
     return s
-
 
 def _gpt_translate_event_name(raw: str) -> str:
     if not isinstance(raw, str) or not raw.strip():
         return ""
-
     raw_clean = " ".join(raw.strip().split())
     key = raw_clean.lower()
 
@@ -341,8 +419,6 @@ def _gpt_translate_event_name(raw: str) -> str:
     user_prompt = (
         "Traduce este nombre de evento macro al español claro.\n"
         "- Mantén siglas útiles (Fed, FOMC, IPC, PCE, NFP, PMI).\n"
-        "- Si es una subasta, dilo como 'Subasta del Tesoro USA (10 años)' etc.\n"
-        "- Si es un discurso, dilo como 'Discurso de X (FOMC)' si aparece el nombre.\n"
         "- No añadas datos que no estén.\n\n"
         f"Evento: {raw_clean}"
     )
@@ -353,13 +429,12 @@ def _gpt_translate_event_name(raw: str) -> str:
         logger.warning(f"GPT translate falló: {e}")
         out = ""
 
-    if not out or out.lower() == raw_clean.lower():
+    if not out:
         out = raw_clean
 
     cache[key] = out
     _save_translation_cache(cache)
     return out
-
 
 def _translate_event_name_smart(raw: str) -> str:
     if not isinstance(raw, str) or not raw.strip():
@@ -377,29 +452,26 @@ def _translate_event_name_smart(raw: str) -> str:
 def _bucket_event(ev_name: str) -> str:
     n = _normalize_event_name(ev_name)
 
-    if "core cpi" in n or ("cpi" in n and "core" in n) or "cpi" in n or "inflation" in n:
-        return "Inflación: IPC e IPC subyacente"
+    if "cpi" in n or "consumer price" in n:
+        return "Inflación: IPC"
     if "pce" in n:
         return "Inflación: PCE (Fed)"
+    if "inflation" in n:
+        return "Inflación"
 
     if "jobless" in n or "unemployment" in n or "payroll" in n or "nonfarm" in n:
         return "Empleo"
-    if "average hourly earnings" in n or ("hourly" in n and "earnings" in n):
-        return "Empleo"
 
-    if "philadelphia fed" in n:
-        return "Actividad: Fed de Filadelfia"
-    if "manufacturing" in n or "ism" in n or "pmi" in n:
+    if "gdp" in n:
+        return "Crecimiento: PIB"
+
+    if "ism" in n or "pmi" in n or "manufact" in n:
         return "Actividad"
 
-    if ("speaks" in n or "speech" in n) and ("fed" in n or "fomc" in n or "chair" in n or "member" in n):
-        return "Fed: discursos"
-
-    if "president" in n and ("speaks" in n or "speech" in n):
-        return "Política: declaraciones"
+    if "fed" in n or "fomc" in n:
+        return "Fed: eventos"
 
     return "Otros"
-
 
 def _group_agenda(events: List[Dict]) -> List[Dict]:
     if not events:
@@ -465,21 +537,9 @@ def _make_macro_brief(events: List[Dict]) -> str:
         dt = e.get("datetime")
         hr = dt.strftime("%H:%M") if dt else ""
         stars = "⭐" * int(e.get("stars", 1))
-
         evn_raw = e.get("event", "")
         evn_es = _translate_event_name_smart(evn_raw) or evn_raw
-
-        fc = e.get("forecast", "")
-        pv = e.get("previous", "")
-
-        extra = []
-        if fc:
-            extra.append(f"previsión: {fc}")
-        if pv:
-            extra.append(f"anterior: {pv}")
-
-        tail = f" ({' | '.join(extra)})" if extra else ""
-        lines.append(f"- {stars} {hr} — {evn_es}{tail}")
+        lines.append(f"- {stars} {hr} — {evn_es}")
 
     event_block = "\n".join(lines)
 
@@ -494,9 +554,9 @@ def _make_macro_brief(events: List[Dict]) -> str:
         "Objetivo: que se entienda rápido qué puede mover hoy el mercado.\n\n"
         "Reglas:\n"
         "- No enumeres eventos ni horas (eso va debajo en la agenda).\n"
-        "- Puedes mencionar 1 dato por su nombre si es el protagonista.\n"
+        "- Puedes mencionar 1 dato por su nombre si es el protagonista (ej: IPC, empleo, Fed).\n"
         "- Agrupa mentalmente lo repetido.\n"
-        "- Usa condicionales claros: si sale por encima / por debajo de lo previsto.\n"
+        "- Usa condicionales claros: si sale por encima / por debajo de lo esperado.\n"
         "- Conecta con: expectativas de la Fed/tipos, yields, USD y renta variable.\n"
         "- No inventes resultados ni cifras.\n"
         "- Prohibido escribir en inglés.\n\n"
@@ -521,7 +581,7 @@ def _make_macro_brief(events: List[Dict]) -> str:
 
 
 # =====================================================
-# MENSAJE FINAL (NO MIENTE SI HAY BLOQUEO)
+# MENSAJE FINAL (NO MIENTE SI LA FUENTE FALLA)
 # =====================================================
 def _build_message(events, date_ref: datetime, source_status: str = "OK") -> str:
     fecha = date_ref.strftime("%a %d/%m").replace(".", "")
@@ -529,8 +589,8 @@ def _build_message(events, date_ref: datetime, source_status: str = "OK") -> str
     if source_status == "BLOCKED":
         return (
             f"📅 Calendario económico — {fecha}\n\n"
-            "⚠️ Fuente Investing temporalmente no disponible (bloqueo o cambios). "
-            "Si hay caché reciente, se usará automáticamente; si no, hoy no puedo listar eventos con fiabilidad."
+            "⚠️ Fuente CME temporalmente no disponible. "
+            "Si hay caché reciente, se usa; si no, hoy no puedo listar eventos con fiabilidad."
         )
 
     if events == "HOLIDAY":
@@ -584,34 +644,37 @@ def run_econ_calendar(force: bool = False, force_tomorrow: bool = False):
         title_date = now
         cache_key = day_key
 
-    # 1) intentar investpy
-    df = _safe_request(DEFAULT_COUNTRY, start, end)
+    # 1) intentar CME
+    df = _safe_request_cme(start, end)
 
-    # 2) si devuelve vacío: usar caché (si existe)
     source_status = "OK"
+
+    # 2) si CME falla, usar caché
     if df.empty:
         cached = _load_daily_cache(cache_key)
         if not cached.empty:
-            logger.warning(f"[econ] Using cached data for {cache_key} (investpy empty/blocked).")
-            # recomputar datetime
+            logger.warning(f"[econ] Using cached data for {cache_key} (CME empty/unavailable).")
             cached = cached.copy()
             for col in ["date", "time", "event", "importance", "actual", "forecast", "previous"]:
                 if col not in cached.columns:
                     cached[col] = ""
-            cached["datetime"] = pd.to_datetime(cached["date"].astype(str) + " " + cached["time"].astype(str), errors="coerce")
+            cached["datetime"] = pd.to_datetime(
+                cached["date"].astype(str) + " " + cached["time"].astype(str),
+                errors="coerce"
+            )
             cached = cached.dropna(subset=["datetime"]).sort_values("datetime")
             df = cached
         else:
             source_status = "BLOCKED"
 
-    # 3) si tenemos df válido, guardar caché (para próximos bloqueos)
+    # 3) guardar caché si tenemos algo
     if not df.empty and source_status == "OK":
         try:
             _save_daily_cache(cache_key, df)
         except:
             pass
 
-    # 4) construir eventos + mensaje
+    # 4) construir mensaje
     if source_status == "BLOCKED":
         msg = _build_message([], title_date, source_status="BLOCKED")
         send_telegram_message(msg)
