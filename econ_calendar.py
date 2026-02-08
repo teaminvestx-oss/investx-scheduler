@@ -1,20 +1,19 @@
 # =====================================================
 # econ_calendar.py — InvestX v4.2 (Macro Brief PRO + Español total)
-# Fuente: FINNHUB (sustituye investpy por bloqueos)
-# Lógica: 1 envío/día (igual) + festivos (igual) + filtro 2-3⭐ (igual) + máx 6 (igual)
+# Fuente: FMP (Financial Modeling Prep)  ✅
+# Lógica: 1 envío/día + festivos + filtro 2-3⭐ + máx 6
 # NUEVO:
 # - Macro Brief IA estilo CNBC/Bloomberg SIEMPRE en español
 # - Agenda agrupada + “detalle humano” (sin repetir CPI 4 veces)
 # - Traducción/adaptación de nombres (no mezcla inglés/español)
 # - Verificación de OPENAI_API_KEY (si falta, fallback digno)
 # MEJORAS:
-# - FIX: call_gpt_mini(system_prompt, user_prompt, ...)
 # - Traducción "instantánea": reglas + fallback IA para eventos no cubiertos
 # - Caché persistente de traducciones (evita gastar tokens repetidos)
 #
 # FIX MÍNIMO PARA QUE DEVUELVA DATOS:
-# - Timezone Europe/Madrid (evita desfase UTC que te pedía domingo cuando era lunes)
-# - _safe_request robusto: reintentos + logs
+# - Timezone Europe/Madrid (evita desfase UTC)
+# - _safe_request robusto: reintentos + limpieza de time + logs
 # =====================================================
 
 import os
@@ -98,90 +97,177 @@ def _save_translation_cache(d: Dict[str, str]):
 
 
 # =====================================================
-# REQUEST SAFE A FINNHUB (sustituye investpy bloqueado)
-# Devuelve DF compatible con tu pipeline: date/time/event/importance/actual/forecast/previous/datetime
+# REQUEST SAFE A FMP (Economic Calendar)
 # =====================================================
 def _safe_request(country, start: datetime, end: datetime):
-    api_key = os.getenv("FINNHUB_API_KEY", "").strip()
-    if not api_key:
-        logger.error("[econ] FINNHUB_API_KEY no configurada")
-        return pd.DataFrame()
+    """
+    FMP endpoint:
+      https://financialmodelingprep.com/api/v3/economic_calendar
 
+    Params típicos:
+      - from=YYYY-MM-DD
+      - to=YYYY-MM-DD
+      - apikey=...
+      - (opcional) country=US / United States (según dataset)
+
+    Nota: Para robustez, si el filtro country no lo respeta, filtramos nosotros.
+    """
     if end <= start:
         end = start + timedelta(days=1)
 
-    # Finnhub usa rango por fecha ISO
+    api_key = os.getenv("FMP_API_KEY", "").strip()
+    if not api_key:
+        logger.error("[econ] FMP_API_KEY no configurada -> devolviendo vacío.")
+        return pd.DataFrame()
+
     f = start.strftime("%Y-%m-%d")
     t = end.strftime("%Y-%m-%d")
 
-    url = "https://finnhub.io/api/v1/calendar/economic"
-    params = {"from": f, "to": t, "token": api_key}
+    url = "https://financialmodelingprep.com/api/v3/economic_calendar"
 
     df = None
     last_err = None
 
-    logger.info(f"[econ] finnhub request country={country} from={f} to={t}")
+    logger.info(f"[econ] FMP request from={f} to={t} country={country}")
 
-    # 3 intentos: por robustez (timeouts / rate / fallos puntuales)
+    # 3 intentos: robustez
     for attempt in range(3):
         try:
-            r = requests.get(url, params=params, timeout=12)
+            params = {
+                "from": f,
+                "to": t,
+                "apikey": api_key,
+            }
+
+            # Intento de filtro country (FMP a veces lo soporta, a veces no)
+            # Para EE.UU. usamos US como estándar.
+            # Si no filtra, filtramos después.
+            if isinstance(country, str) and country.strip():
+                # si piden United States -> US
+                if country.lower().strip() in ["united states", "united states of america", "usa", "us"]:
+                    params["country"] = "US"
+                else:
+                    params["country"] = country
+
+            r = requests.get(url, params=params, timeout=20)
             r.raise_for_status()
+
             data = r.json()
+            if not isinstance(data, list):
+                data = []
 
-            items = data.get("economicCalendar", []) or []
-            logger.info(f"[econ] attempt {attempt+1}/3 -> items={len(items)}")
+            logger.info(f"[econ] attempt {attempt+1}/3 -> items={len(data)}")
 
-            rows = []
-            for ev in items:
-                ts = ev.get("time")
-                if not ts:
-                    continue
-
-                # Finnhub devuelve epoch (segundos). Convertimos a TZ Madrid
-                dt = datetime.fromtimestamp(int(ts), TZ)
-
-                rows.append(
-                    {
-                        "date": dt.strftime("%d/%m/%Y"),
-                        "time": dt.strftime("%H:%M"),
-                        "event": ev.get("event", "") or "",
-                        "importance": ev.get("impact", "") or "",  # low/medium/high
-                        "actual": ev.get("actual", "") or "",
-                        "forecast": ev.get("forecast", "") or "",
-                        "previous": ev.get("previous", "") or "",
-                        "datetime": dt,
-                    }
-                )
-
-            df = pd.DataFrame(rows)
-            if df is None:
+            if not data:
                 df = pd.DataFrame()
+            else:
+                df = pd.DataFrame(data)
 
-            if not df.empty:
-                df = df.sort_values("datetime")
-                logger.info(
-                    f"[econ] after parse -> rows={len(df)} sample_event={df.iloc[0]['event'] if len(df) else 'n/a'}"
-                )
+            if df is not None and not df.empty:
                 break
 
         except Exception as e:
             last_err = e
-            logger.error(f"[econ] finnhub exception attempt {attempt+1}/3: {e}")
+            logger.error(f"[econ] FMP exception attempt {attempt+1}/3: {e}")
 
         _time.sleep(0.8 + _random.random() * 0.8)
 
     if df is None or df.empty:
         if last_err:
-            logger.error(f"[econ] finnhub returned EMPTY after retries (with error): {last_err}")
+            logger.error(f"[econ] FMP returned EMPTY after retries (with error): {last_err}")
         else:
-            logger.warning("[econ] finnhub returned EMPTY after retries (NO exception). Possible no events.")
+            logger.warning("[econ] FMP returned EMPTY after retries (NO exception). Possible no events / filtro / cambios.")
         return pd.DataFrame()
 
-    # Normalizamos columnas por si falta alguna
-    for col in ["date", "time", "event", "importance", "actual", "forecast", "previous", "datetime"]:
+    # Normalizamos columnas esperadas
+    # FMP suele devolver campos tipo:
+    # date, country, event, actual, previous, estimate/forecast, impact
+    # pero lo hacemos flexible.
+    colmap = {
+        "date": "date",
+        "event": "event",
+        "country": "country",
+        "actual": "actual",
+        "previous": "previous",
+        "forecast": "forecast",      # si existiera
+        "estimate": "forecast",      # FMP suele usar estimate
+        "importance": "importance",  # si existiera
+        "impact": "importance",      # FMP suele usar impact (Low/Medium/High)
+    }
+
+    for src, dst in colmap.items():
+        if src in df.columns and dst not in df.columns:
+            df[dst] = df[src]
+
+    # Aseguramos columnas base
+    for col in ["date", "time", "event", "importance", "actual", "forecast", "previous", "country"]:
         if col not in df.columns:
             df[col] = ""
+
+    # Si "date" incluye hora (ej: 2026-02-09 13:30:00), separamos.
+    def _split_date_time(x):
+        s = str(x).strip()
+        if not s:
+            return "", "00:00"
+        # Si ya viene con 'T'
+        if "T" in s:
+            try:
+                # 2026-02-09T13:30:00.000Z o similar
+                s2 = s.replace("Z", "")
+                dt = pd.to_datetime(s2, errors="coerce")
+                if pd.isna(dt):
+                    return s[:10], "00:00"
+                return dt.strftime("%Y-%m-%d"), dt.strftime("%H:%M")
+            except:
+                return s[:10], "00:00"
+        # Si viene con espacio + hora
+        if " " in s:
+            parts = s.split()
+            d = parts[0]
+            tm = parts[1] if len(parts) > 1 else "00:00"
+            tm = tm[:5] if len(tm) >= 5 else tm
+            return d, tm
+        # Solo fecha
+        return s[:10], "00:00"
+
+    # Si no hay "time" fiable, lo derivamos de "date"
+    dates = []
+    times = []
+    for v in df["date"].tolist():
+        d, tm = _split_date_time(v)
+        dates.append(d)
+        times.append(tm)
+
+    df["date"] = dates
+    # Si df["time"] viene vacío, lo llenamos con lo derivado
+    df["time"] = df["time"].astype(str).str.strip()
+    df.loc[df["time"].isin(["", "nan", "None"]), "time"] = pd.Series(times).astype(str)
+
+    # Limpieza de time tipo All Day / Tentative / etc.
+    def _clean_time(x):
+        s = str(x).strip()
+        low = s.lower()
+        if low in ["", "all day", "tentative", "tbd", "--:--", "na", "n/a", "null", "none", "nan"]:
+            return "00:00"
+        if "all day" in low or "tentative" in low:
+            return "00:00"
+        return s[:5] if len(s) >= 5 else s
+
+    df["time"] = df["time"].apply(_clean_time)
+
+    # Filtrado de país EE.UU. (por si FMP no filtró)
+    # Aceptamos variantes típicas.
+    if "country" in df.columns:
+        c = df["country"].astype(str).str.lower()
+        us_mask = c.isin(["united states", "united states of america", "us", "usa", "united states (us)"]) | c.str.contains("united states", na=False)
+        if us_mask.any():
+            df = df[us_mask]
+
+    # Parse datetime
+    df["datetime"] = pd.to_datetime(df["date"].astype(str) + " " + df["time"].astype(str), errors="coerce")
+    df = df.dropna(subset=["datetime"]).sort_values("datetime")
+
+    logger.info(f"[econ] after parse -> rows={len(df)} sample_event={df.iloc[0]['event'] if len(df) else 'n/a'}")
 
     return df
 
@@ -412,7 +498,6 @@ def _bucket_event(ev_name: str) -> str:
     if "president" in n and ("speaks" in n or "speech" in n):
         return "Política: declaraciones"
 
-    # (Mantenemos 'Otros' como fallback)
     return "Otros"
 
 
@@ -438,16 +523,13 @@ def _group_agenda(events: List[Dict]) -> List[Dict]:
                 "datetime": dt,
                 "stars": stars,
                 "label": bucket,
-                "examples": [example_es] if example_es else [],
+                "examples": [example_es] if example_es else []
             }
         else:
-            # Hora: la más temprana
             if dt and groups[bucket]["datetime"] and dt < groups[bucket]["datetime"]:
                 groups[bucket]["datetime"] = dt
-            # Estrellas: la más alta
             if stars > groups[bucket]["stars"]:
                 groups[bucket]["stars"] = stars
-            # Ejemplos: únicos (máximo 2)
             if example_es and example_es not in groups[bucket]["examples"]:
                 groups[bucket]["examples"].append(example_es)
 
@@ -457,7 +539,11 @@ def _group_agenda(events: List[Dict]) -> List[Dict]:
         suffix = ""
         if ex:
             suffix = ": " + " / ".join(ex)
-        out.append({"datetime": g["datetime"], "stars": g["stars"], "label": g["label"] + suffix})
+        out.append({
+            "datetime": g["datetime"],
+            "stars": g["stars"],
+            "label": g["label"] + suffix
+        })
 
     out.sort(key=lambda x: x["datetime"] or datetime.max)
     return out
@@ -480,7 +566,6 @@ def _make_macro_brief(events: List[Dict]) -> str:
             "si salen más suaves, alivio para el riesgo y para los bonos."
         )
 
-    # Contexto para IA (pero sin obligar a listar)
     lines = []
     for e in events:
         dt = e.get("datetime")
@@ -531,7 +616,6 @@ def _make_macro_brief(events: List[Dict]) -> str:
         logger.warning(f"call_gpt_mini falló: {e}")
         out = ""
 
-    # Si sale accidentalmente en inglés, lo traducimos
     eng_hits = 0
     low = out.lower() if isinstance(out, str) else ""
     for w in ["markets", "ahead", "yields", "dollar", "stocks", "brace", "inflation", "fed", "rates"]:
@@ -562,7 +646,6 @@ def _make_macro_brief(events: List[Dict]) -> str:
 def _build_message(events: List[Dict], date_ref: datetime) -> str:
     fecha = date_ref.strftime("%a %d/%m").replace(".", "")
 
-    # Caso: festividad
     if events == "HOLIDAY":
         return (
             f"📅 Calendario económico — {fecha}\n\n"
@@ -570,7 +653,6 @@ def _build_message(events: List[Dict], date_ref: datetime) -> str:
             f"No hay referencias macroeconómicas relevantes."
         )
 
-    # Caso: no eventos
     if not events:
         return (
             f"📅 Calendario económico — {fecha}\n\n"
@@ -598,30 +680,25 @@ def _build_message(events: List[Dict], date_ref: datetime) -> str:
 # FUNCIÓN PRINCIPAL
 # =====================================================
 def run_econ_calendar(force: bool = False, force_tomorrow: bool = False):
-
     now = datetime.now(TZ)
     day_key = now.strftime("%Y-%m-%d")
 
-    # Control 1 vez al día
     if not force and not force_tomorrow:
         if _already_sent(day_key):
             logger.info("econ_calendar: ya enviado hoy.")
             return
 
-    # Rangos
     if force_tomorrow:
-        start = datetime.combine(now.date() + timedelta(days=1), time.min, tzinfo=TZ)
+        start = datetime.combine(now.date() + timedelta(days=1), time.min)
         end = start + timedelta(days=1)
         title_date = start
     else:
-        start = datetime.combine(now.date(), time.min, tzinfo=TZ)
+        start = datetime.combine(now.date(), time.min)
         end = start + timedelta(days=1)
         title_date = now
 
-    # Descarga (Finnhub)
     df = _safe_request(DEFAULT_COUNTRY, start, end)
 
-    # Detectar festividad
     if _is_holiday(df):
         msg = _build_message("HOLIDAY", title_date)
         send_telegram_message(msg)
