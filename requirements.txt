@@ -10,5 +10,3 @@ openai
 investpy
 pandas-market-calendars
 setuptools
-setuptools==75.8.0
-investpy==1.0.8
