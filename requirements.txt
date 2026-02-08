@@ -9,3 +9,4 @@ numpy
 openai
 investpy
 pandas-market-calendars
+setuptools
