@@ -1,8 +1,13 @@
 # =====================================================
 # econ_calendar.py — InvestX v4.2 (Macro Brief PRO + Español total)
-# Fuente: FMP (Financial Modeling Prep) — STABLE endpoint ✅
-# Lógica: 1 envío/día + festivos + filtro 2-3⭐ + máx 6 + agenda agrupada
-# Firma run_econ_calendar compatible con main.py (force, force_tomorrow) ✅
+# Fuente: investpy (Investing.com) — SCRAPING (puede fallar por bloqueos)
+#
+# Objetivo: 1 envío/día + festivos + filtro 2-3⭐ + máx 6
+# Robustez:
+# - Timezone Europe/Madrid
+# - _safe_request con reintentos + limpieza de time
+# - Caché diaria: si hoy Investing bloquea, usamos el último resultado guardado
+# - Si no hay datos y no hay caché: se avisa (NO se miente con “no hay macro”)
 # =====================================================
 
 import os
@@ -15,7 +20,7 @@ from typing import List, Dict
 from zoneinfo import ZoneInfo
 
 import pandas as pd
-import requests
+import investpy
 
 from utils import send_telegram_message, call_gpt_mini
 
@@ -24,9 +29,12 @@ logger.setLevel(logging.INFO)
 
 STATE_FILE = "econ_calendar_state.json"
 DEFAULT_COUNTRY = "United States"
-
 TZ = ZoneInfo("Europe/Madrid")
+
 TRANSLATION_CACHE_FILE = "econ_translation_cache.json"
+
+# Caché diaria de eventos (para aguantar bloqueos de Investing)
+DAILY_CACHE_DIR = "econ_daily_cache"
 
 
 # ================================
@@ -41,6 +49,7 @@ def _load_state():
     except:
         return {}
 
+
 def _save_state(d):
     try:
         with open(STATE_FILE, "w", encoding="utf-8") as f:
@@ -48,9 +57,11 @@ def _save_state(d):
     except:
         pass
 
+
 def _already_sent(day_key: str) -> bool:
     st = _load_state()
     return st.get("sent_day") == day_key
+
 
 def _mark_sent(day_key: str):
     st = _load_state()
@@ -70,6 +81,7 @@ def _load_translation_cache() -> Dict[str, str]:
     except:
         return {}
 
+
 def _save_translation_cache(d: Dict[str, str]):
     try:
         with open(TRANSLATION_CACHE_FILE, "w", encoding="utf-8") as f:
@@ -78,123 +90,111 @@ def _save_translation_cache(d: Dict[str, str]):
         pass
 
 
+# ================================
+# CACHÉ DIARIA (RAW EVENTS)
+# ================================
+def _cache_path(day_key: str) -> str:
+    if not os.path.exists(DAILY_CACHE_DIR):
+        try:
+            os.makedirs(DAILY_CACHE_DIR, exist_ok=True)
+        except:
+            pass
+    return os.path.join(DAILY_CACHE_DIR, f"econ_{day_key}.json")
+
+
+def _save_daily_cache(day_key: str, df: pd.DataFrame):
+    try:
+        p = _cache_path(day_key)
+        # guardamos solo columnas relevantes
+        cols = [c for c in ["date", "time", "event", "importance", "actual", "forecast", "previous"] if c in df.columns]
+        out = df[cols].copy()
+
+        # datetime no lo guardamos (lo recomputamos)
+        out = out.fillna("")
+        out.to_json(p, orient="records", force_ascii=False)
+        logger.info(f"[econ] daily cache saved -> {p} rows={len(out)}")
+    except Exception as e:
+        logger.warning(f"[econ] daily cache save failed: {e}")
+
+
+def _load_daily_cache(day_key: str) -> pd.DataFrame:
+    try:
+        p = _cache_path(day_key)
+        if not os.path.exists(p):
+            return pd.DataFrame()
+        df = pd.read_json(p, orient="records", dtype=False)
+        if df is None:
+            return pd.DataFrame()
+        return df
+    except Exception as e:
+        logger.warning(f"[econ] daily cache load failed: {e}")
+        return pd.DataFrame()
+
+
 # =====================================================
-# REQUEST SAFE A FMP (STABLE) ✅
+# REQUEST SAFE A INVESTPY
 # =====================================================
-def _safe_request(country, start: datetime, end: datetime):
+def _safe_request(country, start: datetime, end: datetime) -> pd.DataFrame:
     if end <= start:
         end = start + timedelta(days=1)
 
-    api_key = os.getenv("FMP_API_KEY", "").strip()
-    if not api_key:
-        logger.error("[econ] FMP_API_KEY no configurada -> devolviendo vacío.")
-        return pd.DataFrame()
-
-    f = start.strftime("%Y-%m-%d")
-    t = end.strftime("%Y-%m-%d")
-
-    # ✅ endpoint correcto (no /api/v3/)
-    url = "https://financialmodelingprep.com/stable/economic-calendar"
+    f = start.strftime("%d/%m/%Y")
+    t = end.strftime("%d/%m/%Y")
 
     df = None
     last_err = None
 
-    logger.info(f"[econ] FMP(STABLE) request from={f} to={t} country={country}")
+    logger.info(f"[econ] investpy request country={country} from={f} to={t}")
+
+    # Jitter pequeño para evitar patrones “clavados” (no es bypass; reduce colisiones)
+    _time.sleep(0.4 + _random.random() * 0.8)
 
     for attempt in range(3):
         try:
-            # IMPORTANTE: NO pasamos country aquí (a veces provoca 403/filtrado raro).
-            params = {"from": f, "to": t, "apikey": api_key}
+            df = investpy.economic_calendar(
+                from_date=f,
+                to_date=t,
+                countries=[country]
+            )
+            if df is None:
+                df = pd.DataFrame()
 
-            r = requests.get(url, params=params, timeout=20)
-            r.raise_for_status()
+            logger.info(f"[econ] attempt {attempt+1}/3 -> rows={len(df)} cols={list(df.columns)[:8]}")
 
-            data = r.json()
-            if not isinstance(data, list):
-                data = []
-
-            logger.info(f"[econ] attempt {attempt+1}/3 -> items={len(data)}")
-
-            df = pd.DataFrame(data) if data else pd.DataFrame()
-            if df is not None and not df.empty:
+            if not df.empty:
                 break
 
         except Exception as e:
             last_err = e
-            logger.error(f"[econ] FMP exception attempt {attempt+1}/3: {e}")
+            logger.error(f"[econ] investpy exception attempt {attempt+1}/3: {e}")
 
-        _time.sleep(0.8 + _random.random() * 0.8)
+        # backoff suave
+        _time.sleep(1.0 + attempt * 1.2 + _random.random() * 0.8)
 
     if df is None or df.empty:
         if last_err:
-            logger.error(f"[econ] FMP returned EMPTY after retries (with error): {last_err}")
+            logger.error(f"[econ] investpy returned EMPTY after retries (with error): {last_err}")
         else:
-            logger.warning("[econ] FMP returned EMPTY after retries (NO exception).")
+            logger.warning("[econ] investpy returned EMPTY after retries (NO exception). Possible block/change/no events.")
         return pd.DataFrame()
 
-    # Normalización
-    colmap = {
-        "date": "date",
-        "event": "event",
-        "country": "country",
-        "actual": "actual",
-        "previous": "previous",
-        "forecast": "forecast",
-        "estimate": "forecast",
-        "importance": "importance",
-        "impact": "importance",
-    }
-    for src, dst in colmap.items():
-        if src in df.columns and dst not in df.columns:
-            df[dst] = df[src]
-
-    for col in ["date", "time", "event", "importance", "actual", "forecast", "previous", "country"]:
+    # Normalizamos columnas
+    for col in ["date", "time", "event", "importance", "actual", "forecast", "previous"]:
         if col not in df.columns:
             df[col] = ""
 
-    # parse fecha/hora
-    def _split_date_time(x):
-        s = str(x).strip()
-        if not s:
-            return "", "00:00"
-        try:
-            dt = pd.to_datetime(s, errors="coerce")
-            if pd.isna(dt):
-                return s[:10], "00:00"
-            return dt.strftime("%Y-%m-%d"), dt.strftime("%H:%M")
-        except:
-            return s[:10], "00:00"
-
-    dates, times = [], []
-    for v in df["date"].tolist():
-        d, tm = _split_date_time(v)
-        dates.append(d)
-        times.append(tm)
-
-    df["date"] = dates
-    df["time"] = df["time"].astype(str).str.strip()
-    df.loc[df["time"].isin(["", "nan", "None"]), "time"] = pd.Series(times).astype(str)
-
+    # Limpiar time
     def _clean_time(x):
         s = str(x).strip()
         low = s.lower()
         if low in ["", "all day", "tentative", "tbd", "--:--", "na", "n/a", "null", "none", "nan"]:
             return "00:00"
+        if "all day" in low or "tentative" in low:
+            return "00:00"
+        # recorta HH:MM
         return s[:5] if len(s) >= 5 else s
 
     df["time"] = df["time"].apply(_clean_time)
-
-    # filtrar US localmente (FMP puede traer varios países)
-    c = df["country"].astype(str).str.lower()
-    us_mask = (
-        c.isin(["united states", "united states of america", "us", "usa", "united states (us)"])
-        | c.str.contains("united states", na=False)
-    )
-    if us_mask.any():
-        df = df[us_mask]
-    else:
-        # si FMP viene con country vacío, no lo eliminamos todo
-        logger.warning("[econ] No se detectó country=US en payload; se mantiene sin filtro estricto.")
 
     df["datetime"] = pd.to_datetime(df["date"].astype(str) + " " + df["time"].astype(str), errors="coerce")
     df = df.dropna(subset=["datetime"]).sort_values("datetime")
@@ -239,10 +239,12 @@ def _process_events(df: pd.DataFrame) -> List[Dict]:
     df = df.copy()
     df["stars"] = df["importance"].apply(_stars)
 
+    # Solo 2 y 3 estrellas
     df = df[df["stars"] >= 2]
     if df.empty:
         return []
 
+    # Reducimos a máximo 6 eventos
     df = df.sort_values(["stars", "datetime"], ascending=[False, True]).head(6)
     df = df.sort_values("datetime")
 
@@ -269,9 +271,11 @@ def _normalize_event_name(name: str) -> str:
         return ""
     return " ".join(name.strip().split()).lower()
 
+
 def _translate_event_name(ev_name: str) -> str:
     if not isinstance(ev_name, str) or not ev_name.strip():
         return ""
+
     s = " ".join(ev_name.strip().split())
     n = s.lower()
 
@@ -314,9 +318,11 @@ def _translate_event_name(ev_name: str) -> str:
 
     return s
 
+
 def _gpt_translate_event_name(raw: str) -> str:
     if not isinstance(raw, str) or not raw.strip():
         return ""
+
     raw_clean = " ".join(raw.strip().split())
     key = raw_clean.lower()
 
@@ -353,6 +359,7 @@ def _gpt_translate_event_name(raw: str) -> str:
     cache[key] = out
     _save_translation_cache(cache)
     return out
+
 
 def _translate_event_name_smart(raw: str) -> str:
     if not isinstance(raw, str) or not raw.strip():
@@ -392,6 +399,7 @@ def _bucket_event(ev_name: str) -> str:
         return "Política: declaraciones"
 
     return "Otros"
+
 
 def _group_agenda(events: List[Dict]) -> List[Dict]:
     if not events:
@@ -447,7 +455,7 @@ def _make_macro_brief(events: List[Dict]) -> str:
     api_key = os.getenv("OPENAI_API_KEY", "").strip()
     if not api_key:
         return (
-            "Sesión marcada por datos macro capaces de mover expectativas de tipos. "
+            "Sesión marcada por referencias macro capaces de mover expectativas de tipos. "
             "Si sorprenden al alza, presión para la renta variable y apoyo al USD/yields; "
             "si salen más suaves, alivio para el riesgo y para los bonos."
         )
@@ -469,8 +477,8 @@ def _make_macro_brief(events: List[Dict]) -> str:
             extra.append(f"previsión: {fc}")
         if pv:
             extra.append(f"anterior: {pv}")
-        tail = f" ({' | '.join(extra)})" if extra else ""
 
+        tail = f" ({' | '.join(extra)})" if extra else ""
         lines.append(f"- {stars} {hr} — {evn_es}{tail}")
 
     event_block = "\n".join(lines)
@@ -486,7 +494,7 @@ def _make_macro_brief(events: List[Dict]) -> str:
         "Objetivo: que se entienda rápido qué puede mover hoy el mercado.\n\n"
         "Reglas:\n"
         "- No enumeres eventos ni horas (eso va debajo en la agenda).\n"
-        "- Puedes mencionar 1 dato por su nombre si es el protagonista (ej: IPC, empleo, Fed).\n"
+        "- Puedes mencionar 1 dato por su nombre si es el protagonista.\n"
         "- Agrupa mentalmente lo repetido.\n"
         "- Usa condicionales claros: si sale por encima / por debajo de lo previsto.\n"
         "- Conecta con: expectativas de la Fed/tipos, yields, USD y renta variable.\n"
@@ -504,7 +512,7 @@ def _make_macro_brief(events: List[Dict]) -> str:
 
     if not out:
         out = (
-            "Sesión marcada por datos macro capaces de mover expectativas de tipos. "
+            "Sesión marcada por referencias macro capaces de mover expectativas de tipos. "
             "Si sorprenden al alza, presión para la renta variable y apoyo al USD/yields; "
             "si salen más suaves, alivio para el riesgo y para los bonos."
         )
@@ -513,16 +521,23 @@ def _make_macro_brief(events: List[Dict]) -> str:
 
 
 # =====================================================
-# MENSAJE FINAL
+# MENSAJE FINAL (NO MIENTE SI HAY BLOQUEO)
 # =====================================================
-def _build_message(events, date_ref: datetime) -> str:
+def _build_message(events, date_ref: datetime, source_status: str = "OK") -> str:
     fecha = date_ref.strftime("%a %d/%m").replace(".", "")
+
+    if source_status == "BLOCKED":
+        return (
+            f"📅 Calendario económico — {fecha}\n\n"
+            "⚠️ Fuente Investing temporalmente no disponible (bloqueo o cambios). "
+            "Si hay caché reciente, se usará automáticamente; si no, hoy no puedo listar eventos con fiabilidad."
+        )
 
     if events == "HOLIDAY":
         return (
             f"📅 Calendario económico — {fecha}\n\n"
-            f"🎌 Hoy es festivo en Estados Unidos.\n"
-            f"No hay referencias macroeconómicas relevantes."
+            "🎌 Hoy es festivo en Estados Unidos.\n"
+            "No hay referencias macroeconómicas relevantes."
         )
 
     if not events:
@@ -547,7 +562,7 @@ def _build_message(events, date_ref: datetime) -> str:
 
 
 # =====================================================
-# FUNCIÓN PRINCIPAL (COMPATIBLE CON main.py) ✅
+# FUNCIÓN PRINCIPAL (compatible con main.py)
 # =====================================================
 def run_econ_calendar(force: bool = False, force_tomorrow: bool = False):
     now = datetime.now(TZ)
@@ -562,12 +577,47 @@ def run_econ_calendar(force: bool = False, force_tomorrow: bool = False):
         start = datetime.combine(now.date() + timedelta(days=1), time.min)
         end = start + timedelta(days=1)
         title_date = start
+        cache_key = start.strftime("%Y-%m-%d")
     else:
         start = datetime.combine(now.date(), time.min)
         end = start + timedelta(days=1)
         title_date = now
+        cache_key = day_key
 
+    # 1) intentar investpy
     df = _safe_request(DEFAULT_COUNTRY, start, end)
+
+    # 2) si devuelve vacío: usar caché (si existe)
+    source_status = "OK"
+    if df.empty:
+        cached = _load_daily_cache(cache_key)
+        if not cached.empty:
+            logger.warning(f"[econ] Using cached data for {cache_key} (investpy empty/blocked).")
+            # recomputar datetime
+            cached = cached.copy()
+            for col in ["date", "time", "event", "importance", "actual", "forecast", "previous"]:
+                if col not in cached.columns:
+                    cached[col] = ""
+            cached["datetime"] = pd.to_datetime(cached["date"].astype(str) + " " + cached["time"].astype(str), errors="coerce")
+            cached = cached.dropna(subset=["datetime"]).sort_values("datetime")
+            df = cached
+        else:
+            source_status = "BLOCKED"
+
+    # 3) si tenemos df válido, guardar caché (para próximos bloqueos)
+    if not df.empty and source_status == "OK":
+        try:
+            _save_daily_cache(cache_key, df)
+        except:
+            pass
+
+    # 4) construir eventos + mensaje
+    if source_status == "BLOCKED":
+        msg = _build_message([], title_date, source_status="BLOCKED")
+        send_telegram_message(msg)
+        if not force and not force_tomorrow:
+            _mark_sent(day_key)
+        return
 
     if _is_holiday(df):
         msg = _build_message("HOLIDAY", title_date)
