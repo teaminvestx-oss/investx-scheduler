@@ -9,7 +9,7 @@
 # - Agenda agrupada (evita repetir IPC 4 veces)
 # - Fallback digno si CME falla o no hay eventos
 # =====================================================
-
+error
 import os
 import json
 import logging
