@@ -1,615 +1,365 @@
-# =====================================================
-# econ_calendar.py — InvestX (CME + Macro Brief IA ES)
-# Fuente: CME Group (web pública)
-#
-# - 1 envío/día (state)
-# - force / force_tomorrow compatible con tu main.py
-# - Macro Brief IA estilo Bloomberg SIEMPRE en español (call_gpt_mini)
-# - Traducción/adaptación nombres + caché persistente
-# - Agenda agrupada (evita repetir IPC 4 veces)
-# - Fallback digno si CME falla o no hay eventos
-# =====================================================
+# === econ_calendar.py ===
+# Calendario económico (USA) para InvestX
+# Fuente principal: CME Group Economic Release Calendar (web)
+# - Sin APIs de pago
+# - Con control anti-duplicados para no spamear si Render ejecuta varias veces
+# - Opcional: resumen estilo Bloomberg usando call_gpt_mini (si está en utils)
+
 import os
-import json
-import logging
-import time as _time
-import random as _random
 import re
-from datetime import datetime, timedelta, time
-from typing import List, Dict, Any
+import json
+import time as _time
+from datetime import datetime, timedelta, date
+from typing import Any, Dict, List, Optional
 from zoneinfo import ZoneInfo
 
 import requests
 
-try:
-    from bs4 import BeautifulSoup
-except Exception:
-    BeautifulSoup = None  # fallback a regex
+from utils import send_telegram_message, call_gpt_mini  # asumimos que ya lo tienes así
 
-from utils import send_telegram_message, call_gpt_mini
-
-logger = logging.getLogger(__name__)
-logger.setLevel(logging.INFO)
-
-STATE_FILE = "econ_calendar_state.json"
-TRANSLATION_CACHE_FILE = "econ_translation_cache.json"
-
+# -----------------------
+# Config
+# -----------------------
 TZ = ZoneInfo("Europe/Madrid")
+STATE_FILE = "econ_calendar_state.json"
 
-# CME página pública
-CME_URL = "https://www.cmegroup.com/education/events/economic-releases-calendar.html"
+CME_PAGE_URL = "https://www.cmegroup.com/education/events/economic-releases-calendar.html"
 
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (X11; Linux x86_64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/120.0 Safari/537.36"
-    ),
-    "Accept-Language": "en-US,en;q=0.9",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-}
+# Si quieres “solo USA”, dejamos un filtro por país/flag si viene en los datos
+ONLY_USA = os.getenv("ECON_ONLY_USA", "1").strip().lower() in ("1", "true", "yes")
 
-MAX_RETRIES = 3
-TIMEOUT = 25
+# Impact filter (si la fuente lo trae): Market Mover / Merits Extra Attention / Other Key Indicator
+# En CME web lo ves como filtros; aquí lo dejamos flexible:
+IMPACT_ALLOW = set(
+    x.strip().lower()
+    for x in os.getenv("ECON_IMPACT_ALLOW", "market mover,merits extra attention").split(",")
+    if x.strip()
+)
 
-
-# ================================
-# ESTADO DE ENVÍO (solo 1 vez)
-# ================================
-def _load_state():
+# Anti-spam: solo 1 envío por "target_date" (hoy o mañana)
+def _load_state() -> Dict[str, Any]:
     if not os.path.exists(STATE_FILE):
         return {}
     try:
         with open(STATE_FILE, "r", encoding="utf-8") as f:
             return json.load(f)
-    except:
+    except Exception:
         return {}
 
-
-def _save_state(d):
+def _save_state(d: Dict[str, Any]) -> None:
     try:
         with open(STATE_FILE, "w", encoding="utf-8") as f:
             json.dump(d, f)
-    except:
+    except Exception:
         pass
 
-
-def _already_sent(day_key: str) -> bool:
+def _already_sent(target_key: str) -> bool:
     st = _load_state()
-    return st.get("sent_day") == day_key
+    return st.get("sent_key") == target_key
 
-
-def _mark_sent(day_key: str):
+def _mark_sent(target_key: str) -> None:
     st = _load_state()
-    st["sent_day"] = day_key
+    st["sent_key"] = target_key
+    st["sent_at"] = datetime.now(TZ).isoformat()
     _save_state(st)
 
+def _safe_get(url: str, headers: Optional[Dict[str, str]] = None, timeout: int = 25) -> str:
+    # Headers “normales” (no para esconder nada), solo para evitar respuestas raras por missing UA
+    h = {
+        "User-Agent": "Mozilla/5.0 (InvestX Econ Calendar Bot; +https://investx.ai)",
+        "Accept": "text/html,application/json;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9,es;q=0.8",
+        "Connection": "close",
+    }
+    if headers:
+        h.update(headers)
+    r = requests.get(url, headers=h, timeout=timeout)
+    r.raise_for_status()
+    return r.text
 
-# ================================
-# CACHÉ DE TRADUCCIÓN
-# ================================
-def _load_translation_cache() -> Dict[str, str]:
-    if not os.path.exists(TRANSLATION_CACHE_FILE):
-        return {}
-    try:
-        with open(TRANSLATION_CACHE_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except:
-        return {}
+def _safe_get_json(url: str, headers: Optional[Dict[str, str]] = None, timeout: int = 25) -> Any:
+    h = {
+        "User-Agent": "Mozilla/5.0 (InvestX Econ Calendar Bot; +https://investx.ai)",
+        "Accept": "application/json,text/plain,*/*",
+        "Accept-Language": "en-US,en;q=0.9,es;q=0.8",
+        "Connection": "close",
+    }
+    if headers:
+        h.update(headers)
+    r = requests.get(url, headers=h, timeout=timeout)
+    r.raise_for_status()
+    return r.json()
 
-
-def _save_translation_cache(d: Dict[str, str]):
-    try:
-        with open(TRANSLATION_CACHE_FILE, "w", encoding="utf-8") as f:
-            json.dump(d, f, ensure_ascii=False)
-    except:
-        pass
-
-
-# =====================================================
-# FETCH CME
-# =====================================================
-def _fetch_cme_html() -> str:
-    last_err = None
-    for attempt in range(1, MAX_RETRIES + 1):
-        try:
-            r = requests.get(CME_URL, headers=HEADERS, timeout=TIMEOUT)
-            r.raise_for_status()
-            return r.text or ""
-        except Exception as e:
-            last_err = e
-            logger.error(f"[econ] CME html exception attempt {attempt}/{MAX_RETRIES}: {e}")
-            _time.sleep(0.8 + _random.random() * 0.8)
-    raise last_err
-
-
-# =====================================================
-# PARSE CME -> eventos normalizados
-# Objetivo: lista de dicts con:
-#   datetime, event, stars(2-3), forecast, previous
-#
-# CME puede cambiar HTML; hacemos:
-#  1) Intento JSON embebido (si aparece)
-#  2) Intento tabla HTML (si aparece)
-#  3) Fallback vacío
-# =====================================================
-def _parse_time_to_dt(date_ref: datetime, hhmm: str) -> datetime:
-    # hhmm esperado "08:30" etc. Si no, 00:00
-    try:
-        hhmm = (hhmm or "").strip()
-        m = re.match(r"^(\d{1,2}):(\d{2})$", hhmm)
-        if not m:
-            return datetime.combine(date_ref.date(), time(0, 0), tzinfo=TZ)
-        h = int(m.group(1))
-        mi = int(m.group(2))
-        return datetime.combine(date_ref.date(), time(h, mi), tzinfo=TZ)
-    except:
-        return datetime.combine(date_ref.date(), time(0, 0), tzinfo=TZ)
-
-
-def _stars_from_event_name(name: str) -> int:
+# -----------------------
+# CME fetcher (heurístico)
+# -----------------------
+def _extract_candidate_urls(html: str) -> List[str]:
     """
-    CME no trae 'importance' estándar.
-    Asignamos heurística:
-    - 3⭐: IPC/CPI, PCE, NFP, Unemployment, FOMC/Fed, GDP, ISM, Retail Sales, CPI Core, Core PCE
-    - 2⭐: Jobless claims, PMI, Philly Fed, Durable Goods, Housing, Confidence, Treasury auctions (si salen)
-    - 1⭐: resto
+    Busca URLs candidatas en el HTML que suenan a endpoints internos:
+    - EconomicReleaseCalendar
+    - event-calendar / calendar
+    - json
     """
-    n = (name or "").lower()
-    three = [
-        "cpi", "consumer price", "pce", "nonfarm", "payroll", "unemployment",
-        "fomc", "fed rate", "interest rate", "gdp", "ism", "retail sales",
-        "core cpi", "core pce", "ppi"
-    ]
-    two = [
-        "jobless", "claims", "pmi", "philadelphia", "philly", "durable goods",
-        "housing", "confidence", "sentiment", "treasury", "auction", "t-bill", "t-note", "t-bond"
-    ]
-    if any(k in n for k in three):
-        return 3
-    if any(k in n for k in two):
-        return 2
-    return 1
+    urls = set()
 
+    # URLs absolutas
+    for m in re.findall(r'https?://[^\s"\'<>]+', html):
+        if any(k in m.lower() for k in ("economic", "calendar", "event-calendar", "economicreleasecalendar", ".json")):
+            urls.add(m)
 
-def _extract_json_like(html: str) -> List[Dict[str, Any]]:
+    # URLs relativas tipo /something.json o /CmeWS/...
+    for m in re.findall(r'/(?:[A-Za-z0-9\-_./]+)', html):
+        ml = m.lower()
+        if any(k in ml for k in ("economic", "calendar", "event-calendar", "economicreleasecalendar", ".json", "cnews", "cmews", "mvc")):
+            # construye absoluta
+            urls.add("https://www.cmegroup.com" + m)
+
+    # limpia basuras
+    clean = []
+    for u in urls:
+        if u.startswith("https://www.cmegroup.com"):
+            clean.append(u.split("#")[0])
+    return sorted(set(clean))
+
+def _try_parse_events_from_json_payload(payload: Any, target_day: date) -> List[Dict[str, Any]]:
     """
-    Algunos sitios embeben datos en JSON dentro de scripts.
-    Buscamos patrones típicos de arrays con campos como 'title','time','country'.
-    Si no encontramos, devolvemos [].
+    Intenta normalizar “algo” a lista de eventos con campos básicos.
+    Como no garantizamos el shape exacto, hacemos heurística.
     """
-    out: List[Dict[str, Any]] = []
+    events: List[Dict[str, Any]] = []
 
-    # Heurística: buscar bloques que parezcan JSON con "country":"US" o "United States"
-    # No garantizado; es solo intento.
-    candidates = re.findall(r"\{[^{}]{50,2000}\}", html)
-    for c in candidates[:400]:
-        if ("\"US\"" not in c and "United States" not in c and "\"country\"" not in c):
-            continue
-        # Intento muy prudente: no parseamos todo, solo extraemos campos simples con regex
-        country = None
-        title = None
-        ttime = None
-        fc = ""
-        pv = ""
-        m_country = re.search(r"\"country\"\s*:\s*\"([^\"]+)\"", c)
-        if m_country:
-            country = m_country.group(1)
-        m_title = re.search(r"\"(title|event|name)\"\s*:\s*\"([^\"]+)\"", c)
-        if m_title:
-            title = m_title.group(2)
-        m_time = re.search(r"\"time\"\s*:\s*\"([0-9]{1,2}:[0-9]{2})\"", c)
-        if m_time:
-            ttime = m_time.group(1)
+    def to_dt(val: Any) -> Optional[datetime]:
+        if val is None:
+            return None
+        if isinstance(val, (int, float)):
+            # epoch ms/sec heurístico
+            if val > 10_000_000_000:
+                return datetime.fromtimestamp(val / 1000, tz=TZ)
+            return datetime.fromtimestamp(val, tz=TZ)
+        if isinstance(val, str):
+            s = val.strip()
+            # ISO
+            try:
+                # intenta parse simple
+                return datetime.fromisoformat(s.replace("Z", "+00:00")).astimezone(TZ)
+            except Exception:
+                pass
+        return None
 
-        if country and title and ttime:
-            out.append({"country": country, "event": title, "time": ttime, "forecast": fc, "previous": pv})
+    def walk(obj: Any):
+        if isinstance(obj, dict):
+            # posible evento
+            keys = {k.lower() for k in obj.keys()}
+            if any(k in keys for k in ("event", "eventname", "title", "name")) and any(k in keys for k in ("date", "datetime", "release", "time", "timestamp", "releasedate")):
+                # intenta montar evento
+                name = obj.get("eventName") or obj.get("event") or obj.get("title") or obj.get("name")
+                dval = obj.get("date") or obj.get("dateTime") or obj.get("datetime") or obj.get("releaseDate") or obj.get("timestamp") or obj.get("time")
+                dt = to_dt(dval)
 
-    return out
+                country = obj.get("country") or obj.get("countryName") or obj.get("locale") or obj.get("region")
+                impact = obj.get("impact") or obj.get("importance") or obj.get("impactLevel")
 
+                actual = obj.get("actual") or obj.get("act")
+                forecast = obj.get("forecast") or obj.get("consensus") or obj.get("cons")
+                previous = obj.get("previous") or obj.get("prev")
 
-def _parse_table(html: str) -> List[Dict[str, Any]]:
-    if not BeautifulSoup:
-        return []
-    soup = BeautifulSoup(html, "html.parser")
+                if dt is not None and dt.date() == target_day:
+                    events.append({
+                        "name": str(name) if name is not None else "Evento",
+                        "dt": dt,
+                        "country": str(country) if country is not None else "",
+                        "impact": str(impact) if impact is not None else "",
+                        "actual": actual,
+                        "forecast": forecast,
+                        "previous": previous,
+                    })
 
-    events = []
-    rows = soup.select("table tbody tr")
-    for row in rows:
-        cols = [c.get_text(" ", strip=True) for c in row.find_all("td")]
-        if len(cols) < 3:
-            continue
+            for v in obj.values():
+                walk(v)
 
-        # Muy habitual: Time | Country | Event | Actual | Forecast | Previous...
-        ttime = (cols[0] or "").strip()
-        country = (cols[1] or "").strip()
-        event = (cols[2] or "").strip()
+        elif isinstance(obj, list):
+            for it in obj:
+                walk(it)
 
-        # Forecast / Previous si están
-        forecast = cols[4].strip() if len(cols) >= 5 else ""
-        previous = cols[5].strip() if len(cols) >= 6 else ""
+    walk(payload)
 
-        if not event:
-            continue
+    # filtro USA si aplica
+    if ONLY_USA:
+        filtered = []
+        for e in events:
+            c = (e.get("country") or "").lower()
+            # acepta "US", "United States", etc.
+            if ("united states" in c) or (c.strip() == "us") or ("usa" in c):
+                filtered.append(e)
+        events = filtered
 
-        events.append({
-            "country": country,
-            "event": event,
-            "time": ttime,
-            "forecast": forecast,
-            "previous": previous
-        })
+    # impacto allow si viene
+    if IMPACT_ALLOW:
+        tmp = []
+        for e in events:
+            imp = (e.get("impact") or "").lower()
+            if not imp:
+                tmp.append(e)  # si no viene, no lo descartamos
+            elif any(a in imp for a in IMPACT_ALLOW):
+                tmp.append(e)
+        events = tmp
 
+    # ordena por hora
+    events.sort(key=lambda x: x["dt"])
     return events
 
+def _fetch_cme_events(target_day: date) -> List[Dict[str, Any]]:
+    """
+    Estrategia:
+    1) Descarga HTML de la página CME
+    2) Extrae URLs candidatas a JSON/endpoints
+    3) Prueba varias y busca eventos del target_day
+    """
+    html = _safe_get(CME_PAGE_URL)
 
-def _get_cme_events_for_day(date_ref: datetime) -> List[Dict]:
-    html = _fetch_cme_html()
+    candidates = _extract_candidate_urls(html)
 
-    # 1) intentar JSON-like
-    raw = _extract_json_like(html)
+    # Prioriza URLs con pinta de datos
+    def score(u: str) -> int:
+        ul = u.lower()
+        s = 0
+        if "economicreleasecalendar" in ul: s += 5
+        if "calendar" in ul: s += 3
+        if "event" in ul: s += 2
+        if ul.endswith(".json") or ".json?" in ul: s += 3
+        if "mvc" in ul or "cmews" in ul: s += 2
+        return s
 
-    # 2) si no, intentar tabla HTML
-    if not raw:
-        raw = _parse_table(html)
+    candidates = sorted(candidates, key=score, reverse=True)
 
-    # 3) normalizar
-    out = []
-    for r in raw:
-        country = (r.get("country") or "").strip()
-        # Aceptamos "US", "United States", "USA"
-        country_low = country.lower()
-        if not (country_low in ("us", "usa", "united states", "united states of america")):
+    last_err: Optional[Exception] = None
+
+    for u in candidates[:30]:  # no queremos 200 llamadas
+        try:
+            # intenta JSON directo
+            if ".json" in u.lower() or "calendar" in u.lower() or "economic" in u.lower():
+                payload = _safe_get_json(u)
+                ev = _try_parse_events_from_json_payload(payload, target_day)
+                if ev:
+                    return ev
+        except Exception as e:
+            last_err = e
             continue
 
-        ev = (r.get("event") or "").strip()
-        if not ev:
-            continue
+    # Si no encontró nada, devuelve vacío
+    if last_err:
+        print(f"[econ] CME fetch failed (no usable endpoint found). Last error: {last_err}")
+    return []
 
-        ttime = (r.get("time") or "").strip()
-        dt = _parse_time_to_dt(date_ref, ttime)
+# -----------------------
+# Formatting + GPT rewrite
+# -----------------------
+def _format_header(target_day: date) -> str:
+    # “Mon 09/02”
+    dt = datetime(target_day.year, target_day.month, target_day.day, tzinfo=TZ)
+    dow = dt.strftime("%a")  # Mon/Tue...
+    return f"📅 Calendario económico — {dow} {dt.strftime('%d/%m')}"
 
-        stars = _stars_from_event_name(ev)
-
-        out.append({
-            "datetime": dt,
-            "event": ev,
-            "stars": int(stars),
-            "forecast": (r.get("forecast") or "").strip(),
-            "previous": (r.get("previous") or "").strip(),
-        })
-
-    # Orden y límite: igual filosofía (2-3⭐, máx 6)
-    out = [e for e in out if e["stars"] >= 2]
-    out.sort(key=lambda x: (-x["stars"], x["datetime"]))
-    out = out[:6]
-    out.sort(key=lambda x: x["datetime"])
-    return out
-
-
-# =====================================================
-# TRADUCCIÓN / ADAPTACIÓN (reglas + IA + caché)
-# =====================================================
-def _normalize_event_name(name: str) -> str:
-    if not isinstance(name, str):
-        return ""
-    return " ".join(name.strip().split()).lower()
-
-
-def _translate_event_name_rules(ev_name: str) -> str:
-    if not isinstance(ev_name, str) or not ev_name.strip():
-        return ""
-
-    s = " ".join(ev_name.strip().split())
-    n = s.lower()
-
-    # Empleo
-    if "initial jobless claims" in n or ("jobless" in n and "claims" in n):
-        return "Solicitudes semanales de subsidio por desempleo"
-    if "nonfarm payroll" in n or "non-farm payroll" in n or "payrolls" in n:
-        return "Nóminas no agrícolas (NFP)"
-    if "unemployment" in n and "rate" in n:
-        return "Tasa de desempleo"
-    if "average hourly earnings" in n:
-        return "Salario medio por hora"
-
-    # Inflación
-    if "core cpi" in n:
-        return "IPC subyacente (sin energía ni alimentos)"
-    if "cpi" in n or "consumer price" in n:
-        return "IPC (índice de precios al consumidor)"
-    if "pce" in n:
-        return "PCE (inflación preferida por la Fed)"
-    if "ppi" in n or "producer price" in n:
-        return "IPP (precios de producción)"
-
-    # Actividad
-    if "gdp" in n:
-        return "PIB"
-    if "ism" in n:
-        return "ISM (actividad)"
-    if "pmi" in n:
-        return "PMI (actividad)"
-    if "retail sales" in n:
-        return "Ventas minoristas"
-    if "philadelphia" in n:
-        return "Índice manufacturero Fed de Filadelfia"
-
-    # Fed
-    if "fomc" in n:
-        return "Fed (FOMC)"
-    if "fed" in n and ("speech" in n or "speaks" in n):
-        return "Fed: discursos"
-
-    return s
-
-
-def _gpt_translate_event_name(raw: str) -> str:
-    if not isinstance(raw, str) or not raw.strip():
-        return ""
-
-    raw_clean = " ".join(raw.strip().split())
-    key = raw_clean.lower()
-
-    cache = _load_translation_cache()
-    if key in cache and cache[key]:
-        return cache[key]
-
-    api_key = os.getenv("OPENAI_API_KEY", "").strip()
-    if not api_key:
-        return raw_clean
-
-    system_prompt = (
-        "Eres traductor/editor macro. Devuelve SOLO la traducción al español, "
-        "corta y natural para un canal de trading. Sin comillas."
-    )
-    user_prompt = (
-        "Traduce este nombre de evento macro al español claro.\n"
-        "- Mantén siglas útiles (Fed, FOMC, IPC, PCE, NFP, PMI).\n"
-        "- Si es una subasta, dilo como 'Subasta del Tesoro USA (10 años)' etc.\n"
-        "- Si es un discurso, dilo como 'Discurso de X (Fed)' si aparece el nombre.\n"
-        "- No añadas datos que no estén.\n\n"
-        f"Evento: {raw_clean}"
-    )
-
-    try:
-        out = call_gpt_mini(system_prompt, user_prompt, max_tokens=40).strip()
-    except Exception as e:
-        logger.warning(f"GPT translate falló: {e}")
-        out = ""
-
-    if not out:
-        out = raw_clean
-
-    cache[key] = out
-    _save_translation_cache(cache)
-    return out
-
-
-def _translate_event_name_smart(raw: str) -> str:
-    if not isinstance(raw, str) or not raw.strip():
-        return ""
-    raw_clean = " ".join(raw.strip().split())
-    rule_es = _translate_event_name_rules(raw_clean)
-    if rule_es.strip().lower() == raw_clean.strip().lower():
-        return _gpt_translate_event_name(raw_clean)
-    return rule_es
-
-
-# =====================================================
-# AGRUPACIÓN AGENDA (evita duplicados)
-# =====================================================
-def _bucket_event(ev_name: str) -> str:
-    n = _normalize_event_name(ev_name)
-
-    # Inflación
-    if "core cpi" in n or "cpi" in n or "consumer price" in n:
-        return "Inflación: IPC"
-    if "pce" in n:
-        return "Inflación: PCE (Fed)"
-    if "ppi" in n or "producer price" in n:
-        return "Inflación: IPP"
-
-    # Empleo
-    if "jobless" in n or "claims" in n:
-        return "Empleo: jobless claims"
-    if "payroll" in n or "nonfarm" in n or "unemployment" in n or "earnings" in n:
-        return "Empleo"
-
-    # Actividad
-    if "gdp" in n:
-        return "Actividad: PIB"
-    if "ism" in n or "pmi" in n:
-        return "Actividad: ISM/PMI"
-    if "retail sales" in n:
-        return "Actividad: consumo"
-    if "philadelphia" in n or "philly" in n:
-        return "Actividad: Fed de Filadelfia"
-
-    # Fed
-    if "fomc" in n or ("fed" in n and ("speech" in n or "speaks" in n)):
-        return "Fed"
-
-    return "Otros"
-
-
-def _group_agenda(events: List[Dict]) -> List[Dict]:
-    if not events:
-        return []
-
-    groups: Dict[str, Dict[str, Any]] = {}
-    for ev in events:
-        raw_name = (ev.get("event") or "").strip()
-        bucket = _bucket_event(raw_name)
-        dt = ev.get("datetime")
-        stars = int(ev.get("stars", 1))
-
-        example_es = _translate_event_name_smart(raw_name) or raw_name
-
-        if bucket not in groups:
-            groups[bucket] = {
-                "datetime": dt,
-                "stars": stars,
-                "label": bucket,
-                "examples": [example_es] if example_es else []
-            }
-        else:
-            if dt and groups[bucket]["datetime"] and dt < groups[bucket]["datetime"]:
-                groups[bucket]["datetime"] = dt
-            if stars > groups[bucket]["stars"]:
-                groups[bucket]["stars"] = stars
-            if example_es and example_es not in groups[bucket]["examples"]:
-                groups[bucket]["examples"].append(example_es)
-
-    out = []
-    for g in groups.values():
-        ex = g["examples"][:2]
-        suffix = (": " + " / ".join(ex)) if ex else ""
-        out.append({
-            "datetime": g["datetime"],
-            "stars": g["stars"],
-            "label": g["label"] + suffix
-        })
-
-    out.sort(key=lambda x: x["datetime"] or datetime.max.replace(tzinfo=TZ))
-    return out
-
-
-# =====================================================
-# MACRO BRIEF IA — SIEMPRE ESPAÑOL
-# =====================================================
-def _make_macro_brief(events: List[Dict]) -> str:
-    if not events:
-        return ""
-
-    api_key = os.getenv("OPENAI_API_KEY", "").strip()
-    if not api_key:
-        logger.warning("OPENAI_API_KEY no configurada. Macro Brief irá por fallback.")
-        return (
-            "Sesión marcada por referencias macro capaces de mover expectativas de tipos. "
-            "Si sorprenden al alza, presión para la renta variable y apoyo al USD/yields; "
-            "si salen más suaves, alivio para el riesgo y para los bonos."
-        )
-
-    # Contexto para IA
+def _format_events_plain(events: List[Dict[str, Any]]) -> str:
     lines = []
     for e in events:
-        dt = e.get("datetime")
-        hr = dt.strftime("%H:%M") if dt else ""
-        stars = "⭐" * int(e.get("stars", 1))
-        evn_raw = e.get("event", "")
-        evn_es = _translate_event_name_smart(evn_raw) or evn_raw
-        fc = e.get("forecast", "")
-        pv = e.get("previous", "")
+        t = e["dt"].strftime("%H:%M")
+        name = e["name"]
+        prev = e.get("previous")
+        cons = e.get("forecast")
+        act = e.get("actual")
 
-        extra = []
-        if fc:
-            extra.append(f"previsión: {fc}")
-        if pv:
-            extra.append(f"anterior: {pv}")
+        extras = []
+        if cons not in (None, "", "—", "-"):
+            extras.append(f"Cons: {cons}")
+        if prev not in (None, "", "—", "-"):
+            extras.append(f"Prev: {prev}")
+        if act not in (None, "", "—", "-"):
+            extras.append(f"Act: {act}")
 
-        tail = f" ({' | '.join(extra)})" if extra else ""
-        lines.append(f"- {stars} {hr} — {evn_es}{tail}")
-
-    event_block = "\n".join(lines)
-
-    system_prompt = (
-        "Eres analista macro senior en un desk institucional (estilo Bloomberg) "
-        "y escribes para un canal de Telegram en español. "
-        "Tono humano, directo y con criterio; cero relleno."
-    )
-
-    user_prompt = (
-        "Redacta un 'Macro Brief' en 2 a 4 frases.\n"
-        "Objetivo: que se entienda rápido qué puede mover hoy el mercado.\n\n"
-        "Reglas:\n"
-        "- No enumeres eventos ni horas (eso va debajo en la agenda).\n"
-        "- Puedes mencionar 1 dato por su nombre si es protagonista (ej: IPC, empleo, Fed).\n"
-        "- Agrupa mentalmente lo repetido.\n"
-        "- Usa condicionales claros: si sale por encima / por debajo de lo previsto.\n"
-        "- Conecta con: expectativas de la Fed/tipos, yields, USD y renta variable.\n"
-        "- No inventes resultados ni cifras.\n"
-        "- Prohibido escribir en inglés.\n\n"
-        "Contexto de eventos (solo para que entiendas el día):\n"
-        f"{event_block}\n"
-    )
-
-    try:
-        out = call_gpt_mini(system_prompt, user_prompt, max_tokens=200).strip()
-    except Exception as e:
-        logger.warning(f"call_gpt_mini falló: {e}")
-        out = ""
-
-    if not out:
-        out = (
-            "Sesión marcada por referencias macro capaces de mover expectativas de tipos. "
-            "Si sorprenden al alza, presión para la renta variable y apoyo al USD/yields; "
-            "si salen más suaves, alivio para el riesgo y para los bonos."
-        )
-
-    return out
-
-
-# =====================================================
-# MENSAJE FINAL (Brief + Agenda agrupada)
-# =====================================================
-def _build_message(events: List[Dict], date_ref: datetime) -> str:
-    fecha = date_ref.strftime("%a %d/%m").replace(".", "")
-
-    if not events:
-        return (
-            f"📅 Calendario económico — {fecha}\n\n"
-            "Hoy no hay datos macro relevantes en EE. UU."
-        )
-
-    brief = _make_macro_brief(events)
-    agenda = _group_agenda(events)
-
-    lines = [f"🧠 Macro Brief (EE. UU.) — {fecha}\n", brief, "\nAgenda clave:"]
-
-    for a in agenda:
-        dt = a.get("datetime")
-        hr = dt.strftime("%H:%M") if dt else ""
-        stars = "⭐" * int(a.get("stars", 1))
-        label = a.get("label", "")
-        lines.append(f"{stars} {hr} — {label}".strip())
-
+        tail = f" ({' | '.join(extras)})" if extras else ""
+        lines.append(f"• {t} — {name}{tail}")
     return "\n".join(lines)
 
-
-# =====================================================
-# FUNCIÓN PRINCIPAL (COMPATIBLE CON TU MAIN)
-# =====================================================
-def run_econ_calendar(force: bool = False, force_tomorrow: bool = False):
+def _bloomberg_rewrite(header: str, body_plain: str) -> str:
     """
-    Compatible con main.py:
-      run_econ_calendar(force=True, force_tomorrow=True)
+    Si tienes call_gpt_mini operativo, lo usamos para un texto estilo Bloomberg.
+    Si falla, devolvemos el plain.
+    """
+    try:
+        prompt = f"""
+Eres un redactor financiero tipo Bloomberg. Escribe un mensaje corto para Telegram (máx 700 caracteres),
+en español, basado SOLO en estos eventos. No inventes datos.
+
+Título: {header}
+
+Eventos (lista):
+{body_plain}
+
+Formato deseado:
+- 1 línea de título
+- 2–6 bullets con lo más relevante (impacto/tema)
+- Si no hay eventos, dilo de forma clara.
+"""
+        txt = call_gpt_mini(prompt).strip()
+        if txt:
+            return txt
+    except Exception as e:
+        print(f"[econ] GPT rewrite failed: {e}")
+    return f"{header}\n\n{body_plain}"
+
+# -----------------------
+# Public entry point
+# -----------------------
+def run_econ_calendar(force: bool = False, force_tomorrow: bool = False) -> None:
+    """
+    force=True  -> ignora anti-duplicados (pero sigue intentando enviar 1 mensaje coherente)
+    force_tomorrow=True -> target_day = mañana (para pruebas manuales)
     """
     now = datetime.now(TZ)
-    day_key = now.strftime("%Y-%m-%d")
+    target_day = (now.date() + timedelta(days=1)) if force_tomorrow else now.date()
+    target_key = f"econ:{target_day.isoformat()}"
 
-    # Control 1 vez al día (solo para hoy; mañana también se controla por day_key de hoy)
-    if not force and not force_tomorrow:
-        if _already_sent(day_key):
-            logger.info("econ_calendar: ya enviado hoy.")
-            return
+    if (not force) and _already_sent(target_key):
+        print(f"[econ] SKIP: ya enviado para {target_key}")
+        return
 
-    # Fecha objetivo
-    if force_tomorrow:
-        target = now + timedelta(days=1)
-        title_date = target
-    else:
-        target = now
-        title_date = now
+    # reintentos suaves
+    last_err: Optional[Exception] = None
+    events: List[Dict[str, Any]] = []
 
-    try:
-        events = _get_cme_events_for_day(target)
-    except Exception as e:
-        logger.error(f"[econ] CME fetch/parse failed: {e}")
-        events = []
+    for attempt in range(1, 4):
+        try:
+            events = _fetch_cme_events(target_day)
+            last_err = None
+            break
+        except Exception as e:
+            last_err = e
+            print(f"[econ] CME exception attempt {attempt}/3: {e}")
+            _time.sleep(0.8 * attempt)
 
-    msg = _build_message(events, title_date)
+    header = _format_header(target_day)
+
+    if not events:
+        # mensaje “sin eventos”
+        msg_plain = f"{header}\n\nHoy no hay datos macro relevantes en EE. UU."
+        # opcional: que GPT lo deje bonito (pero ya es corto)
+        try:
+            msg = _bloomberg_rewrite(header, "No hay publicaciones macro relevantes en EE. UU.")
+        except Exception:
+            msg = msg_plain
+
+        send_telegram_message(msg)
+        _mark_sent(target_key)
+        if last_err:
+            print(f"[econ] CME returned EMPTY after retries (with error): {last_err}")
+        else:
+            print("[econ] CME returned EMPTY (no events for target day).")
+        return
+
+    body_plain = _format_events_plain(events)
+    msg = _bloomberg_rewrite(header, body_plain)
+
     send_telegram_message(msg)
-
-    if not force and not force_tomorrow:
-        _mark_sent(day_key)
+    _mark_sent(target_key)
+    print(f"[econ] SENT OK for {target_key} ({len(events)} events).")
