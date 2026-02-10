@@ -20,10 +20,6 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 # CME FETCH
 # =====================
 def fetch_cme_events(date_yyyy_mm_dd: str) -> list[dict]:
-    """
-    Descarga eventos CME (USA) para una fecha concreta.
-    Devuelve lista de eventos crudos.
-    """
     payload = {
         "startDate": date_yyyy_mm_dd,
         "endDate": date_yyyy_mm_dd,
@@ -53,10 +49,6 @@ def fetch_cme_events(date_yyyy_mm_dd: str) -> list[dict]:
 # GPT BLOOMBERG STYLE
 # =====================
 def gpt_calendar_es(events: list[dict], date_label_es: str) -> str:
-    """
-    Traduce + lista eventos + interpretación Bloomberg.
-    TODO en español.
-    """
     if not OPENAI_API_KEY:
         return f"📅 **Agenda macro — {date_label_es}**\n\n⚠️ OPENAI_API_KEY no configurada."
 
@@ -98,7 +90,7 @@ Eventos crudos (JSON):
 # =====================
 def send_telegram(text: str):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print("[econ] Telegram no configurado, imprimo mensaje:\n")
+        print("[econ] Telegram no configurado (TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID). Imprimo mensaje:\n")
         print(text)
         return
 
@@ -109,13 +101,14 @@ def send_telegram(text: str):
         "parse_mode": "Markdown",
         "disable_web_page_preview": True,
     }
-    requests.post(url, json=payload, timeout=15)
+    requests.post(url, json=payload, timeout=15).raise_for_status()
 
 
 # =====================
-# MAIN
+# MAIN ENTRY
 # =====================
-def run_econ_calendar():
+def run_econ_calendar(force: bool = False, **kwargs):
+    # `force` existe SOLO para que tu main.py no rompa. No lo usamos.
     today = datetime.now().strftime("%Y-%m-%d")
     date_label_es = datetime.now().strftime("%A %d de %B").capitalize()
 
