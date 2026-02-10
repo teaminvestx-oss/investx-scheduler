@@ -1,278 +1,366 @@
+# === econ_calendar.py ===
+# InvestX - Economic Calendar (CME)
+# - Bootstrap cookies (GET page) + POST /services/economic-release-events
+# - Spanish output + Bloomberg-style interpretation via OpenAI API
+# - Telegram via ENV: INVESTX_TOKEN + CHAT_ID (compat with TELEGRAM_* too)
+# - Anti-duplicate daily sending (state file)
+#
+# NOTE:
+# CME puede bloquear IPs de datacenter (Render) con 403. En ese caso,
+# el script NO revienta: envía aviso + (opcional) interpretación "sin datos".
+
+from __future__ import annotations
+
 import os
 import json
-import requests
-from datetime import datetime, timedelta
+import time
+from datetime import datetime, timedelta, date
 from zoneinfo import ZoneInfo
-from typing import List, Dict, Any, Optional
+from typing import Any, Dict, List, Optional, Tuple
+
+import requests
 
 
-# =========================
-# Config
-# =========================
-CME_CALENDAR_PAGE = "https://www.cmegroup.com/education/events/economic-releases-calendar.html"
-CME_EVENTS_API    = "https://www.cmegroup.com/services/economic-release-events"
-
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID")
-
-# Estado para evitar duplicados (1 envío/día)
-STATE_FILE = "econ_calendar_state.json"
-
+# -----------------------------
+# CONFIG
+# -----------------------------
 TZ = ZoneInfo("Europe/Madrid")
 
+CME_PAGE_URL = "https://www.cmegroup.com/education/events/economic-releases-calendar.html"
+CME_EVENTS_URL = "https://www.cmegroup.com/services/economic-release-events"
 
-# =========================
-# State helpers (dedupe)
-# =========================
-def _load_state() -> dict:
+# Filtros por defecto (equivalente a lo que estás usando en la web)
+DEFAULT_COUNTRY = os.getenv("ECON_COUNTRY", "United States")  # en web sale "United States"
+DEFAULT_IMPACTS = os.getenv("ECON_IMPACTS", "Market Mover,Merits Extra Attention").strip()
+
+# Ventana / rango
+DAYS_FORWARD = int(os.getenv("ECON_DAYS_FORWARD", "1"))  # por defecto solo el día elegido
+
+# Retries / timeouts
+HTTP_TIMEOUT = int(os.getenv("ECON_HTTP_TIMEOUT", "25"))
+HTTP_RETRIES = int(os.getenv("ECON_HTTP_RETRIES", "3"))
+RETRY_SLEEP = float(os.getenv("ECON_RETRY_SLEEP", "1.5"))
+
+# OpenAI
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip()
+
+# Telegram
+STATE_FILE = "econ_calendar_state.json"
+
+
+# -----------------------------
+# Telegram sender (compat)
+# -----------------------------
+def _send_telegram(message: str) -> None:
+    token = (
+        os.getenv("INVESTX_TOKEN")
+        or os.getenv("TELEGRAM_BOT_TOKEN")
+        or os.getenv("TELEGRAM_TOKEN")
+    )
+    chat_id = (
+        os.getenv("CHAT_ID")
+        or os.getenv("TELEGRAM_CHAT_ID")
+        or os.getenv("TELEGRAM_CHAT")
+    )
+
+    if not token or not chat_id:
+        print("[econ] Telegram no configurado (INVESTX_TOKEN/CHAT_ID o TELEGRAM_*). Imprimo mensaje:")
+        print(message)
+        return
+
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    payload = {
+        "chat_id": chat_id,
+        "text": message,
+        "parse_mode": "Markdown",
+        "disable_web_page_preview": True,
+    }
+    try:
+        requests.post(url, json=payload, timeout=20).raise_for_status()
+    except Exception as e:
+        print(f"[econ] ERROR enviando Telegram: {e}")
+        print(message)
+
+
+# -----------------------------
+# State (anti-duplicate)
+# -----------------------------
+def _load_state() -> Dict[str, Any]:
     if not os.path.exists(STATE_FILE):
         return {}
     try:
         with open(STATE_FILE, "r", encoding="utf-8") as f:
-            return json.load(f) or {}
-    except:
+            return json.load(f)
+    except Exception:
         return {}
 
-def _save_state(d: dict) -> None:
+def _save_state(d: Dict[str, Any]) -> None:
     try:
         with open(STATE_FILE, "w", encoding="utf-8") as f:
             json.dump(d, f)
-    except:
+    except Exception:
         pass
 
-def _already_sent(target_date: str) -> bool:
+def _already_sent(day_key: str) -> bool:
     st = _load_state()
-    return st.get("sent_for_date") == target_date
+    return st.get("last_sent_day") == day_key
 
-def _mark_sent(target_date: str) -> None:
+def _mark_sent(day_key: str) -> None:
     st = _load_state()
-    st["sent_for_date"] = target_date
-    st["sent_at"] = datetime.now(TZ).isoformat()
+    st["last_sent_day"] = day_key
+    st["last_sent_at"] = datetime.now(TZ).isoformat()
     _save_state(st)
 
 
-# =========================
-# CME fetch (browser-like)
-# =========================
-def _fetch_cme_events(target_date: str) -> List[Dict[str, Any]]:
+# -----------------------------
+# OpenAI (Bloomberg-style)
+# -----------------------------
+def _openai_bloomberg_summary_es(day_label: str, events: List[Dict[str, Any]]) -> str:
     """
-    target_date: 'YYYY-MM-DD' (Europe/Madrid, solo para el rango de consulta)
+    Devuelve texto en español:
+    1) Lista de eventos (sin prev/consenso)
+    2) Interpretación tipo Bloomberg (riesgo / sesgo)
     """
-    session = requests.Session()
-
-    # 1) Warm-up para cookies / WAF
-    session.get(
-        CME_CALENDAR_PAGE,
-        headers={
-            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)",
-            "Accept-Language": "es-ES,es;q=0.9,en;q=0.8",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        },
-        timeout=25,
-    )
-
-    payload = {
-        "startDate": target_date,
-        "endDate": target_date,
-        "countries": ["United States"],
-        # Estos son los que ves en la web:
-        "impact": ["Market Mover", "Merits Extra Attention"],
-    }
-
-    headers = {
-        "Content-Type": "text/plain;charset=UTF-8",
-        "Accept": "application/json, text/plain, */*",
-        "Origin": "https://www.cmegroup.com",
-        "Referer": CME_CALENDAR_PAGE,
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)",
-        "X-Requested-With": "XMLHttpRequest",
-    }
-
-    resp = session.post(
-        CME_EVENTS_API,
-        data=json.dumps(payload),
-        headers=headers,
-        timeout=25,
-    )
-
-    # CME puede bloquear IPs de datacenter (Render) => 403
-    if resp.status_code == 403:
-        raise requests.HTTPError("403 Forbidden (WAF/Datacenter block)", response=resp)
-
-    resp.raise_for_status()
-    data = resp.json() if resp.content else {}
-    return data.get("events", []) or []
-
-
-# =========================
-# OpenAI (interpretación)
-# =========================
-def _interpret_with_openai(events: List[Dict[str, Any]], target_date: str) -> str:
+    # Si no hay key, devolvemos plantilla sin IA
     if not OPENAI_API_KEY:
-        # Sin OpenAI: fallback mínimo en ES
+        lines = [f"**AGENDA MACRO - EE.UU. ({day_label})**", ""]
         if not events:
-            return (
-                f"**AGENDA MACRO – EE.UU. ({target_date})**\n\n"
-                "No se publican datos macroeconómicos relevantes hoy.\n\n"
-                "**Sesgo esperado:** Neutral"
-            )
-        lines = []
-        for e in events:
-            name = e.get("eventName") or e.get("name") or "Evento"
-            time = e.get("eventTime") or e.get("time") or ""
-            impact = e.get("impact") or ""
-            lines.append(f"- {name} ({time}) {('— ' + impact) if impact else ''}".strip())
-        return (
-            f"**AGENDA MACRO – EE.UU. ({target_date})**\n\n"
-            + "\n".join(lines)
-            + "\n\n**Sesgo esperado:** Neutral"
-        )
+            lines.append("- **Eventos:** No se reportan eventos significativos para el día.")
+            lines.append("")
+            lines.append("**Lectura rápida:** Sesgo neutral por falta de referencias macro concretas.")
+            return "\n".join(lines)
 
-    # Prepara lista “limpia” (sin consenso/previo)
+    # Reducimos payload para no meter ruido
     compact = []
-    for e in events:
+    for e in events[:30]:
         compact.append({
-            "time": e.get("eventTime") or e.get("time") or "",
-            "event": e.get("eventName") or e.get("name") or "",
-            "impact": e.get("impact") or "",
-            "country": e.get("country") or "United States",
+            "time": e.get("time"),
+            "event": e.get("event"),
+            "country": e.get("country"),
+            "impact": e.get("impact"),
         })
 
-    prompt = f"""
-Eres un analista macro profesional (estilo Bloomberg) para un canal de trading.
-
-Objetivo:
-- Escribir en ESPAÑOL, claro, directo, sin jerga innecesaria.
-- Dar primero una LISTA de eventos (hora + evento + impacto).
-- Luego una interpretación breve de cada evento (1-2 frases por evento).
-- Finalmente un "Sesgo de riesgo" (Alcista / Bajista / Neutral) y por qué en 2-3 líneas.
-- NO menciones "consenso" ni "previo" ni valores numéricos (aunque existan).
-- Si un evento no es relevante para mercados, dilo.
-
-Fecha objetivo: {target_date}
-País: Estados Unidos
-
-Eventos (JSON):
-{json.dumps(compact, ensure_ascii=False)}
-""".strip()
-
-    r = requests.post(
-        "https://api.openai.com/v1/chat/completions",
-        headers={
-            "Authorization": f"Bearer {OPENAI_API_KEY}",
-            "Content-Type": "application/json",
-        },
-        json={
-            "model": "gpt-4o-mini",
-            "messages": [{"role": "user", "content": prompt}],
-            "temperature": 0.3,
-        },
-        timeout=45,
+    sys = (
+        "Eres el analista macro de un canal financiero (estilo Bloomberg) para traders. "
+        "Escribes SIEMPRE en español neutro, conciso y accionable. "
+        "NO inventes datos. No incluyas consenso ni dato previo. "
+        "Formato:\n"
+        "1) Título\n"
+        "2) Lista de eventos con hora + evento + etiqueta de impacto\n"
+        "3) Interpretación (2-5 bullets) sobre posible volatilidad y sesgo (risk-on/off/neutral)\n"
+        "4) Nota final muy corta (gestión de riesgo)\n"
     )
-    r.raise_for_status()
-    return r.json()["choices"][0]["message"]["content"]
+
+    user = {
+        "day_label": day_label,
+        "events": compact,
+        "instructions": "Traduce los nombres de eventos al español si vienen en inglés.",
+    }
+
+    try:
+        # Chat Completions simple (compatible)
+        r = requests.post(
+            "https://api.openai.com/v1/chat/completions",
+            headers={"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"},
+            json={
+                "model": OPENAI_MODEL,
+                "temperature": 0.2,
+                "messages": [
+                    {"role": "system", "content": sys},
+                    {"role": "user", "content": json.dumps(user, ensure_ascii=False)},
+                ],
+            },
+            timeout=35,
+        )
+        r.raise_for_status()
+        data = r.json()
+        text = data["choices"][0]["message"]["content"].strip()
+        return text
+    except Exception as e:
+        # fallback sin IA
+        lines = [f"**AGENDA MACRO - EE.UU. ({day_label})**", ""]
+        if not events:
+            lines.append("- **Eventos:** No se reportan eventos significativos para el día.")
+            lines.append("")
+            lines.append("**Lectura rápida:** Sesgo neutral por falta de referencias macro concretas.")
+        else:
+            lines.append("**Eventos:**")
+            for ev in events:
+                lines.append(f"- {ev.get('time','--:--')} — {ev.get('event','(evento)')} ({ev.get('impact','Impacto')})")
+            lines.append("")
+            lines.append("**Lectura rápida:** Posible aumento de volatilidad alrededor de los horarios clave.")
+        lines.append("")
+        lines.append(f"_OpenAI no disponible (error: {e})._")
+        return "\n".join(lines)
 
 
-# =========================
-# Telegram send
-# =========================
-def _send_telegram(text: str) -> None:
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print("[econ] Telegram no configurado (TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID). Imprimo mensaje:\n")
-        print(text)
-        return
+# -----------------------------
+# CME fetch (bootstrap + POST)
+# -----------------------------
+def _browser_headers() -> Dict[str, str]:
+    # Imitación razonable (Safari/Chrome)
+    return {
+        "User-Agent": (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15"
+        ),
+        "Accept": "*/*",
+        "Accept-Language": "es-ES,es;q=0.9,en;q=0.8",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Origin": "https://www.cmegroup.com",
+        "Referer": CME_PAGE_URL,
+        "Connection": "keep-alive",
+    }
 
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    resp = requests.post(
-        url,
-        json={
-            "chat_id": TELEGRAM_CHAT_ID,
-            "text": text,
-            "parse_mode": "Markdown",
-            "disable_web_page_preview": True,
-        },
-        timeout=25,
-    )
-    resp.raise_for_status()
+def _bootstrap_session(sess: requests.Session) -> None:
+    # 1) GET a la página -> cookies + seteo inicial
+    sess.get(CME_PAGE_URL, headers=_browser_headers(), timeout=HTTP_TIMEOUT)
+
+def _build_cme_payload(day_from: date, day_to: date) -> str:
+    """
+    CME espera Content-Type text/plain; en Safari suele ir un JSON en texto.
+    Payload "mínimo" replicando filtros:
+    - country: United States
+    - impact: Market Mover, Merits Extra Attention
+    - rango fechas
+    """
+    impacts = [x.strip() for x in DEFAULT_IMPACTS.split(",") if x.strip()]
+
+    payload = {
+        "country": DEFAULT_COUNTRY,
+        "impacts": impacts,
+        "fromDate": day_from.isoformat(),
+        "toDate": day_to.isoformat(),
+        "timezone": "America/Chicago",  # CME muestra CT
+        "language": "en",               # el backend suele devolver en inglés; luego traducimos con IA
+    }
+    return json.dumps(payload, ensure_ascii=False)
+
+def fetch_cme_events(day_local: date) -> Tuple[List[Dict[str, Any]], Optional[str]]:
+    """
+    Devuelve (events, error_string)
+    events: lista normalizada con keys: time, event, country, impact
+    """
+    day_from = day_local
+    day_to = day_local + timedelta(days=max(0, DAYS_FORWARD - 1))
+
+    sess = requests.Session()
+    headers = _browser_headers()
+
+    last_err: Optional[str] = None
+
+    for attempt in range(1, HTTP_RETRIES + 1):
+        try:
+            _bootstrap_session(sess)
+
+            body = _build_cme_payload(day_from, day_to)
+
+            resp = sess.post(
+                CME_EVENTS_URL,
+                headers={**headers, "Content-Type": "text/plain;charset=UTF-8"},
+                data=body,
+                timeout=HTTP_TIMEOUT,
+            )
+
+            # Si CME bloquea por WAF, suele ser 403
+            if resp.status_code == 403:
+                last_err = "403_FORBIDDEN"
+                raise requests.HTTPError("403 Client Error: Forbidden", response=resp)
+
+            resp.raise_for_status()
+
+            data = resp.json()
+
+            raw_events = data.get("events") or []
+            out: List[Dict[str, Any]] = []
+
+            for ev in raw_events:
+                # Campos típicos (pueden variar)
+                # Intentamos ser tolerantes:
+                time_str = ev.get("time") or ev.get("releaseTime") or ev.get("eventTime") or "--:--"
+                title = ev.get("event") or ev.get("title") or ev.get("name") or ""
+                country = ev.get("country") or ev.get("countryName") or DEFAULT_COUNTRY
+                impact = ev.get("impact") or ev.get("impactLabel") or ev.get("importance") or ""
+
+                out.append({
+                    "time": str(time_str),
+                    "event": str(title),
+                    "country": str(country),
+                    "impact": str(impact),
+                })
+
+            return out, None
+
+        except Exception as e:
+            last_err = str(e)
+            print(f"[econ] CME exception attempt {attempt}/{HTTP_RETRIES}: {e}")
+            time.sleep(RETRY_SLEEP)
+
+    return [], last_err
 
 
-# =========================
-# Public API (compatible con tu main)
-# =========================
+# -----------------------------
+# Public entrypoint
+# -----------------------------
 def run_econ_calendar(force: bool = False, force_tomorrow: bool = False) -> None:
     """
-    Compatible con tu main.py:
-      run_econ_calendar(force=True/False, force_tomorrow=True/False)
-
-    - En modo normal: envía 1 vez/día (dedupe por fecha objetivo).
-    - En force=True: ignora dedupe.
-    - En force_tomorrow=True: calcula fecha objetivo = mañana (Europe/Madrid).
+    - force=False: respeta anti-duplicados (1 envío/día)
+    - force=True: envía aunque ya se haya enviado hoy
+    - force_tomorrow=True: usa mañana (Europe/Madrid) como fecha objetivo
     """
     now = datetime.now(TZ)
-    target = now.date() + (timedelta(days=1) if force_tomorrow else timedelta(days=0))
-    target_date = target.strftime("%Y-%m-%d")
+    target = (now.date() + timedelta(days=1)) if force_tomorrow else now.date()
 
-    # Dedupe: si Render ejecuta 20 veces, solo 1 envío
-    if (not force) and _already_sent(target_date):
-        print(f"[econ] Ya enviado para {target_date}. Skip.")
+    day_key = target.isoformat()
+    if (not force) and _already_sent(day_key):
+        print(f"[econ] Ya enviado para {day_key}. Skipping.")
         return
 
-    # Descarga CME
-    try:
-        print(f"[econ] Descargando CME para {target_date} (USA)")
-        events = _fetch_cme_events(target_date)
-        print(f"[econ] CME eventos: {len(events)}")
-    except requests.HTTPError as e:
-        # No rompas cronjob: manda aviso claro
-        status = getattr(e.response, "status_code", None)
-        if status == 403:
-            msg = (
-                f"**AGENDA MACRO – EE.UU. ({target_date})**\n\n"
-                "⚠️ CME está bloqueando la petición desde el servidor (403).\n"
-                "Esto suele pasar con IPs de datacenter (Render).\n\n"
-                "**Sesgo esperado:** Neutral (sin datos)\n"
-            )
-            _send_telegram(msg)
-            _mark_sent(target_date)
-            return
-        raise
-    except Exception as e:
-        msg = (
-            f"**AGENDA MACRO – EE.UU. ({target_date})**\n\n"
-            f"⚠️ Error obteniendo CME: {e}\n\n"
-            "**Sesgo esperado:** Neutral (sin datos)\n"
-        )
-        _send_telegram(msg)
-        _mark_sent(target_date)
-        return
+    print(f"[econ] Descargando CME para {day_key} (USA)")
 
-    # Interpreta (OpenAI) y envía
-    try:
-        text = _interpret_with_openai(events, target_date)
-    except Exception as e:
-        # fallback si OpenAI falla
-        print(f"[econ] OpenAI fallo: {e}")
-        if not events:
-            text = (
-                f"**AGENDA MACRO – EE.UU. ({target_date})**\n\n"
-                "No se publican datos macroeconómicos relevantes hoy.\n\n"
-                "**Sesgo esperado:** Neutral"
-            )
+    events, err = fetch_cme_events(target)
+
+    # Construimos etiqueta día para título
+    # Ej: "2026-02-10"
+    day_label = target.strftime("%Y-%m-%d")
+
+    if err:
+        # Mensaje claro, sin tumbar cron
+        warn_lines = [
+            f"**AGENDA MACRO - EE.UU. ({day_label})**",
+            "",
+        ]
+
+        if "403" in err or "Forbidden" in err or err == "403_FORBIDDEN":
+            warn_lines += [
+                "⚠️ **CME está bloqueando la petición desde el servidor (403).**",
+                "Esto suele pasar con **IPs de datacenter** (Render) o reglas anti-bot.",
+                "",
+            ]
+        elif "Read timed out" in err or "timeout" in err.lower():
+            warn_lines += [
+                "⚠️ **Timeout al consultar CME desde el servidor.**",
+                "Puede ser temporal o un bloqueo intermitente.",
+                "",
+            ]
         else:
-            lines = []
-            for ev in events:
-                name = ev.get("eventName") or ev.get("name") or "Evento"
-                time = ev.get("eventTime") or ev.get("time") or ""
-                impact = ev.get("impact") or ""
-                lines.append(f"- {name} ({time}) {('— ' + impact) if impact else ''}".strip())
-            text = (
-                f"**AGENDA MACRO – EE.UU. ({target_date})**\n\n"
-                + "\n".join(lines)
-                + "\n\n**Sesgo esperado:** Neutral"
-            )
+            warn_lines += [
+                f"⚠️ **Error consultando CME:** `{err}`",
+                "",
+            ]
 
+        # Aun así, generamos “lectura” sin datos (IA o plantilla)
+        text = _openai_bloomberg_summary_es(day_label, events)
+        message = "\n".join(warn_lines) + text
+
+        _send_telegram(message)
+        _mark_sent(day_key)
+        print(f"[econ] OK enviado (con error CME) para {day_key} (force={force}, force_tomorrow={force_tomorrow}).")
+        return
+
+    # Caso OK (con eventos o vacío)
+    text = _openai_bloomberg_summary_es(day_label, events)
     _send_telegram(text)
-    _mark_sent(target_date)
-    print(f"[econ] OK enviado para {target_date} (force={force}, force_tomorrow={force_tomorrow})")
+    _mark_sent(day_key)
+    print(f"[econ] OK enviado para {day_key} (force={force}, force_tomorrow={force_tomorrow}).")
