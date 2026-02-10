@@ -2,125 +2,143 @@ import os
 import json
 import requests
 from datetime import datetime
-from openai import OpenAI
+from typing import List, Dict
 
-
-# =====================
-# CONFIG
-# =====================
-CME_EVENTS_URL = "https://www.cmegroup.com/services/economic-release-events"
-TIMEOUT = 25
+CME_CALENDAR_PAGE = "https://www.cmegroup.com/education/events/economic-releases-calendar.html"
+CME_EVENTS_API = "https://www.cmegroup.com/services/economic-release-events"
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
+# =========================
+# CME FETCH (browser-like)
+# =========================
+def fetch_cme_events(date: str) -> List[Dict]:
+    session = requests.Session()
 
-# =====================
-# CME FETCH
-# =====================
-def fetch_cme_events(date_yyyy_mm_dd: str) -> list[dict]:
+    # 1) Warm-up page (cookies / akamai / consent)
+    session.get(
+        CME_CALENDAR_PAGE,
+        headers={
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)",
+            "Accept-Language": "es-ES,es;q=0.9,en;q=0.8",
+        },
+        timeout=25,
+    )
+
     payload = {
-        "startDate": date_yyyy_mm_dd,
-        "endDate": date_yyyy_mm_dd,
+        "startDate": date,
+        "endDate": date,
         "countries": ["United States"],
         "impact": ["Market Mover", "Merits Extra Attention"],
     }
 
     headers = {
         "Content-Type": "text/plain;charset=UTF-8",
-        "Accept": "*/*",
-        "User-Agent": "Mozilla/5.0",
+        "Accept": "application/json, text/plain, */*",
+        "Origin": "https://www.cmegroup.com",
+        "Referer": CME_CALENDAR_PAGE,
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)",
+        "X-Requested-With": "XMLHttpRequest",
     }
 
-    resp = requests.post(
-        CME_EVENTS_URL,
+    resp = session.post(
+        CME_EVENTS_API,
         data=json.dumps(payload),
         headers=headers,
-        timeout=TIMEOUT,
+        timeout=25,
     )
+
+    if resp.status_code == 403:
+        raise RuntimeError("CME bloquea la IP (403). Render muy probable.")
+
     resp.raise_for_status()
-
-    data = resp.json()
-    return data.get("events", [])
+    return resp.json().get("events", [])
 
 
-# =====================
-# GPT BLOOMBERG STYLE
-# =====================
-def gpt_calendar_es(events: list[dict], date_label_es: str) -> str:
-    if not OPENAI_API_KEY:
-        return f"📅 **Agenda macro — {date_label_es}**\n\n⚠️ OPENAI_API_KEY no configurada."
+# =========================
+# GPT INTERPRETATION
+# =========================
+def interpret_with_gpt(events: List[Dict], date: str) -> str:
+    if not events:
+        return (
+            f"**Agenda macro – Estados Unidos ({date})**\n\n"
+            "No se publican datos macroeconómicos relevantes hoy.\n\n"
+            "**Sesgo esperado:** Neutral"
+        )
 
-    client = OpenAI(api_key=OPENAI_API_KEY)
+    events_text = "\n".join(
+        f"- {e.get('eventName','')} ({e.get('eventTime','')})"
+        for e in events
+    )
 
     prompt = f"""
-Vas a generar un mensaje para Telegram en CASTELLANO (España) a partir de eventos macroeconómicos crudos de CME.
+Eres un analista macro profesional (estilo Bloomberg).
 
-Requisitos OBLIGATORIOS:
-1) NO incluir consenso ni dato previo.
-2) Traducir TODOS los nombres de eventos al español.
-3) Formato exacto de lista:
-   • HH:MM — Nombre del evento traducido | Impacto: Alto / Medio
-4) Después de la lista, añade una interpretación estilo Bloomberg (máx 8 líneas).
-   - Impacto probable en: S&P / Nasdaq, bonos USA (10Y) y USD.
-   - Cierra con: "Sesgo de riesgo: Alcista / Neutral / Bajista".
-5) Si no hay eventos relevantes, indícalo claramente.
+Fecha: {date}
+País: Estados Unidos
 
-Fecha: {date_label_es}
+Eventos:
+{events_text}
 
-Eventos crudos (JSON):
-{json.dumps(events, ensure_ascii=False)}
+Tareas:
+1. Resume los eventos en español claro.
+2. Explica por qué importan para mercado.
+3. Da un sesgo de riesgo: Alcista / Bajista / Neutral.
+NO menciones consenso ni datos previos.
 """
 
-    resp = client.chat.completions.create(
-        model="gpt-4.1-mini",
-        messages=[
-            {"role": "system", "content": "Eres un analista macro institucional. Respondes en español (España)."},
-            {"role": "user", "content": prompt},
-        ],
-        temperature=0.2,
+    r = requests.post(
+        "https://api.openai.com/v1/chat/completions",
+        headers={
+            "Authorization": f"Bearer {OPENAI_API_KEY}",
+            "Content-Type": "application/json",
+        },
+        json={
+            "model": "gpt-4o-mini",
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.3,
+        },
+        timeout=40,
     )
 
-    return resp.choices[0].message.content.strip()
+    r.raise_for_status()
+    return r.json()["choices"][0]["message"]["content"]
 
 
-# =====================
+# =========================
 # TELEGRAM
-# =====================
+# =========================
 def send_telegram(text: str):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print("[econ] Telegram no configurado (TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID). Imprimo mensaje:\n")
+        print("[econ] Telegram no configurado, imprimo mensaje:\n")
         print(text)
         return
 
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": text,
-        "parse_mode": "Markdown",
-        "disable_web_page_preview": True,
-    }
-    requests.post(url, json=payload, timeout=15).raise_for_status()
+    requests.post(
+        url,
+        json={
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": text,
+            "parse_mode": "Markdown",
+        },
+        timeout=20,
+    )
 
 
-# =====================
+# =========================
 # MAIN ENTRY
-# =====================
-def run_econ_calendar(force: bool = False, **kwargs):
-    # `force` existe SOLO para que tu main.py no rompa. No lo usamos.
+# =========================
+def run_econ_calendar():
     today = datetime.now().strftime("%Y-%m-%d")
-    date_label_es = datetime.now().strftime("%A %d de %B").capitalize()
 
-    print(f"[econ] Descargando CME para {today}…")
+    print(f"[econ] Descargando CME para {today}")
     events = fetch_cme_events(today)
 
-    print(f"[econ] Eventos recibidos: {len(events)}")
-    message = gpt_calendar_es(events, date_label_es)
+    print(f"[econ] Eventos encontrados: {len(events)}")
+    message = interpret_with_gpt(events, today)
 
     send_telegram(message)
-    print("[econ] OK enviado.")
-
-
-if __name__ == "__main__":
-    run_econ_calendar()
+    print("[econ] OK enviado")
