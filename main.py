@@ -141,14 +141,16 @@ def main():
     # ======================================================
     if ECON_FORCE_TOMORROW:
         print("INFO | __main__: ECON_FORCE_TOMORROW=1 -> enviando calendario de mañana.")
-        run_econ_calendar(force=True, force_tomorrow=True)
+        # run_econ_calendar(force=True, force_tomorrow=True)
 
     elif FORCE_ECON:
-        run_econ_calendar(force=True)
+        # run_econ_calendar(force=True)
+        pass
 
     else:
         if weekday < 5 and nyse_open_today and hour == ECON_HOUR and minute >= ECON_MINUTE:
-            run_econ_calendar(force=False)
+            # run_econ_calendar(force=False)
+            pass
 
     # ======================================================
     # 4) NOTICIAS (SIN CAMBIOS)
