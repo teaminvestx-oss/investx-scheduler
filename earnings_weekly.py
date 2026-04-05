@@ -1,18 +1,16 @@
 # === earnings_weekly.py ===
-# Earnings semanales desde Investing.com usando endpoint filtrado
-# - País: Estados Unidos (country=5)
-# - Impacto: 3 estrellas
+# Earnings semanales vía yfinance (calendario de tickers de alto impacto USA)
+# - Lista curada de ~60 compañías de gran capitalización
 # - Semana L-V desde la fecha base
 # - Formato profesional y minimalista para Telegram
 
 import os
 import json
 import logging
-from datetime import datetime, timedelta
-from typing import List, Dict, Any
+from datetime import datetime, timedelta, date
+from typing import List, Dict, Any, Optional
 
-import requests
-from bs4 import BeautifulSoup
+import yfinance as yf
 
 from utils import send_telegram_message, call_gpt_mini
 
@@ -22,19 +20,97 @@ logger.setLevel(logging.INFO)
 STATE_FILE = "earnings_weekly_state.json"
 TZ_OFFSET = int(os.getenv("TZ_OFFSET", "1"))
 
-API_URL = "https://es.investing.com/earnings-calendar/Service/getCalendarFilteredData"
-
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/122.0 Safari/537.36"
-    ),
-    "Accept": "application/json, text/javascript, */*; q=0.01",
-    "X-Requested-With": "XMLHttpRequest",
-    "Referer": "https://es.investing.com/earnings-calendar/",
-    "Accept-Language": "es-ES,es;q=0.9",
+# =====================================================
+# Universo de tickers a seguir (alto impacto USA)
+# =====================================================
+TICKER_NAMES: Dict[str, str] = {
+    # Mega-cap Tech
+    "AAPL":  "Apple",
+    "MSFT":  "Microsoft",
+    "AMZN":  "Amazon",
+    "NVDA":  "Nvidia",
+    "GOOGL": "Alphabet (Google)",
+    "META":  "Meta",
+    "TSLA":  "Tesla",
+    # Software / Cloud
+    "ADBE":  "Adobe",
+    "CRM":   "Salesforce",
+    "NOW":   "ServiceNow",
+    "ORCL":  "Oracle",
+    "IBM":   "IBM",
+    "CSCO":  "Cisco",
+    "INTU":  "Intuit",
+    "MSCI":  "MSCI",
+    # Semis
+    "AMD":   "AMD",
+    "INTC":  "Intel",
+    "AVGO":  "Broadcom",
+    "QCOM":  "Qualcomm",
+    "TXN":   "Texas Instruments",
+    "MU":    "Micron",
+    "AMAT":  "Applied Materials",
+    "KLAC":  "KLA Corp",
+    # Financieras
+    "JPM":   "JPMorgan Chase",
+    "BAC":   "Bank of America",
+    "C":     "Citigroup",
+    "GS":    "Goldman Sachs",
+    "MS":    "Morgan Stanley",
+    "WFC":   "Wells Fargo",
+    "AXP":   "American Express",
+    "V":     "Visa",
+    "MA":    "Mastercard",
+    "BLK":   "BlackRock",
+    # Salud / Farma
+    "JNJ":   "Johnson & Johnson",
+    "LLY":   "Eli Lilly",
+    "ABBV":  "AbbVie",
+    "UNH":   "UnitedHealth",
+    "PFE":   "Pfizer",
+    "MRK":   "Merck",
+    "BMY":   "Bristol-Myers Squibb",
+    "AMGN":  "Amgen",
+    # Energía
+    "XOM":   "ExxonMobil",
+    "CVX":   "Chevron",
+    "COP":   "ConocoPhillips",
+    "SLB":   "SLB (Schlumberger)",
+    # Media / Entretenimiento
+    "NFLX":  "Netflix",
+    "DIS":   "Walt Disney",
+    "CMCSA": "Comcast",
+    # Consumo discrecional / Retail
+    "HD":    "Home Depot",
+    "WMT":   "Walmart",
+    "COST":  "Costco",
+    "TGT":   "Target",
+    "MCD":   "McDonald's",
+    "NKE":   "Nike",
+    "SBUX":  "Starbucks",
+    # Consumo básico
+    "PG":    "Procter & Gamble",
+    "KO":    "Coca-Cola",
+    "PEP":   "PepsiCo",
+    "PM":    "Philip Morris",
+    # Industriales / Defensa
+    "BA":    "Boeing",
+    "CAT":   "Caterpillar",
+    "DE":    "Deere & Company",
+    "GE":    "GE Aerospace",
+    "HON":   "Honeywell",
+    "RTX":   "RTX Corp",
+    "LMT":   "Lockheed Martin",
+    # Telecom
+    "T":     "AT&T",
+    "VZ":    "Verizon",
+    # Otros relevantes
+    "PYPL":  "PayPal",
+    "BKNG":  "Booking Holdings",
+    "UBER":  "Uber",
+    "SPOT":  "Spotify",
+    "COIN":  "Coinbase",
 }
+
 
 # =====================================================
 # Estado (solo 1 envío por día)
@@ -66,106 +142,79 @@ def _mark_sent(today_str: str) -> None:
 
 
 # =====================================================
-# Descarga de earnings: un día concreto (USA, impacto 3)
+# Extracción de fecha de earnings desde yfinance
 # =====================================================
 
-def _fetch_day_from_investing(day: datetime) -> List[Dict[str, Any]]:
+def _extract_earnings_date(cal) -> Optional[date]:
     """
-    Descarga el calendario de resultados de Investing.com para un día concreto,
-    filtrando por:
-      - country[] = 5 (Estados Unidos)
-      - importance[] = 3 (impacto fuerte)
-
-    Devuelve lista de dicts:
-      - date (YYYY-MM-DD)
-      - company
-      - eps       (texto BPA / previsión)
-      - revenue   (texto ingresos / previsión)
-      - time      (hora / icono)
+    Extrae la próxima fecha de earnings del objeto calendar de yfinance.
+    Devuelve la fecha más cercana o None si no hay datos.
     """
+    if not cal:
+        return None
 
-    date_str = day.strftime("%Y-%m-%d")
+    # yfinance puede devolver dict o DataFrame
+    if isinstance(cal, dict):
+        raw = cal.get("Earnings Date")
+        if raw is None:
+            return None
+        dates = raw if isinstance(raw, (list, tuple)) else [raw]
+    else:
+        # DataFrame: intentamos columna "Earnings Date"
+        try:
+            if "Earnings Date" in cal.columns:
+                dates = cal["Earnings Date"].dropna().tolist()
+            else:
+                dates = cal.iloc[0].tolist() if not cal.empty else []
+        except Exception:
+            return None
 
-    payload = {
-        "country[]": ["5"],       # Estados Unidos
-        "importance[]": ["3"],    # Impacto 3 estrellas
-        "dateFrom": date_str,
-        "dateTo": date_str,
-        "currentTab": "earnings",
-        "limit_from": "0",
-    }
+    found = []
+    for d in dates:
+        try:
+            if hasattr(d, "date"):
+                found.append(d.date())
+            elif hasattr(d, "to_pydatetime"):
+                found.append(d.to_pydatetime().date())
+        except Exception:
+            continue
 
-    try:
-        resp = requests.post(API_URL, headers=HEADERS, data=payload, timeout=15)
-        resp.raise_for_status()
-        raw = resp.json()
-    except Exception as e:
-        logger.error(f"earnings_weekly | Error HTTP/JSON Investing para {date_str}: {e}")
-        return []
-
-    blocks_html = raw.get("data", [])
-    if isinstance(blocks_html, str):
-        blocks_html = [blocks_html]
-
-    earnings: List[Dict[str, Any]] = []
-
-    for block_html in blocks_html:
-        soup = BeautifulSoup(block_html, "html.parser")
-        for tr in soup.find_all("tr"):
-            tds = tr.find_all("td")
-            if len(tds) < 6:
-                continue
-
-            # Estructura típica:
-            # 0: país / icono
-            # 1: empresa
-            # 2: BPA / Previsión
-            # 3: Ingresos / Previsión
-            # 4: Cap. mercado
-            # 5: Hora
-            company = tds[1].get_text(strip=True)
-            if not company:
-                continue
-
-            eps_text = tds[2].get_text(strip=True) or "--"
-            rev_text = tds[3].get_text(strip=True) or "--"
-            time_text = tds[5].get_text(strip=True) or "—"
-
-            earnings.append(
-                {
-                    "date": date_str,
-                    "company": company,
-                    "eps": eps_text,
-                    "revenue": rev_text,
-                    "time": time_text,
-                }
-            )
-
-    logger.info(
-        f"earnings_weekly | Investing {date_str} (USA, impacto 3): "
-        f"{len(earnings)} resultados."
-    )
-    return earnings
+    return min(found) if found else None
 
 
 # =====================================================
-# Semana completa (L-V)
+# Fetch semanal vía yfinance (una llamada por ticker)
 # =====================================================
 
 def fetch_weekly_earnings(week_start: datetime) -> List[Dict[str, Any]]:
     """
-    Obtiene los earnings de la semana [week_start, week_start+4] (lunes a viernes).
-    Para cada día hace una llamada independiente al endpoint filtrado.
+    Obtiene los earnings de la semana [week_start, week_start+4] (lunes a viernes)
+    consultando el calendario de yfinance para cada ticker de la lista curada.
     """
+    week_dates: set[date] = set()
+    for i in range(5):
+        week_dates.add((week_start + timedelta(days=i)).date())
+
     earnings: List[Dict[str, Any]] = []
 
-    for i in range(5):
-        day = week_start + timedelta(days=i)
-        day_list = _fetch_day_from_investing(day)
-        earnings.extend(day_list)
+    for ticker_sym, company_name in TICKER_NAMES.items():
+        try:
+            t = yf.Ticker(ticker_sym)
+            cal = t.calendar
+            ed = _extract_earnings_date(cal)
+            if ed and ed in week_dates:
+                earnings.append({
+                    "date": ed.isoformat(),
+                    "company": company_name,
+                    "eps": "--",
+                    "revenue": "--",
+                    "time": "—",
+                })
+        except Exception as e:
+            logger.warning(f"earnings_weekly | {ticker_sym}: {e}")
 
     logger.info(
-        f"earnings_weekly | Total semana Investing (USA, impacto 3): "
+        f"earnings_weekly | Total semana yfinance (tickers curados): "
         f"{len(earnings)} resultados."
     )
     return earnings
@@ -181,16 +230,16 @@ def _build_calendar_text(earnings: List[Dict[str, Any]], week_start: datetime) -
     if not earnings:
         return (
             "📊 *Resultados empresariales de la semana*\n"
-            "(Estados Unidos · impacto alto)\n\n"
+            "(Estados Unidos · compañías de alto impacto)\n\n"
             f"No hay resultados entre {week_start:%d/%m} y {week_end:%d/%m} "
-            "bajo los filtros aplicados."
+            "para las compañías seguidas."
         )
 
     earnings_sorted = sorted(earnings, key=lambda x: (x["date"], x["company"]))
 
     lines: List[str] = []
     lines.append("📊 *Resultados empresariales de la semana*")
-    lines.append("(Estados Unidos · impacto alto)")
+    lines.append("(Estados Unidos · compañías de alto impacto)")
     lines.append(f"Semana del {week_start:%d/%m} al {week_end:%d/%m}\n")
 
     last_date = None
@@ -202,7 +251,6 @@ def _build_calendar_text(earnings: List[Dict[str, Any]], week_start: datetime) -
             date_label = e["date"]
 
         if date_label != last_date:
-            # Deja una línea en blanco antes de cada día (menos el primero)
             if last_date is not None:
                 lines.append("")
             lines.append(f"📅 *{date_label}*")
@@ -214,7 +262,7 @@ def _build_calendar_text(earnings: List[Dict[str, Any]], week_start: datetime) -
 
 
 # =====================================================
-# Párrafo profesional IA (“Lectura de la semana”)
+# Párrafo profesional IA ("Lectura de la semana")
 # =====================================================
 
 def _build_professional_note(earnings: List[Dict[str, Any]], week_start: datetime) -> str:
@@ -227,7 +275,6 @@ def _build_professional_note(earnings: List[Dict[str, Any]], week_start: datetim
             "de alto impacto en Estados Unidos."
         )
 
-    # Texto compacto para el prompt de usuario
     compact = "\n".join(
         f"{e['date']} — {e['company']}"
         for e in earnings
@@ -271,8 +318,7 @@ def run_weekly_earnings(force: bool = False) -> None:
 
     - Por defecto solo 1 envío al día (control STATE_FILE).
     - Si force=True ignora el control y envía siempre.
-    - Si EARNINGS_SIMULATE_TOMORROW=1, toma como base 'hoy + 1 día'
-      para poder forzar un domingo la semana siguiente.
+    - Si EARNINGS_SIMULATE_TOMORROW=1, toma como base 'hoy + 1 día'.
     """
 
     simulate_tomorrow = (
@@ -295,7 +341,6 @@ def run_weekly_earnings(force: bool = False) -> None:
         logger.info("earnings_weekly | Ya se envió hoy. No se repite.")
         return
 
-    # Semana que comienza en la fecha base (habitualmente lunes)
     week_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
     earnings = fetch_weekly_earnings(week_start)
 
