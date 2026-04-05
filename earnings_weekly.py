@@ -149,33 +149,42 @@ def _extract_earnings_date(cal) -> Optional[date]:
     """
     Extrae la próxima fecha de earnings del objeto calendar de yfinance.
     Devuelve la fecha más cercana o None si no hay datos.
+
+    yfinance puede devolver:
+    - dict:      {"Earnings Date": [Timestamp, ...], ...}
+    - DataFrame: "Earnings Date" como fila del índice (versiones recientes)
     """
-    if not cal:
+    if cal is None:
         return None
 
-    # yfinance puede devolver dict o DataFrame
+    raw_dates = []
+
     if isinstance(cal, dict):
         raw = cal.get("Earnings Date")
         if raw is None:
             return None
-        dates = raw if isinstance(raw, (list, tuple)) else [raw]
+        raw_dates = list(raw) if isinstance(raw, (list, tuple)) else [raw]
     else:
-        # DataFrame: intentamos columna "Earnings Date"
+        # DataFrame: en yfinance >= 0.2 "Earnings Date" suele estar en el índice
         try:
-            if "Earnings Date" in cal.columns:
-                dates = cal["Earnings Date"].dropna().tolist()
-            else:
-                dates = cal.iloc[0].tolist() if not cal.empty else []
+            if hasattr(cal, "index") and "Earnings Date" in cal.index:
+                row = cal.loc["Earnings Date"]
+                raw_dates = row.dropna().tolist() if hasattr(row, "dropna") else [row]
+            elif hasattr(cal, "columns") and "Earnings Date" in cal.columns:
+                raw_dates = cal["Earnings Date"].dropna().tolist()
         except Exception:
             return None
 
     found = []
-    for d in dates:
+    for d in raw_dates:
         try:
             if hasattr(d, "date"):
                 found.append(d.date())
             elif hasattr(d, "to_pydatetime"):
                 found.append(d.to_pydatetime().date())
+            elif isinstance(d, str) and len(d) >= 10:
+                from datetime import datetime as _dt
+                found.append(_dt.strptime(d[:10], "%Y-%m-%d").date())
         except Exception:
             continue
 
