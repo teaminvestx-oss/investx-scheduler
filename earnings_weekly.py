@@ -75,6 +75,32 @@ TICKER_NAMES: Dict[str, str] = {
     "CVX":   "Chevron",
     "COP":   "ConocoPhillips",
     "SLB":   "SLB (Schlumberger)",
+    "OXY":   "Occidental Petroleum",
+    # Bebidas / Consumo
+    "STZ":   "Constellation Brands",
+    "DEO":   "Diageo",
+    "BUD":   "AB InBev",
+    # Seguros / Financieras especializadas
+    "PGR":   "Progressive",
+    "TRV":   "Travelers",
+    "ALL":   "Allstate",
+    "CB":    "Chubb",
+    "MET":   "MetLife",
+    "PRU":   "Prudential",
+    # Salud adicional
+    "CVS":   "CVS Health",
+    "HUM":   "Humana",
+    "CI":    "Cigna",
+    "ELV":   "Elevance Health",
+    # Inmobiliario / Otros S&P 500
+    "AMT":   "American Tower",
+    "PLD":   "Prologis",
+    "SPG":   "Simon Property Group",
+    # Transporte / Logística
+    "UPS":   "UPS",
+    "FDX":   "FedEx",
+    "DAL":   "Delta Air Lines",
+    "UAL":   "United Airlines",
     # Media / Entretenimiento
     "NFLX":  "Netflix",
     "DIS":   "Walt Disney",
