@@ -197,51 +197,78 @@ def _format_time(iso_str: str) -> str:
 
 
 # -----------------------------
-# Resumen IA (Bloomberg-style)
+# Formato del mensaje
 # -----------------------------
-def _ai_summary(day_label: str, events: List[Dict[str, Any]]) -> str:
+DIAS_ES = ["Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado", "Domingo"]
+
+def _build_message(target_date: date, events: List[Dict[str, Any]]) -> str:
+    """
+    Construye el bloque de cabecera + eventos con formato Telegram Markdown.
+    La IA solo aporta la interpretación, nunca el listado de eventos.
+    """
+    day_name = DIAS_ES[target_date.weekday()]
+    day_label = f"{day_name} {target_date.strftime('%d/%m/%Y')}"
+
+    lines = [f"🗓 *AGENDA MACRO — EE.UU.*", f"_{day_label}_", ""]
+
     if not events:
-        lines = [
-            f"*AGENDA MACRO — EE.UU. ({day_label})*",
+        lines += [
+            "Sin eventos de alto impacto programados para hoy.",
             "",
-            "Sin eventos de alto impacto programados.",
-            "",
-            "*Lectura rápida:* Sesgo neutral por falta de referencias macro.",
+            "📌 *Lectura:* Sesgo neutral. Sin referencias macro relevantes.",
         ]
         return "\n".join(lines)
 
+    lines.append("⏱ *Horario* \\(hora Madrid\\):\n")
+    for ev in events:
+        # Línea principal: hora en negrita + nombre del evento
+        line = f"*{ev['time_str']}* — {ev['event']}"
+        # Datos previo / estimación en la misma línea si existen
+        meta = []
+        if ev["previous"]:
+            meta.append(f"ant: {ev['previous']}")
+        if ev["forecast"]:
+            meta.append(f"est: {ev['forecast']}")
+        if meta:
+            line += f"  _({', '.join(meta)})_"
+        lines.append(line)
+
+    lines.append("")
+
+    # Bloque de interpretación IA
+    interpretation = _ai_interpretation(day_label, events)
+    if interpretation:
+        lines += ["📊 *Análisis macro*\n", interpretation]
+
+    return "\n".join(lines)
+
+
+def _ai_interpretation(day_label: str, events: List[Dict[str, Any]]) -> str:
+    """IA genera SOLO la interpretación (no el listado de eventos)."""
     compact = "\n".join(
         f"- {e['time_str']} {e['event']}"
-        + (f" | prev: {e['previous']}" if e["previous"] else "")
+        + (f" | ant: {e['previous']}" if e["previous"] else "")
         + (f" | est: {e['forecast']}" if e["forecast"] else "")
         for e in events
     )
 
     system = (
-        "Eres el analista macro de un canal financiero estilo Bloomberg para traders. "
-        "Escribes SIEMPRE en español neutro, conciso y accionable. "
-        "NO inventes datos. Usa solo lo que aparece en los eventos.\n"
-        "Formato:\n"
-        "1) Título con fecha\n"
-        "2) Lista de eventos con hora (hora Madrid) y nombre\n"
-        "3) Interpretación en 2-4 bullets sobre volatilidad esperada y sesgo (risk-on/off/neutral)\n"
-        "4) Nota final muy corta de gestión de riesgo\n"
+        "Eres analista macro de un desk institucional estilo Bloomberg. "
+        "Escribes en español neutro, conciso y accionable para traders. "
+        "NO menciones que eres IA. NO repitas la lista de eventos. "
+        "Formato: 2-3 bullets cortos sobre volatilidad esperada y sesgo "
+        "(risk-on / risk-off / neutral), seguidos de una línea final "
+        "que empiece por '⚠️ Riesgo:' con la recomendación de gestión."
     )
     user = (
-        f"Fecha: {day_label}\n"
-        f"Eventos (hora Madrid):\n{compact}\n\n"
-        "Redacta el resumen siguiendo el formato indicado."
+        f"Eventos macro de EE.UU. para {day_label} (hora Madrid):\n{compact}\n\n"
+        "Redacta solo la interpretación siguiendo el formato."
     )
 
     try:
-        return (call_gpt_mini(system, user, max_tokens=400) or "").strip()
-    except Exception as e:
-        # Fallback sin IA
-        lines = [f"*AGENDA MACRO — EE.UU. ({day_label})*", ""]
-        for ev in events:
-            lines.append(f"- {ev['time_str']} — {ev['event']}")
-        lines += ["", f"_(IA no disponible: {e})_"]
-        return "\n".join(lines)
+        return (call_gpt_mini(system, user, max_tokens=300) or "").strip()
+    except Exception:
+        return ""
 
 
 # -----------------------------
@@ -264,9 +291,8 @@ def run_econ_calendar(force: bool = False, force_tomorrow: bool = False) -> None
     print(f"[econ] Descargando ForexFactory para {day_key} (USD, impacto: {IMPACTS_INCLUDE})")
 
     events = fetch_ff_events(target)
-    day_label = target.strftime("%d/%m/%Y")
 
-    text = _ai_summary(day_label, events)
+    text = _build_message(target, events)
     _send_telegram(text)
     _mark_sent(day_key)
     print(f"[econ] OK enviado para {day_key} ({len(events)} eventos, force={force}).")
