@@ -137,20 +137,18 @@ def main():
                     _mark_earnings_sent(now)
 
     # ======================================================
-    # 3) CALENDARIO ECONÓMICO  🔴 ÚNICO BLOQUE MODIFICADO
+    # 3) CALENDARIO ECONÓMICO
     # ======================================================
     if ECON_FORCE_TOMORROW:
         print("INFO | __main__: ECON_FORCE_TOMORROW=1 -> enviando calendario de mañana.")
-        # run_econ_calendar(force=True, force_tomorrow=True)
+        run_econ_calendar(force=True, force_tomorrow=True)
 
     elif FORCE_ECON:
-        # run_econ_calendar(force=True)
-        pass
+        run_econ_calendar(force=True)
 
     else:
         if weekday < 5 and nyse_open_today and hour == ECON_HOUR and minute >= ECON_MINUTE:
-            # run_econ_calendar(force=False)
-            pass
+            run_econ_calendar(force=False)
 
     # ======================================================
     # 4) NOTICIAS (SIN CAMBIOS)
