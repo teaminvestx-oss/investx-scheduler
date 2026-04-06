@@ -1,17 +1,15 @@
 # === earnings_weekly.py ===
-# Earnings semanales — fuente primaria: Yahoo Finance calendar (automático)
-# Filtra por cobertura de analistas (epsestimate != null) = alto impacto
-# Fallback: lista curada si Yahoo Finance no responde
+# Earnings semanales — fuente: Nasdaq API (api.nasdaq.com/api/calendar/earnings)
+# - 1 llamada por día, sin rate-limit, sin lista manual
+# - Filtra por cobertura de analistas (epsForecast presente) = alto impacto
 
 import os
-import re
 import json
 import logging
 from datetime import datetime, timedelta, date
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any
 
 import requests
-import yfinance as yf
 
 from utils import send_telegram_message, call_gpt_mini
 
@@ -56,105 +54,75 @@ def _mark_sent(today_str: str) -> None:
 # Fuente primaria: Yahoo Finance calendar
 # =====================================================
 
-_YF_HEADERS = {
+_NASDAQ_HEADERS = {
     "User-Agent": (
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/121.0.0.0 Safari/537.36"
     ),
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept": "application/json, text/plain, */*",
     "Accept-Language": "en-US,en;q=0.9",
+    "Origin": "https://www.nasdaq.com",
+    "Referer": "https://www.nasdaq.com/market-activity/earnings",
 }
 
 
-def _fetch_yf_calendar_day(target_date: date) -> List[Dict[str, Any]]:
+def _fetch_nasdaq_calendar_day(target_date: date) -> List[Dict[str, Any]]:
     """
-    Descarga el calendario de earnings de Yahoo Finance para un día.
-    Filtra: solo US equities con estimación de EPS (cobertura de analistas = alto impacto).
+    Descarga el calendario de earnings de Nasdaq API para un día.
+    Una sola llamada HTTP devuelve todos los earnings del día.
+    Filtra: empresas con cobertura de analistas (epsForecast presente).
     """
     date_str = target_date.isoformat()
 
     try:
         resp = requests.get(
-            "https://finance.yahoo.com/calendar/earnings",
-            params={"day": date_str},
-            headers=_YF_HEADERS,
+            "https://api.nasdaq.com/api/calendar/earnings",
+            params={"date": date_str},
+            headers=_NASDAQ_HEADERS,
             timeout=YF_TIMEOUT,
         )
         resp.raise_for_status()
+        data = resp.json()
     except Exception as e:
-        logger.warning(f"earnings | Yahoo Finance HTTP error {date_str}: {e}")
+        logger.warning(f"earnings | Nasdaq API error {date_str}: {e}")
         return []
 
-    # Extraer JSON embebido en __NEXT_DATA__
-    try:
-        match = re.search(
-            r'<script[^>]+id="__NEXT_DATA__"[^>]*>(.*?)</script>',
-            resp.text,
-            re.DOTALL,
-        )
-        if not match:
-            logger.warning(f"earnings | No __NEXT_DATA__ en Yahoo Finance para {date_str}")
-            return []
-        data = json.loads(match.group(1))
-    except Exception as e:
-        logger.warning(f"earnings | Error parseando __NEXT_DATA__ ({date_str}): {e}")
-        return []
-
-    # Navegar la estructura (puede variar según versión de Yahoo Finance)
-    rows = []
-    paths = [
-        ["props", "pageProps", "state", "calendar", "earnings", "rows"],
-        ["props", "pageProps", "earningsCalendar", "rows"],
-        ["props", "pageProps", "calendars", "earnings", "rows"],
-    ]
-    for path in paths:
-        try:
-            node = data
-            for key in path:
-                node = node[key]
-            if isinstance(node, list):
-                rows = node
-                break
-        except (KeyError, TypeError):
-            continue
-
+    rows = (data.get("data") or {}).get("rows") or []
     if not rows:
-        logger.warning(f"earnings | Estructura inesperada en Yahoo Finance para {date_str}")
+        logger.info(f"earnings | Nasdaq {date_str}: sin resultados")
         return []
 
     results = []
     for row in rows:
-        ticker = (row.get("ticker") or "").strip()
-        company = (row.get("companyshortname") or ticker).strip()
-        quote_type = (row.get("quoteType") or "").upper()
-        eps_est = row.get("epsestimate")
-        time_type = row.get("startdatetimetype") or "—"
+        ticker  = (row.get("symbol") or "").strip()
+        company = (row.get("name") or ticker).strip()
+        eps_est = (row.get("epsForecast") or "").strip()
+        n_ests  = (row.get("noOfEsts") or "0").strip()
 
         if not ticker:
             continue
-        # Solo equities con cobertura de analistas (proxy de alto impacto)
-        if quote_type and quote_type != "EQUITY":
-            continue
-        if eps_est is None:
+        # Solo empresas con estimación de analistas = alto impacto
+        if not eps_est or eps_est in ("N/A", "--", ""):
             continue
 
         results.append({
             "date": date_str,
-            "company": company,
-            "eps": f"Est. {eps_est:.2f}" if isinstance(eps_est, (int, float)) else "--",
+            "company": f"{company} ({ticker})",
+            "eps": f"Est. {eps_est}",
             "revenue": "--",
-            "time": time_type,
+            "time": row.get("time") or "—",
         })
 
-    logger.info(f"earnings | Yahoo Finance {date_str}: {len(results)} empresas con cobertura")
+    logger.info(f"earnings | Nasdaq {date_str}: {len(results)} empresas con cobertura")
     return results
 
 
 # =====================================================
-# Fuente fallback: lista curada + yfinance calendar
+# (Fallback eliminado: yfinance está rate-limited desde datacenter)
 # =====================================================
 
+# Lista de referencia — solo para documentación, no se consulta en tiempo real
 TICKER_NAMES: Dict[str, str] = {
     "AAPL": "Apple", "MSFT": "Microsoft", "AMZN": "Amazon",
     "NVDA": "Nvidia", "GOOGL": "Alphabet (Google)", "META": "Meta", "TSLA": "Tesla",
@@ -184,61 +152,6 @@ TICKER_NAMES: Dict[str, str] = {
 }
 
 
-def _extract_earnings_date(cal) -> Optional[date]:
-    if cal is None:
-        return None
-
-    raw_dates = []
-    if isinstance(cal, dict):
-        raw = cal.get("Earnings Date")
-        if raw is None:
-            return None
-        raw_dates = list(raw) if isinstance(raw, (list, tuple)) else [raw]
-    else:
-        try:
-            if hasattr(cal, "index") and "Earnings Date" in cal.index:
-                row = cal.loc["Earnings Date"]
-                raw_dates = row.dropna().tolist() if hasattr(row, "dropna") else [row]
-            elif hasattr(cal, "columns") and "Earnings Date" in cal.columns:
-                raw_dates = cal["Earnings Date"].dropna().tolist()
-        except Exception:
-            return None
-
-    found = []
-    for d in raw_dates:
-        try:
-            if hasattr(d, "date"):
-                found.append(d.date())
-            elif hasattr(d, "to_pydatetime"):
-                found.append(d.to_pydatetime().date())
-            elif isinstance(d, str) and len(d) >= 10:
-                found.append(datetime.strptime(d[:10], "%Y-%m-%d").date())
-        except Exception:
-            continue
-    return min(found) if found else None
-
-
-def _fetch_fallback_week(week_start: datetime) -> List[Dict[str, Any]]:
-    """Lista curada + yfinance calendar como último recurso."""
-    week_dates: set = set()
-    for i in range(5):
-        week_dates.add((week_start + timedelta(days=i)).date())
-
-    earnings = []
-    for ticker_sym, company_name in TICKER_NAMES.items():
-        try:
-            ed = _extract_earnings_date(yf.Ticker(ticker_sym).calendar)
-            if ed and ed in week_dates:
-                earnings.append({
-                    "date": ed.isoformat(),
-                    "company": company_name,
-                    "eps": "--", "revenue": "--", "time": "—",
-                })
-        except Exception as e:
-            logger.warning(f"earnings | fallback {ticker_sym}: {e}")
-
-    logger.info(f"earnings | Fallback curado: {len(earnings)} resultados")
-    return earnings
 
 
 # =====================================================
@@ -248,24 +161,23 @@ def _fetch_fallback_week(week_start: datetime) -> List[Dict[str, Any]]:
 def fetch_weekly_earnings(week_start: datetime) -> List[Dict[str, Any]]:
     """
     Obtiene los earnings L-V de la semana.
-    Fuente primaria: Yahoo Finance calendar (automático, sin lista manual).
-    Fallback: lista curada de ~70 tickers vía yfinance.
+    Fuente: Nasdaq API (1 llamada/día, sin rate-limit, sin lista manual).
+    Si Nasdaq falla todos los días, devuelve lista vacía con aviso.
     """
     earnings: List[Dict[str, Any]] = []
     failed_days = 0
 
     for i in range(5):
         day = (week_start + timedelta(days=i)).date()
-        day_results = _fetch_yf_calendar_day(day)
+        day_results = _fetch_nasdaq_calendar_day(day)
         if not day_results:
             failed_days += 1
         earnings.extend(day_results)
 
-    if failed_days >= 3:
-        logger.warning("earnings | Yahoo Finance falló ≥3 días, usando lista curada como fallback")
-        return _fetch_fallback_week(week_start)
+    if failed_days == 5:
+        logger.error("earnings | Nasdaq API falló los 5 días — sin datos disponibles")
 
-    logger.info(f"earnings | Total semana Yahoo Finance: {len(earnings)} empresas")
+    logger.info(f"earnings | Total semana Nasdaq: {len(earnings)} empresas")
     return earnings
 
 
