@@ -176,6 +176,7 @@ def fetch_ff_events(target_date: date) -> List[Dict[str, Any]]:
             "time_str": _format_time(ev.get("date", "")),
             "event":    title,
             "impact":   impact,
+            "actual":   ev.get("actual") or "",
             "forecast": ev.get("forecast") or "",
             "previous": ev.get("previous") or "",
         })
