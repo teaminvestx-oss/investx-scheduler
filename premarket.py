@@ -368,33 +368,84 @@ def format_premarket_lines(indices, megacaps, sectors, cryptos):
 
 
 # ================================
+# CONTEXTO MACRO Y NOTICIAS PARA IA
+# ================================
+def _fetch_todays_macro_context(target_date) -> str:
+    """Eventos macro de hoy (ForexFactory) para dar contexto a la IA."""
+    try:
+        from econ_calendar import fetch_ff_events
+        events = fetch_ff_events(target_date)
+        if not events:
+            return ""
+        lines = []
+        for e in events:
+            line = f"- {e['time_str']} {e['event']}"
+            if e.get("previous"):
+                line += f" | ant: {e['previous']}"
+            if e.get("forecast"):
+                line += f" | est: {e['forecast']}"
+            lines.append(line)
+        return "\n".join(lines)
+    except Exception as ex:
+        print(f"[WARN] Error fetching macro context: {ex}")
+        return ""
+
+
+def _fetch_recent_headlines() -> str:
+    """Top titulares recientes (RSS) para dar contexto a la IA. Sin traducción."""
+    try:
+        from news_es import fetch_items, select_items
+        uniq = fetch_items()
+        selected = select_items(uniq)
+        if not selected:
+            return ""
+        return "\n".join(f"- {x[2]}" for x in selected[:5])
+    except Exception as ex:
+        print(f"[WARN] Error fetching headlines: {ex}")
+        return ""
+
+
+# ================================
 # INTERPRETACIÓN DEL DÍA (IA unificada)
 # ================================
-def interpret_premarket(plain_text: str) -> str:
+def interpret_premarket(plain_text: str, macro_context: str = "", news_context: str = "") -> str:
     if not plain_text:
         return ""
 
     system_prompt = (
-        "Eres un analista de mercados. Escribes en español claro, neutral e institucional para un canal de trading.\n"
-        "No menciones IA ni modelos.\n"
+        "Eres un analista de mercados senior. Escribes en español claro, neutral e institucional "
+        "para un canal de trading profesional. No menciones IA ni modelos.\n\n"
         "Requisitos:\n"
-        "- 4–6 frases cortas.\n"
-        "- Si hay datos de Fear & Greed Index y VIX, úsalos para contextualizar el sentimiento del mercado.\n"
-        "- Explica el tono general (alcista/bajista/mixto) y por qué.\n"
-        "- Menciona si tecnología lidera o no.\n"
-        "- Indica si BTC/ETH acompañan o divergen.\n"
-        "- Si casi todo se mueve <0.3%, di que el arranque es plano/mixto.\n"
+        "- 4–6 frases cortas y directas.\n"
+        "- Usa Fear & Greed y VIX para contextualizar el sentimiento.\n"
+        "- Si hay eventos macro programados hoy, menciona el más relevante y a qué hora.\n"
+        "- Si hay titulares que estén moviendo el mercado, incorpóralos brevemente.\n"
+        "- Explica el tono general (alcista/bajista/mixto) y los motivos.\n"
+        "- Menciona si el sector tecnológico lidera o diverge.\n"
+        "- Indica si BTC/ETH acompañan o van a contracorriente.\n"
+        "- Si casi todo se mueve <0.3%, señala que el arranque es plano/mixto.\n"
         "- Termina con 'En resumen, ...'."
     )
 
+    macro_section = (
+        f"\nAgenda macro de hoy (hora Madrid):\n{macro_context}"
+        if macro_context else "\nAgenda macro de hoy: sin eventos de alto impacto."
+    )
+    news_section = (
+        f"\nTitulares recientes:\n{news_context}"
+        if news_context else ""
+    )
+
     user_prompt = (
-        "Movimientos del premarket (precio actual y cambio vs cierre previo):\n\n"
-        f"{plain_text}\n\n"
-        "Redacta el comentario siguiendo estrictamente los requisitos."
+        "Datos del premarket:\n"
+        f"{plain_text}"
+        f"{macro_section}"
+        f"{news_section}\n\n"
+        "Redacta el comentario siguiendo la estructura indicada."
     )
 
     try:
-        return (call_gpt_mini(system_prompt, user_prompt, max_tokens=260) or "").strip()
+        return (call_gpt_mini(system_prompt, user_prompt, max_tokens=350) or "").strip()
     except Exception:
         return ""
 
@@ -464,11 +515,15 @@ def run_premarket_morning(force: bool = False):
     fg = _fetch_fear_and_greed()
     sentiment_display, sentiment_plain = _format_sentiment_block(vix, fg)
 
-    # Enriquecemos el plain_text para la IA
+    # Enriquecemos el plain_text con sentimiento para la IA
     if sentiment_plain:
         plain_text = sentiment_plain + "\n" + plain_text
 
-    interpretation = interpret_premarket(plain_text)
+    # Contexto macro y noticias para la IA
+    macro_context = _fetch_todays_macro_context(today)
+    news_context = _fetch_recent_headlines()
+
+    interpretation = interpret_premarket(plain_text, macro_context, news_context)
 
     today_str_nice = today.strftime("%d/%m/%Y")
 
