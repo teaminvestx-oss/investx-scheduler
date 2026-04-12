@@ -24,6 +24,7 @@ from econ_calendar import run_econ_calendar
 from news_es import run_news_once
 from earnings_weekly import run_weekly_earnings
 from market_close import run_market_close
+from insider_trading import run_weekly_insider
 
 
 # ---------------------------
@@ -50,7 +51,8 @@ FORCE_NEWS = any(
 )
 
 FORCE_EARNINGS = os.getenv("FORCE_EARNINGS", "0").strip().lower() in ("1", "true", "yes")
-CLOSE_FORCE = os.getenv("CLOSE_FORCE", "0").strip().lower() in ("1", "true", "yes")
+CLOSE_FORCE    = os.getenv("CLOSE_FORCE",    "0").strip().lower() in ("1", "true", "yes")
+FORCE_INSIDER  = os.getenv("FORCE_INSIDER",  "0").strip().lower() in ("1", "true", "yes")
 
 
 # ======================================================
@@ -102,6 +104,9 @@ def main():
         print(f"WARNING | __main__: Fallo al evaluar calendario NYSE ({e}). Continuando sin filtro.")
         nyse_open_today = True
 
+    INSIDER_HOUR   = 9
+    INSIDER_MINUTE = 15
+
     PREMARKET_HOUR = 10
     PREMARKET_MINUTE = 30
 
@@ -114,6 +119,15 @@ def main():
     NEWS_HOUR_1 = 13
     NEWS_HOUR_2 = 21
     NEWS_MINUTE = 30
+
+    # ======================================================
+    # 0) INSIDER TRADING (lunes 9:15, semana anterior)
+    # ======================================================
+    if FORCE_INSIDER:
+        run_weekly_insider(force=True)
+    else:
+        if weekday == 0 and hour == INSIDER_HOUR and minute >= INSIDER_MINUTE:
+            run_weekly_insider(force=False)
 
     # ======================================================
     # 1) PREMARKET
