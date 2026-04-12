@@ -201,10 +201,37 @@ def _format_time(iso_str: str) -> str:
 # -----------------------------
 DIAS_ES = ["Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado", "Domingo"]
 
+
+def _translate_events(events: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Traduce los nombres de los eventos al español en una sola llamada a la IA."""
+    if not events:
+        return events
+
+    titles = [e["event"] for e in events]
+    system = (
+        "Eres un traductor financiero experto. "
+        "Traduce al español los nombres de indicadores económicos de forma precisa y concisa. "
+        "Devuelve ÚNICAMENTE las traducciones, una por línea, en el mismo orden."
+    )
+    user = "Traduce estos indicadores económicos al español:\n" + "\n".join(titles)
+
+    try:
+        result = (call_gpt_mini(system, user, max_tokens=300) or "").strip()
+        translated = [ln.strip() for ln in result.split("\n") if ln.strip()]
+        if len(translated) == len(titles):
+            events = [dict(ev) for ev in events]
+            for i, ev in enumerate(events):
+                ev["event"] = translated[i]
+    except Exception:
+        pass  # Si falla la traducción, se usan los nombres originales
+
+    return events
+
+
 def _build_message(target_date: date, events: List[Dict[str, Any]]) -> str:
     """
-    Construye el bloque de cabecera + eventos con formato Telegram Markdown.
-    La IA solo aporta la interpretación, nunca el listado de eventos.
+    Construye el mensaje completo: cabecera + horario + análisis IA.
+    El listado de eventos siempre tiene formato consistente (código, no IA).
     """
     day_name = DIAS_ES[target_date.weekday()]
     day_label = f"{day_name} {target_date.strftime('%d/%m/%Y')}"
@@ -219,11 +246,12 @@ def _build_message(target_date: date, events: List[Dict[str, Any]]) -> str:
         ]
         return "\n".join(lines)
 
+    # Traducir nombres al español
+    events = _translate_events(events)
+
     lines.append("⏱ *Horario* \\(hora Madrid\\):\n")
     for ev in events:
-        # Línea principal: hora en negrita + nombre del evento
         line = f"*{ev['time_str']}* — {ev['event']}"
-        # Datos previo / estimación en la misma línea si existen
         meta = []
         if ev["previous"]:
             meta.append(f"ant: {ev['previous']}")
@@ -235,7 +263,7 @@ def _build_message(target_date: date, events: List[Dict[str, Any]]) -> str:
 
     lines.append("")
 
-    # Bloque de interpretación IA
+    # Análisis IA
     interpretation = _ai_interpretation(day_label, events)
     if interpretation:
         lines += ["📊 *Análisis macro*\n", interpretation]
@@ -244,7 +272,10 @@ def _build_message(target_date: date, events: List[Dict[str, Any]]) -> str:
 
 
 def _ai_interpretation(day_label: str, events: List[Dict[str, Any]]) -> str:
-    """IA genera SOLO la interpretación (no el listado de eventos)."""
+    """
+    Análisis Bloomberg-style: contexto macro + lectura evento a evento + sesgo neto.
+    Sin línea de riesgo — solo análisis puro.
+    """
     compact = "\n".join(
         f"- {e['time_str']} {e['event']}"
         + (f" | ant: {e['previous']}" if e["previous"] else "")
@@ -253,20 +284,25 @@ def _ai_interpretation(day_label: str, events: List[Dict[str, Any]]) -> str:
     )
 
     system = (
-        "Eres analista macro de un desk institucional estilo Bloomberg. "
-        "Escribes en español neutro, conciso y accionable para traders. "
-        "NO menciones que eres IA. NO repitas la lista de eventos. "
-        "Formato: 2-3 bullets cortos sobre volatilidad esperada y sesgo "
-        "(risk-on / risk-off / neutral), seguidos de una línea final "
-        "que empiece por '⚠️ Riesgo:' con la recomendación de gestión."
+        "Eres el analista macro senior de un desk institucional, estilo Bloomberg Terminal. "
+        "Escribes en español neutro, preciso y accionable para traders profesionales. "
+        "NO menciones que eres IA. NO repitas el listado de eventos.\n\n"
+        "Estructura exacta:\n"
+        "1) Una frase de apertura que contextualice el tono macro del día.\n"
+        "2) Un bullet por cada evento relevante explicando: "
+        "qué mide el indicador, qué implica el dato previo/estimación, "
+        "y cómo podría mover mercados si supera o defrauda expectativas.\n"
+        "3) Una frase de cierre con el sesgo neto del día "
+        "(risk-on / risk-off / neutral) y los activos o pares a vigilar.\n\n"
+        "Estilo: directo, sin relleno, sin disclaimers."
     )
     user = (
-        f"Eventos macro de EE.UU. para {day_label} (hora Madrid):\n{compact}\n\n"
-        "Redacta solo la interpretación siguiendo el formato."
+        f"Eventos macro de EE.UU. — {day_label} (hora Madrid):\n{compact}\n\n"
+        "Redacta el análisis siguiendo la estructura indicada."
     )
 
     try:
-        return (call_gpt_mini(system, user, max_tokens=300) or "").strip()
+        return (call_gpt_mini(system, user, max_tokens=500) or "").strip()
     except Exception:
         return ""
 
