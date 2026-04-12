@@ -7,6 +7,19 @@ import yfinance as yf
 
 from utils import call_gpt_mini  # unificamos OpenAI
 
+# ================================
+# CONSTANTES SENTIMIENTO
+# ================================
+_FG_API_URL = "https://production.dataviz.cnn.io/index/fearandgreed/graphdata"
+
+_FG_RATING_ES = {
+    "Extreme Fear": "Miedo extremo",
+    "Fear": "Miedo",
+    "Neutral": "Neutral",
+    "Greed": "Codicia",
+    "Extreme Greed": "Codicia extrema",
+}
+
 
 # ================================
 # ENV VARS
@@ -200,6 +213,123 @@ def get_crypto_changes():
 
 
 # ================================
+# SENTIMIENTO: VIX + FEAR & GREED
+# ================================
+def _fetch_vix():
+    """Último cierre del VIX y variación vs día anterior."""
+    try:
+        t = yf.Ticker("^VIX")
+        daily = t.history(period="5d", interval="1d")
+        if daily is None or daily.empty:
+            return None
+        closes = daily["Close"].dropna()
+        if len(closes) < 1:
+            return None
+        current = float(closes.iloc[-1])
+        if len(closes) >= 2:
+            prev = float(closes.iloc[-2])
+            change = current - prev
+            change_pct = (change / prev) * 100.0
+        else:
+            change = 0.0
+            change_pct = 0.0
+        return {
+            "value": round(current, 2),
+            "change": round(change, 2),
+            "change_pct": round(change_pct, 2),
+        }
+    except Exception as e:
+        print(f"[WARN] Error fetching VIX: {e}")
+        return None
+
+
+def _fetch_fear_and_greed():
+    """Fear & Greed Index actual desde CNN Data Viz."""
+    headers = {
+        "User-Agent": "Mozilla/5.0 (compatible; InvestX-Bot/1.0)",
+        "Accept": "application/json",
+        "Referer": "https://edition.cnn.com/",
+    }
+    try:
+        resp = requests.get(_FG_API_URL, headers=headers, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+        fg = data.get("fear_and_greed") or {}
+        score = fg.get("score")
+        rating = fg.get("rating") or ""
+        if score is None:
+            return None
+        return {
+            "score": round(float(score)),
+            "rating": rating,
+        }
+    except Exception as e:
+        print(f"[WARN] Error fetching Fear & Greed: {e}")
+        return None
+
+
+def _fg_emoji(score: int) -> str:
+    if score <= 25:
+        return "😱"
+    elif score <= 45:
+        return "😨"
+    elif score <= 55:
+        return "😐"
+    elif score <= 75:
+        return "😊"
+    return "🤑"
+
+
+def _vix_label(value: float) -> str:
+    if value < 15:
+        return "calma"
+    elif value < 20:
+        return "moderado"
+    elif value < 30:
+        return "elevado"
+    return "alto"
+
+
+def _format_sentiment_block(vix, fg):
+    """
+    Devuelve (display_html, plain_text) con el bloque de sentimiento.
+    Si ambos son None devuelve ('', '').
+    """
+    display_lines = []
+    plain_lines = []
+
+    if fg:
+        emoji = _fg_emoji(fg["score"])
+        rating_es = _FG_RATING_ES.get(fg["rating"], fg["rating"])
+        display_lines.append(
+            f"  Fear &amp; Greed: <b>{fg['score']}</b> — {rating_es} {emoji}"
+        )
+        plain_lines.append(
+            f"Fear & Greed Index: {fg['score']} ({fg['rating']})"
+        )
+
+    if vix:
+        sign = "+" if vix["change"] >= 0 else ""
+        direction = "↑" if vix["change"] >= 0 else "↓"
+        label = _vix_label(vix["value"])
+        display_lines.append(
+            f"  VIX: <b>{vix['value']:.1f}</b>"
+            f" ({direction}{sign}{vix['change']:.2f} pts — {label})"
+        )
+        plain_lines.append(
+            f"VIX: {vix['value']:.1f}"
+            f" (variación {sign}{vix['change']:.2f} pts, nivel {label})"
+        )
+
+    if not display_lines:
+        return "", ""
+
+    header = "🧭 <b>Sentimiento</b>"
+    display = header + "\n" + "\n".join(display_lines)
+    return display, "\n".join(plain_lines)
+
+
+# ================================
 # FORMATEO CON COLORES Y FLECHAS
 # ================================
 def style_change(change_pct: float):
@@ -249,6 +379,7 @@ def interpret_premarket(plain_text: str) -> str:
         "No menciones IA ni modelos.\n"
         "Requisitos:\n"
         "- 4–6 frases cortas.\n"
+        "- Si hay datos de Fear & Greed Index y VIX, úsalos para contextualizar el sentimiento del mercado.\n"
         "- Explica el tono general (alcista/bajista/mixto) y por qué.\n"
         "- Menciona si tecnología lidera o no.\n"
         "- Indica si BTC/ETH acompañan o divergen.\n"
@@ -327,6 +458,16 @@ def run_premarket_morning(force: bool = False):
         return
 
     display_text, plain_text = format_premarket_lines(indices, megacaps, sectors, cryptos)
+
+    # Sentimiento: VIX + Fear & Greed
+    vix = _fetch_vix()
+    fg = _fetch_fear_and_greed()
+    sentiment_display, sentiment_plain = _format_sentiment_block(vix, fg)
+
+    # Enriquecemos el plain_text para la IA
+    if sentiment_plain:
+        plain_text = sentiment_plain + "\n" + plain_text
+
     interpretation = interpret_premarket(plain_text)
 
     today_str_nice = today.strftime("%d/%m/%Y")
@@ -334,8 +475,12 @@ def run_premarket_morning(force: bool = False):
     parts = [
         "🌅 <b>Buenos días, equipo</b>\n",
         f"Así viene el mercado hoy — {today_str_nice}:\n",
-        display_text,
     ]
+
+    if sentiment_display:
+        parts.append(sentiment_display + "\n")
+
+    parts.append(display_text)
 
     if interpretation:
         parts.append("\n")
