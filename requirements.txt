@@ -1,13 +1,10 @@
 requests
 python-dateutil
 feedparser
-beautifulsoup4
-lxml
 yfinance
 pandas
 numpy
 openai
-investpy
 pandas-market-calendars
 setuptools
 matplotlib
