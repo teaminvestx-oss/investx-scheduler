@@ -104,7 +104,7 @@ def main():
         print(f"WARNING | __main__: Fallo al evaluar calendario NYSE ({e}). Continuando sin filtro.")
         nyse_open_today = True
 
-    INSIDER_HOUR   = 9
+    INSIDER_HOUR   = 10
     INSIDER_MINUTE = 15
 
     PREMARKET_HOUR = 10
