@@ -195,33 +195,59 @@ def _strip_ns(xml_bytes: bytes) -> bytes:
     return s.encode("utf-8")
 
 
-def _fetch_xml_content(cik_int: int, acc_clean: str, primary_doc: str) -> Optional[bytes]:
+def _fetch_xml_content(cik_int: int, accession: str, primary_doc: str) -> Optional[bytes]:
     """
-    Intenta obtener el contenido XML de un Form 4.
-    Estrategia:
-      1. URL directa del primaryDocument
-      2. Si es .htm, intenta variante .xml con el mismo nombre base
-      3. Intenta con el número de acceso como nombre de archivo
+    Descarga el XML de un Form 4. Cuatro estrategias en orden:
+      1. URL directa del primaryDocument (si contiene ownershipDocument)
+      2. Si primaryDoc es .htm/.html → prueba misma base con .xml
+      3. Filing index JSON → busca cualquier .xml que contenga ownershipDocument
+      4. Nombre estándar SEC: {accession}.xml  (con guiones)
     """
+    acc_clean = accession.replace("-", "")
     base = f"https://www.sec.gov/Archives/edgar/data/{cik_int}/{acc_clean}"
 
-    candidates = [primary_doc]
-
-    # Si es HTML, añadir variante XML
-    if re.search(r"\.html?$", primary_doc, re.IGNORECASE):
-        candidates.append(re.sub(r"\.html?$", ".xml", primary_doc, flags=re.IGNORECASE))
-
-    # Fallback: accession number como nombre de fichero
-    candidates.append(f"{acc_clean}.xml")
-
-    for doc in candidates:
+    def _try(url: str) -> Optional[bytes]:
         try:
-            resp = requests.get(f"{base}/{doc}", headers=_SEC_HEADERS, timeout=HTTP_TIMEOUT)
-            if resp.ok and b"ownershipDocument" in resp.content:
-                return resp.content
+            r = requests.get(url, headers=_SEC_HEADERS, timeout=HTTP_TIMEOUT)
+            time.sleep(_REQ_DELAY)
+            if r.ok and b"ownershipDocument" in r.content:
+                return r.content
         except Exception:
             pass
+        return None
+
+    # Estrategia 1: documento primario directo
+    content = _try(f"{base}/{primary_doc}")
+    if content:
+        return content
+
+    # Estrategia 2: variante .xml del primaryDoc HTML
+    if re.search(r"\.html?$", primary_doc, re.IGNORECASE):
+        xml_variant = re.sub(r"\.html?$", ".xml", primary_doc, flags=re.IGNORECASE)
+        content = _try(f"{base}/{xml_variant}")
+        if content:
+            return content
+
+    # Estrategia 3: índice del filing → buscar .xml
+    try:
+        idx_url = f"{base}/{accession}-index.json"
+        r_idx = requests.get(idx_url, headers=_SEC_HEADERS, timeout=HTTP_TIMEOUT)
         time.sleep(_REQ_DELAY)
+        if r_idx.ok:
+            items = r_idx.json().get("directory", {}).get("item", [])
+            for item in items:
+                name = item.get("name", "")
+                if name.lower().endswith(".xml") and "index" not in name.lower():
+                    content = _try(f"{base}/{name}")
+                    if content:
+                        return content
+    except Exception:
+        pass
+
+    # Estrategia 4: nombre estándar SEC con guiones
+    content = _try(f"{base}/{accession}.xml")
+    if content:
+        return content
 
     return None
 
@@ -270,16 +296,17 @@ def _parse_form4_xml(cik: str, filing: Dict) -> List[Dict]:
     Devuelve transacciones open-market (P/S) de officers/directors > umbral.
     """
     cik_int   = int(cik)
-    acc_clean = filing["accession"].replace("-", "")
+    accession = filing["accession"]  # con guiones: "0001234567-24-000123"
 
-    xml_content = _fetch_xml_content(cik_int, acc_clean, filing["primary_doc"])
+    xml_content = _fetch_xml_content(cik_int, accession, filing["primary_doc"])
     if not xml_content:
+        print(f"[insider]   ✗ XML no descargado: {accession} primaryDoc={filing['primary_doc']}")
         return []
 
     try:
         root = ET.fromstring(_strip_ns(xml_content))
     except Exception as e:
-        print(f"[insider] XML parse error {acc_clean}: {e}")
+        print(f"[insider]   ✗ XML parse error {accession}: {e}")
         return []
 
     issuer_ticker = (root.findtext(".//issuerTradingSymbol") or "").strip().upper()
@@ -338,19 +365,39 @@ def fetch_weekly_insider_trades(week_start: date, week_end: date) -> List[Dict]:
 
     all_trades: List[Dict] = []
     total = len(cik_map)
+    total_filings   = 0
+    xml_ok          = 0
+    xml_fail        = 0
+    below_threshold = 0
 
     for idx, (ticker, cik) in enumerate(cik_map.items(), 1):
-        print(f"[insider] {idx}/{total} {ticker} ...", end="\r")
+        print(f"[insider] {idx}/{total} {ticker} ...", end="\r", flush=True)
         filings = _get_form4_filings(cik, week_start, week_end)
         time.sleep(_REQ_DELAY)
 
+        if filings:
+            total_filings += len(filings)
+            print(f"\n[insider] {ticker}: {len(filings)} Form 4(s) en la semana")
+
         for filing in filings:
             txns = _parse_form4_xml(cik, filing)
+            if txns is None or txns == []:
+                # Distinguir entre XML no descargado y XML sin transacciones P/S
+                pass
             for t in txns:
                 if t["value"] >= MIN_VALUE:
                     all_trades.append(t)
+                    print(f"[insider]   ✓ {t['owner_name']} ({t['ticker']}) "
+                          f"{'COMPRA' if t['code']=='P' else 'VENTA'} "
+                          f"{_format_value(t['value'])}")
+                else:
+                    below_threshold += 1
 
     print()
+    print(f"[insider] RESUMEN: {total_filings} filings encontrados | "
+          f"{len(all_trades)} sobre umbral | "
+          f"{below_threshold} por debajo de {_format_value(MIN_VALUE)}")
+
     # Compras primero, luego ventas; dentro de cada grupo por valor desc
     all_trades.sort(key=lambda x: (x["code"] != "P", -x["value"]))
     return all_trades
