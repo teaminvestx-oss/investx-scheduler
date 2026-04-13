@@ -10,3 +10,4 @@ openai
 investpy
 pandas-market-calendars
 setuptools
+matplotlib
