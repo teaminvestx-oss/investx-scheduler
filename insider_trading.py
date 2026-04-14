@@ -257,8 +257,13 @@ def _fetch_xml_content(cik_int: int, accession: str, primary_doc: str) -> Option
 # ---------------------------------------------------------------------------
 def _get_form4_filings(cik: str, week_start: date, week_end: date) -> List[Dict]:
     """
-    Consulta submissions API y devuelve Form 4s del rango de fechas.
-    Acepta cualquier tipo de primaryDocument (no solo .xml).
+    Consulta submissions API y devuelve Form 4s cuya fecha de transacción
+    (reportDate) cae en la semana objetivo.
+
+    IMPORTANTE: filtramos por reportDate (fecha de la operación), NO por
+    filingDate (fecha de presentación a la SEC), porque los ejecutivos tienen
+    hasta 2 días hábiles para presentar, por lo que filings de operaciones
+    del viernes pueden aparecer el lunes/martes de la semana siguiente.
     """
     url = f"https://data.sec.gov/submissions/CIK{cik}.json"
     try:
@@ -271,21 +276,42 @@ def _get_form4_filings(cik: str, week_start: date, week_end: date) -> List[Dict]
 
     recent = data.get("filings", {}).get("recent", {})
     forms  = recent.get("form", [])
-    dates  = recent.get("filingDate", [])
+    fdates = recent.get("filingDate", [])
+    rdates = recent.get("reportDate", [])   # fecha real de la transacción
     accs   = recent.get("accessionNumber", [])
     pdocs  = recent.get("primaryDocument", [])
 
+    # Ventana de búsqueda amplia: filings presentados hasta 7 días después del
+    # fin de semana objetivo, para no perder presentaciones tardías
+    filing_cutoff = week_end + timedelta(days=7)
+
     filings = []
-    for form, d_str, acc, pdoc in zip(forms, dates, accs, pdocs):
-        if form not in ("4", "4/A"):   # incluir también enmiendas
+    for form, fd_str, rd_str, acc, pdoc in zip(forms, fdates, rdates, accs, pdocs):
+        if form not in ("4", "4/A"):
             continue
+
+        # Parsear fecha de presentación
         try:
-            fd = date.fromisoformat(d_str)
+            fd = date.fromisoformat(fd_str)
         except Exception:
             continue
-        if not (week_start <= fd <= week_end):
+
+        # Si el filing es demasiado antiguo o futuro, saltar
+        if fd < week_start or fd > filing_cutoff:
             continue
-        filings.append({"accession": acc, "primary_doc": pdoc or "", "filing_date": fd})
+
+        # Filtro principal: fecha de transacción (reportDate) dentro de la semana
+        if rd_str:
+            try:
+                rd = date.fromisoformat(rd_str)
+                if week_start <= rd <= week_end:
+                    filings.append({"accession": acc, "primary_doc": pdoc or "", "filing_date": fd})
+            except Exception:
+                pass
+        else:
+            # Sin reportDate: usar filingDate como aproximación
+            if week_start <= fd <= week_end:
+                filings.append({"accession": acc, "primary_doc": pdoc or "", "filing_date": fd})
 
     return filings
 

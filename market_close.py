@@ -426,8 +426,40 @@ def _generate_close_chart(
 
 
 # ================================
-# FORMATEO TEXTO PARA TELEGRAM + IA
+# IMAGEN: Finviz heatmap (primario) → matplotlib (fallback)
 # ================================
+_FINVIZ_HEATMAP_URL = "https://finviz.com/map.ashx?t=sec&st=d1"
+_FINVIZ_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept":          "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Referer":         "https://finviz.com/",
+    "DNT":             "1",
+}
+
+
+def _fetch_finviz_heatmap() -> Optional[bytes]:
+    """
+    Descarga el heatmap de sectores del S&P 500 de Finviz.
+    Devuelve bytes PNG o None si Finviz bloquea la IP del datacenter.
+    """
+    try:
+        resp = requests.get(_FINVIZ_HEATMAP_URL, headers=_FINVIZ_HEADERS, timeout=15)
+        ct = resp.headers.get("content-type", "")
+        if resp.ok and ct.startswith("image/"):
+            print(f"[market_close] Finviz heatmap OK ({len(resp.content):,} bytes).")
+            return resp.content
+        print(f"[market_close] Finviz heatmap bloqueado (HTTP {resp.status_code}, ct={ct}).")
+    except Exception as e:
+        print(f"[market_close] Finviz heatmap error: {e}")
+    return None
+
+
+
 def format_market_close(indices, sectors, vix, fg, crypto):
     today = dt.date.today().strftime("%d/%m/%Y")
     display_lines: List[str] = []
@@ -583,13 +615,16 @@ def run_market_close(force: bool = False) -> None:
     fg     = _fetch_fear_and_greed()
     crypto = _fetch_crypto_close()
 
-    # ── Gráfico ──────────────────────────────────────────────────────────
-    print("[market_close] Generando gráfico...")
-    chart_bytes = _generate_close_chart(indices, sectors, vix, fg, crypto)
+    # ── Imagen: Finviz heatmap (primario) → matplotlib (fallback) ────────
+    print("[market_close] Intentando Finviz heatmap...")
+    chart_bytes = _fetch_finviz_heatmap()
+    if not chart_bytes:
+        print("[market_close] Finviz no disponible, generando gráfico propio...")
+        chart_bytes = _generate_close_chart(indices, sectors, vix, fg, crypto)
     if chart_bytes:
         send_telegram_photo(chart_bytes)
     else:
-        print("[WARN] No se pudo generar el gráfico, se envía solo el texto.")
+        print("[WARN] Sin imagen disponible, se envía solo el texto.")
 
     # ── Texto + IA ───────────────────────────────────────────────────────
     macro_context = _fetch_todays_macro_results(today)
