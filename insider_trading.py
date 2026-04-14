@@ -152,18 +152,22 @@ def _save_state(d: Dict[str, Any]) -> None:
         pass
 
 
-def _week_key(d: date) -> str:
-    iso_year, iso_week, _ = d.isocalendar()
-    return f"{iso_year}-W{iso_week:02d}"
+def _already_sent_today(d: date) -> bool:
+    return _load_state().get("sent_date") == d.isoformat()
 
 
-def _already_sent_this_week(d: date) -> bool:
-    return _load_state().get("sent_week") == _week_key(d)
-
-
-def _mark_sent(d: date) -> None:
+def _get_sent_keys() -> set:
     st = _load_state()
-    st["sent_week"] = _week_key(d)
+    return set(tuple(k) for k in st.get("sent_keys", []))
+
+
+def _mark_sent(d: date, new_keys: List[tuple]) -> None:
+    st = _load_state()
+    existing = set(tuple(k) for k in st.get("sent_keys", []))
+    existing.update(new_keys)
+    # Limitar a 300 entradas para no crecer sin límite
+    st["sent_keys"] = [list(k) for k in list(existing)[-300:]]
+    st["sent_date"] = d.isoformat()
     st["sent_at"]   = datetime.now(TZ).isoformat()
     _save_state(st)
 
@@ -265,15 +269,15 @@ def _fetch_xml_content(cik_int: int, accession: str, primary_doc: str) -> Option
 # ---------------------------------------------------------------------------
 # Fetch SEC EDGAR
 # ---------------------------------------------------------------------------
-def _get_form4_filings(cik: str, week_start: date, week_end: date) -> List[Dict]:
+def _get_form4_filings(cik: str, date_from: date, date_to: date) -> List[Dict]:
     """
     Consulta submissions API y devuelve Form 4s cuya fecha de transacción
-    (reportDate) cae en la semana objetivo.
+    (reportDate) cae en el rango [date_from, date_to].
 
     IMPORTANTE: filtramos por reportDate (fecha de la operación), NO por
     filingDate (fecha de presentación a la SEC), porque los ejecutivos tienen
     hasta 2 días hábiles para presentar, por lo que filings de operaciones
-    del viernes pueden aparecer el lunes/martes de la semana siguiente.
+    del viernes pueden aparecer el lunes/martes siguiente.
     """
     url = f"https://data.sec.gov/submissions/CIK{cik}.json"
     try:
@@ -291,36 +295,33 @@ def _get_form4_filings(cik: str, week_start: date, week_end: date) -> List[Dict]
     accs   = recent.get("accessionNumber", [])
     pdocs  = recent.get("primaryDocument", [])
 
-    # Ventana de búsqueda amplia: filings presentados hasta 7 días después del
-    # fin de semana objetivo, para no perder presentaciones tardías
-    filing_cutoff = week_end + timedelta(days=7)
+    # Ventana de filing amplia: hasta 5 días después de date_to para no perder
+    # presentaciones tardías (2 días hábiles = hasta ~4 días naturales)
+    filing_cutoff = date_to + timedelta(days=5)
 
     filings = []
     for form, fd_str, rd_str, acc, pdoc in zip(forms, fdates, rdates, accs, pdocs):
         if form not in ("4", "4/A"):
             continue
 
-        # Parsear fecha de presentación
         try:
             fd = date.fromisoformat(fd_str)
         except Exception:
             continue
 
-        # Si el filing es demasiado antiguo o futuro, saltar
-        if fd < week_start or fd > filing_cutoff:
+        if fd < date_from or fd > filing_cutoff:
             continue
 
-        # Filtro principal: fecha de transacción (reportDate) dentro de la semana
+        # Filtro principal: fecha de transacción (reportDate) dentro del rango
         if rd_str:
             try:
                 rd = date.fromisoformat(rd_str)
-                if week_start <= rd <= week_end:
-                    filings.append({"accession": acc, "primary_doc": pdoc or "", "filing_date": fd})
+                if date_from <= rd <= date_to:
+                    filings.append({"accession": acc, "primary_doc": pdoc or "", "filing_date": rd})
             except Exception:
                 pass
         else:
-            # Sin reportDate: usar filingDate como aproximación
-            if week_start <= fd <= week_end:
+            if date_from <= fd <= date_to:
                 filings.append({"accession": acc, "primary_doc": pdoc or "", "filing_date": fd})
 
     return filings
@@ -386,12 +387,12 @@ def _parse_form4_xml(cik: str, filing: Dict) -> List[Dict]:
 
 
 # ---------------------------------------------------------------------------
-# Fetch semanal
+# Fetch
 # ---------------------------------------------------------------------------
-def fetch_weekly_insider_trades(week_start: date, week_end: date) -> List[Dict]:
+def fetch_insider_trades(date_from: date, date_to: date) -> List[Dict]:
     """
     1. Resuelve CIKs desde la SEC en tiempo real
-    2. Por cada empresa, obtiene Form 4s de la semana
+    2. Por cada empresa, obtiene Form 4s en el rango de fechas
     3. Parsea XMLs y filtra por umbral de valor
     """
     cik_map = _build_cik_map()
@@ -408,7 +409,7 @@ def fetch_weekly_insider_trades(week_start: date, week_end: date) -> List[Dict]:
 
     for idx, (ticker, cik) in enumerate(cik_map.items(), 1):
         print(f"[insider] {idx}/{total} {ticker} ...", end="\r", flush=True)
-        filings = _get_form4_filings(cik, week_start, week_end)
+        filings = _get_form4_filings(cik, date_from, date_to)
         time.sleep(_REQ_DELAY)
 
         if filings:
@@ -442,58 +443,146 @@ def fetch_weekly_insider_trades(week_start: date, week_end: date) -> List[Dict]:
 # ---------------------------------------------------------------------------
 # Mensaje
 # ---------------------------------------------------------------------------
-def _build_message(trades: List[Dict], week_start: date, week_end: date) -> str:
-    ws = f"{week_start.day} {MESES_ES[week_start.month - 1]}"
-    we = f"{week_end.day} {MESES_ES[week_end.month - 1]}"
+def _fmt_name(raw: str) -> str:
+    """Normaliza nombres: 'PRINCE MATTHEW' o 'Prince Matthew' → 'Matthew Prince'."""
+    parts = raw.strip().split()
+    if not parts:
+        return raw
+    # Si está todo en mayúsculas asumimos orden apellido-nombre → invertir
+    if raw == raw.upper() and len(parts) >= 2:
+        parts = parts[1:] + [parts[0]]
+    return " ".join(p.capitalize() for p in parts)
+
+
+def _short_company(name: str) -> str:
+    """Acorta el nombre legal de la empresa para mostrar en el mensaje."""
+    for suffix in [", Inc.", " Inc.", " Corp.", " Corporation", ", Ltd.", " Ltd.",
+                   " LLC", " L.P.", " PLC", " N.V.", " S.A."]:
+        name = name.replace(suffix, "")
+    return name.strip()[:24]
+
+
+def _aggregate_trades(trades: List[Dict]) -> List[Dict]:
+    """
+    Agrupa lotes del mismo insider+ticker+tipo en una sola entrada.
+    Reduce el ruido de los planes 10b5-1 que ejecutan múltiples órdenes parciales.
+    """
+    groups: Dict[tuple, Dict] = {}
+    for t in trades:
+        key = (t["owner_name"], t["ticker"], t["code"])
+        if key not in groups:
+            groups[key] = dict(t)
+            groups[key]["n_ops"] = 1
+        else:
+            groups[key]["shares"] += t["shares"]
+            groups[key]["value"]  += t["value"]
+            groups[key]["n_ops"]  += 1
+            # Usar la fecha más temprana
+            if t["date"] < groups[key]["date"]:
+                groups[key]["date"] = t["date"]
+    return list(groups.values())
+
+
+def _date_range_str(date_from: date, date_to: date) -> str:
+    """Devuelve '8–10 abr' o '10 abr–2 may' según el rango."""
+    if date_from == date_to:
+        return f"{date_from.day} {MESES_ES[date_from.month - 1]}"
+    if date_from.month == date_to.month:
+        return f"{date_from.day}–{date_to.day} {MESES_ES[date_to.month - 1]}"
+    return (f"{date_from.day} {MESES_ES[date_from.month - 1]}"
+            f"–{date_to.day} {MESES_ES[date_to.month - 1]}")
+
+
+def _build_message(trades: List[Dict], date_from: date, date_to: date) -> str:
+    # Usar el rango real de las operaciones incluidas (más preciso que la ventana)
+    if trades:
+        real_from = min(t["date"] for t in trades)
+        real_to   = max(t["date"] for t in trades)
+    else:
+        real_from, real_to = date_from, date_to
+
+    date_str = _date_range_str(real_from, real_to)
 
     header = (
         f"🕵️ *Lo que los directivos hicieron con su propio dinero*\n"
-        f"_Insider Trading · Semana {ws}–{we}_"
+        f"_Insider Trading · Operaciones del {date_str}_\n"
+        f"_⏱ La SEC concede 2 días hábiles para el filing_"
     )
 
     if not trades:
         return (
             header +
-            f"\n\nSin operaciones open-market significativas esta semana "
+            f"\n\nSin operaciones open-market significativas "
             f"(umbral: {_format_value(MIN_VALUE)})."
         )
 
-    # Resumen rápido en cabecera
-    buys  = [t for t in trades if t["code"] == "P"]
-    sells = [t for t in trades if t["code"] == "S"]
-    summary = f"\n_{len(buys)} compras · {len(sells)} ventas · umbral {_format_value(MIN_VALUE)}_\n"
+    # Agregar lotes del mismo insider
+    agg = _aggregate_trades(trades)
+    buys  = sorted([t for t in agg if t["code"] == "P"], key=lambda x: -x["value"])
+    sells = sorted([t for t in agg if t["code"] == "S"], key=lambda x: -x["value"])[:10]
 
+    summary = f"\n_{len(buys)} compras · {len(sells)} ventas destacadas · umbral {_format_value(MIN_VALUE)}_\n"
     lines = [header, summary]
 
-    by_date: Dict[date, List[Dict]] = {}
-    for t in trades:
-        by_date.setdefault(t["date"], []).append(t)
+    def _trade_line(t: Dict) -> str:
+        icon    = "🟢" if t["code"] == "P" else "🔴"
+        action  = "Compra" if t["code"] == "P" else "Venta"
+        name    = _fmt_name(t["owner_name"])
+        role    = t["role"]
+        ticker  = t["ticker"]
+        company = _short_company(t.get("issuer_name") or "")
+        ctx     = f"{ticker} ({company})" if company else ticker
+        n       = t.get("n_ops", 1)
+        day     = f"{DIAS_ES[t['date'].weekday()]} {t['date'].day} {MESES_ES[t['date'].month - 1]}"
 
-    for d in sorted(by_date.keys()):
-        day_label = f"{DIAS_ES[d.weekday()]} {d.day} {MESES_ES[d.month - 1]}"
-        lines.append(f"📅 *{day_label}*")
-        for t in by_date[d]:
-            icon   = "🟢" if t["code"] == "P" else "🔴"
-            action = "Compra" if t["code"] == "P" else "Venta"
-            shares_fmt = f"{int(t['shares']):,}".replace(",", ".")
-            lines.append(
-                f"{icon} *{t['owner_name']}* ({t['role']}) — {t['ticker']}\n"
-                f"   {action} {shares_fmt} acc. a ${t['price']:.2f} → *{_format_value(t['value'])}*"
+        if n > 1:
+            return (
+                f"{icon} *{name}* · {role}\n"
+                f"   {ctx}  ·  {action} en {n} lotes → *{_format_value(t['value'])}* total  _{day}_"
             )
+        else:
+            shares_fmt = f"{int(t['shares']):,}".replace(",", ".")
+            return (
+                f"{icon} *{name}* · {role}\n"
+                f"   {ctx}  ·  {action} {shares_fmt} acc. a ${t['price']:.2f} → *{_format_value(t['value'])}*  _{day}_"
+            )
+
+    if buys:
+        lines.append("🟢 *COMPRAS — señal directa*\n")
+        for t in buys:
+            lines.append(_trade_line(t))
+        lines.append("")
+
+    if sells:
+        lines.append("🔴 *VENTAS DESTACADAS* _(top por volumen)_\n")
+        for t in sells:
+            lines.append(_trade_line(t))
         lines.append("")
 
     return "\n".join(lines).strip()
 
 
-def _ai_interpretation(trades: List[Dict], week_start: date, week_end: date) -> str:
+def _ai_interpretation(trades: List[Dict], date_from: date, date_to: date) -> str:
     if not trades:
         return ""
 
-    compact = "\n".join(
-        f"- {'Compra' if t['code'] == 'P' else 'Venta'} {_format_value(t['value'])}"
-        f" | {t['owner_name']} ({t['role']}) | {t['ticker']}"
-        for t in trades[:15]
-    )
+    agg = _aggregate_trades(trades)
+    buys  = sorted([t for t in agg if t["code"] == "P"], key=lambda x: -x["value"])
+    sells = sorted([t for t in agg if t["code"] == "S"], key=lambda x: -x["value"])[:10]
+
+    def _line(t):
+        action  = "Compra" if t["code"] == "P" else "Venta"
+        company = _short_company(t.get("issuer_name") or t["ticker"])
+        n       = t.get("n_ops", 1)
+        suffix  = f" ({n} lotes, posible plan 10b5-1)" if n > 3 else ""
+        return (
+            f"- {action} {_format_value(t['value'])}{suffix}"
+            f" | {_fmt_name(t['owner_name'])} ({t['role']})"
+            f" | {t['ticker']} — {company}"
+        )
+
+    compact = "\n".join(_line(t) for t in (buys + sells)[:15])
+    date_str = _date_range_str(date_from, date_to)
 
     system = (
         "Eres un analista institucional experto en insider trading. "
@@ -501,15 +590,15 @@ def _ai_interpretation(trades: List[Dict], week_start: date, week_end: date) -> 
         "No menciones IA ni modelos."
     )
     user = (
-        f"Operaciones de insiders semana {week_start}–{week_end}:\n\n"
+        f"Operaciones de insiders del {date_str}:\n\n"
         f"{compact}\n\n"
         "Redacta un análisis de 3–5 frases:\n"
-        "1) Balance neto comprador o vendedor.\n"
-        "2) Clusters: varios insiders del mismo sector comprando a la vez.\n"
-        "3) Distingue compras directas (señal fuerte) de ventas de ejecutivos "
+        "1) Balance neto comprador o vendedor y sectores protagonistas.\n"
+        "2) Distingue compras directas (señal fuerte) de ventas con muchos lotes "
         "(suelen ser planes 10b5-1 programados, señal más débil).\n"
+        "3) Señala si hay clusters (varios insiders de la misma empresa o sector).\n"
         "4) Cierra con 'Lectura InvestX:' resumiendo qué acciones o sectores "
-        "destacan por actividad inusual esta semana."
+        "destacan por actividad inusual."
     )
 
     try:
@@ -521,32 +610,45 @@ def _ai_interpretation(trades: List[Dict], week_start: date, week_end: date) -> 
 # ---------------------------------------------------------------------------
 # Entrypoint público
 # ---------------------------------------------------------------------------
-def run_weekly_insider(force: bool = False) -> None:
+def run_daily_insider(force: bool = False) -> None:
     now   = datetime.now(TZ)
     today = now.date()
 
-    if not force and _already_sent_this_week(today):
-        print("[insider] Ya enviado esta semana. Skipping.")
+    if not force and _already_sent_today(today):
+        print("[insider] Ya enviado hoy. Skipping.")
         return
 
-    # Semana anterior completa (lunes–viernes)
-    days_since_monday = today.weekday()
-    if days_since_monday == 0:
-        week_start = today - timedelta(days=7)
-    else:
-        week_start = today - timedelta(days=days_since_monday + 7)
-    week_end = week_start + timedelta(days=4)
+    # Ventana: reportDate de los últimos N días hasta ayer.
+    # Los lunes ampliamos a 5 días para cubrir el fin de semana.
+    date_to   = today - timedelta(days=1)
+    lookback  = 5 if today.weekday() == 0 else 3
+    date_from = today - timedelta(days=lookback)
 
-    print(f"[insider] Form 4s del {week_start} al {week_end} (umbral {_format_value(MIN_VALUE)})...")
+    print(f"[insider] Buscando Form 4s con reportDate {date_from}–{date_to} "
+          f"(umbral {_format_value(MIN_VALUE)})...")
 
-    trades = fetch_weekly_insider_trades(week_start, week_end)
-    print(f"[insider] {len(trades)} operaciones significativas.")
+    all_trades = fetch_insider_trades(date_from, date_to)
+    print(f"[insider] {len(all_trades)} operaciones sobre umbral.")
 
-    msg    = _build_message(trades, week_start, week_end)
-    interp = _ai_interpretation(trades, week_start, week_end)
+    # Filtrar trades ya enviados en días anteriores
+    sent_keys = _get_sent_keys()
+
+    def _trade_key(t: Dict) -> tuple:
+        return (t["owner_name"].upper(), t["ticker"], t["code"], t["date"].isoformat())
+
+    new_trades = [t for t in all_trades if _trade_key(t) not in sent_keys]
+    print(f"[insider] {len(new_trades)} operaciones nuevas (no enviadas antes).")
+
+    if not new_trades:
+        _mark_sent(today, [])
+        print("[insider] Sin operaciones nuevas hoy. Nada enviado.")
+        return
+
+    msg    = _build_message(new_trades, date_from, date_to)
+    interp = _ai_interpretation(new_trades, date_from, date_to)
     if interp:
         msg += f"\n\n📌 *Lectura InvestX*\n{interp}"
 
     send_telegram_message(msg)
-    _mark_sent(today)
+    _mark_sent(today, [_trade_key(t) for t in new_trades])
     print(f"[insider] OK enviado (force={force}).")
