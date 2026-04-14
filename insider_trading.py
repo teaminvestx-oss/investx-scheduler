@@ -442,6 +442,46 @@ def fetch_weekly_insider_trades(week_start: date, week_end: date) -> List[Dict]:
 # ---------------------------------------------------------------------------
 # Mensaje
 # ---------------------------------------------------------------------------
+def _fmt_name(raw: str) -> str:
+    """Normaliza nombres: 'PRINCE MATTHEW' o 'Prince Matthew' → 'Matthew Prince'."""
+    parts = raw.strip().split()
+    if not parts:
+        return raw
+    # Si está todo en mayúsculas asumimos orden apellido-nombre → invertir
+    if raw == raw.upper() and len(parts) >= 2:
+        parts = parts[1:] + [parts[0]]
+    return " ".join(p.capitalize() for p in parts)
+
+
+def _short_company(name: str) -> str:
+    """Acorta el nombre legal de la empresa para mostrar en el mensaje."""
+    for suffix in [", Inc.", " Inc.", " Corp.", " Corporation", ", Ltd.", " Ltd.",
+                   " LLC", " L.P.", " PLC", " N.V.", " S.A."]:
+        name = name.replace(suffix, "")
+    return name.strip()[:24]
+
+
+def _aggregate_trades(trades: List[Dict]) -> List[Dict]:
+    """
+    Agrupa lotes del mismo insider+ticker+tipo en una sola entrada.
+    Reduce el ruido de los planes 10b5-1 que ejecutan múltiples órdenes parciales.
+    """
+    groups: Dict[tuple, Dict] = {}
+    for t in trades:
+        key = (t["owner_name"], t["ticker"], t["code"])
+        if key not in groups:
+            groups[key] = dict(t)
+            groups[key]["n_ops"] = 1
+        else:
+            groups[key]["shares"] += t["shares"]
+            groups[key]["value"]  += t["value"]
+            groups[key]["n_ops"]  += 1
+            # Usar la fecha más temprana
+            if t["date"] < groups[key]["date"]:
+                groups[key]["date"] = t["date"]
+    return list(groups.values())
+
+
 def _build_message(trades: List[Dict], week_start: date, week_end: date) -> str:
     ws = f"{week_start.day} {MESES_ES[week_start.month - 1]}"
     we = f"{week_end.day} {MESES_ES[week_end.month - 1]}"
@@ -458,28 +498,47 @@ def _build_message(trades: List[Dict], week_start: date, week_end: date) -> str:
             f"(umbral: {_format_value(MIN_VALUE)})."
         )
 
-    # Resumen rápido en cabecera
-    buys  = [t for t in trades if t["code"] == "P"]
-    sells = [t for t in trades if t["code"] == "S"]
-    summary = f"\n_{len(buys)} compras · {len(sells)} ventas · umbral {_format_value(MIN_VALUE)}_\n"
+    # Agregar lotes del mismo insider
+    agg = _aggregate_trades(trades)
+    buys  = sorted([t for t in agg if t["code"] == "P"], key=lambda x: -x["value"])
+    sells = sorted([t for t in agg if t["code"] == "S"], key=lambda x: -x["value"])[:10]
 
+    summary = f"\n_{len(buys)} compras · {len(sells)} ventas destacadas · umbral {_format_value(MIN_VALUE)}_\n"
     lines = [header, summary]
 
-    by_date: Dict[date, List[Dict]] = {}
-    for t in trades:
-        by_date.setdefault(t["date"], []).append(t)
+    def _trade_line(t: Dict) -> str:
+        icon    = "🟢" if t["code"] == "P" else "🔴"
+        action  = "Compra" if t["code"] == "P" else "Venta"
+        name    = _fmt_name(t["owner_name"])
+        role    = t["role"]
+        ticker  = t["ticker"]
+        company = _short_company(t.get("issuer_name") or "")
+        ctx     = f"{ticker} ({company})" if company else ticker
+        n       = t.get("n_ops", 1)
+        day     = f"{DIAS_ES[t['date'].weekday()]} {t['date'].day} {MESES_ES[t['date'].month - 1]}"
 
-    for d in sorted(by_date.keys()):
-        day_label = f"{DIAS_ES[d.weekday()]} {d.day} {MESES_ES[d.month - 1]}"
-        lines.append(f"📅 *{day_label}*")
-        for t in by_date[d]:
-            icon   = "🟢" if t["code"] == "P" else "🔴"
-            action = "Compra" if t["code"] == "P" else "Venta"
-            shares_fmt = f"{int(t['shares']):,}".replace(",", ".")
-            lines.append(
-                f"{icon} *{t['owner_name']}* ({t['role']}) — {t['ticker']}\n"
-                f"   {action} {shares_fmt} acc. a ${t['price']:.2f} → *{_format_value(t['value'])}*"
+        if n > 1:
+            return (
+                f"{icon} *{name}* · {role}\n"
+                f"   {ctx}  ·  {action} en {n} lotes → *{_format_value(t['value'])}* total  _{day}_"
             )
+        else:
+            shares_fmt = f"{int(t['shares']):,}".replace(",", ".")
+            return (
+                f"{icon} *{name}* · {role}\n"
+                f"   {ctx}  ·  {action} {shares_fmt} acc. a ${t['price']:.2f} → *{_format_value(t['value'])}*  _{day}_"
+            )
+
+    if buys:
+        lines.append("🟢 *COMPRAS — señal directa*\n")
+        for t in buys:
+            lines.append(_trade_line(t))
+        lines.append("")
+
+    if sells:
+        lines.append("🔴 *VENTAS DESTACADAS* _(top por volumen)_\n")
+        for t in sells:
+            lines.append(_trade_line(t))
         lines.append("")
 
     return "\n".join(lines).strip()
@@ -489,11 +548,22 @@ def _ai_interpretation(trades: List[Dict], week_start: date, week_end: date) -> 
     if not trades:
         return ""
 
-    compact = "\n".join(
-        f"- {'Compra' if t['code'] == 'P' else 'Venta'} {_format_value(t['value'])}"
-        f" | {t['owner_name']} ({t['role']}) | {t['ticker']}"
-        for t in trades[:15]
-    )
+    agg = _aggregate_trades(trades)
+    buys  = sorted([t for t in agg if t["code"] == "P"], key=lambda x: -x["value"])
+    sells = sorted([t for t in agg if t["code"] == "S"], key=lambda x: -x["value"])[:10]
+
+    def _line(t):
+        action  = "Compra" if t["code"] == "P" else "Venta"
+        company = _short_company(t.get("issuer_name") or t["ticker"])
+        n       = t.get("n_ops", 1)
+        suffix  = f" ({n} lotes, posible plan 10b5-1)" if n > 3 else ""
+        return (
+            f"- {action} {_format_value(t['value'])}{suffix}"
+            f" | {_fmt_name(t['owner_name'])} ({t['role']})"
+            f" | {t['ticker']} — {company}"
+        )
+
+    compact = "\n".join(_line(t) for t in (buys + sells)[:15])
 
     system = (
         "Eres un analista institucional experto en insider trading. "
@@ -504,10 +574,10 @@ def _ai_interpretation(trades: List[Dict], week_start: date, week_end: date) -> 
         f"Operaciones de insiders semana {week_start}–{week_end}:\n\n"
         f"{compact}\n\n"
         "Redacta un análisis de 3–5 frases:\n"
-        "1) Balance neto comprador o vendedor.\n"
-        "2) Clusters: varios insiders del mismo sector comprando a la vez.\n"
-        "3) Distingue compras directas (señal fuerte) de ventas de ejecutivos "
+        "1) Balance neto comprador o vendedor y sectores protagonistas.\n"
+        "2) Distingue compras directas (señal fuerte) de ventas con muchos lotes "
         "(suelen ser planes 10b5-1 programados, señal más débil).\n"
+        "3) Señala si hay clusters (varios insiders de la misma empresa o sector).\n"
         "4) Cierra con 'Lectura InvestX:' resumiendo qué acciones o sectores "
         "destacan por actividad inusual esta semana."
     )
