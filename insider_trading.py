@@ -197,14 +197,24 @@ def _strip_ns(xml_bytes: bytes) -> bytes:
 
 def _fetch_xml_content(cik_int: int, accession: str, primary_doc: str) -> Optional[bytes]:
     """
-    Descarga el XML de un Form 4. Cuatro estrategias en orden:
-      1. URL directa del primaryDocument (si contiene ownershipDocument)
-      2. Si primaryDoc es .htm/.html → prueba misma base con .xml
-      3. Filing index JSON → busca cualquier .xml que contenga ownershipDocument
-      4. Nombre estándar SEC: {accession}.xml  (con guiones)
+    Descarga el XML de un Form 4.
+
+    EDGAR almacena los Form 4 XML en la raíz del directorio del filing.
+    El campo primaryDocument a menudo incluye un prefijo de subdirectorio
+    XSLT como "xslF345X06/form4.xml" — ese prefijo hay que eliminarlo.
+
+    Estrategias:
+      1. Nombre base del primaryDoc sin prefijo de subdirectorio (fix principal)
+      2. Nombre completo del primaryDoc tal como viene
+      3. Índice JSON del filing → buscar cualquier .xml en la raíz
+      4. {accession}.xml con guiones (nombre estándar SEC)
     """
+    import posixpath
     acc_clean = accession.replace("-", "")
     base = f"https://www.sec.gov/Archives/edgar/data/{cik_int}/{acc_clean}"
+
+    # Nombre base sin prefijo de subdirectorio (e.g. "xslF345X06/form4.xml" → "form4.xml")
+    doc_basename = posixpath.basename(primary_doc) if primary_doc else ""
 
     def _try(url: str) -> Optional[bytes]:
         try:
@@ -216,19 +226,19 @@ def _fetch_xml_content(cik_int: int, accession: str, primary_doc: str) -> Option
             pass
         return None
 
-    # Estrategia 1: documento primario directo
-    content = _try(f"{base}/{primary_doc}")
-    if content:
-        return content
-
-    # Estrategia 2: variante .xml del primaryDoc HTML
-    if re.search(r"\.html?$", primary_doc, re.IGNORECASE):
-        xml_variant = re.sub(r"\.html?$", ".xml", primary_doc, flags=re.IGNORECASE)
-        content = _try(f"{base}/{xml_variant}")
+    # Estrategia 1: nombre base sin el prefijo xslF345X06/ (fix principal)
+    if doc_basename and doc_basename != primary_doc:
+        content = _try(f"{base}/{doc_basename}")
         if content:
             return content
 
-    # Estrategia 3: índice del filing → buscar .xml
+    # Estrategia 2: ruta completa original
+    if primary_doc:
+        content = _try(f"{base}/{primary_doc}")
+        if content:
+            return content
+
+    # Estrategia 3: índice JSON del filing → todos los .xml de la raíz
     try:
         idx_url = f"{base}/{accession}-index.json"
         r_idx = requests.get(idx_url, headers=_SEC_HEADERS, timeout=HTTP_TIMEOUT)
