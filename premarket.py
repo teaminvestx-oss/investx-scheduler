@@ -468,6 +468,10 @@ def run_premarket_morning(force: bool = False):
         print("[INFO] Premarket ya enviado hoy, no se repite (force=False).")
         return
 
+    # Marcar al inicio para evitar doble ejecución si el cron solapa
+    if not force:
+        _mark_sent_today(today_str)
+
     # ====================================================
     # ÍNDICES / FUTUROS (FUTUROS -> ETF -> ÍNDICE CASH)
     # Esto evita 0.00% por caer en ^GSPC/^NDX/^RUT (sin premarket)

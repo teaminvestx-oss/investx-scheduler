@@ -9,10 +9,13 @@ import datetime as dt
 from io import BytesIO
 from typing import Optional, Dict, List
 
+import math
+
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
+import matplotlib.patches as mpatches
 
 import requests
 import yfinance as yf
@@ -283,6 +286,17 @@ def get_close_market_data():
 # ================================
 # GRÁFICO PNG
 # ================================
+def _tile_color(pct: float) -> str:
+    """Color de fondo para un tile de sector según su variación diaria."""
+    if pct >=  2.5: return "#0a5c3a"
+    if pct >=  1.5: return "#136f45"
+    if pct >=  0.5: return "#1a8a54"
+    if pct >= -0.5: return "#2a3140"
+    if pct >= -1.5: return "#7a1f1f"
+    if pct >= -2.5: return "#9b2020"
+    return "#5a0808"
+
+
 def _generate_close_chart(
     indices: List[Dict],
     sectors: Dict[str, List[Dict]],
@@ -290,136 +304,152 @@ def _generate_close_chart(
     fg: Optional[Dict],
     crypto: List[Dict],
 ) -> Optional[bytes]:
-    """Genera imagen PNG profesional dark-theme con el resumen del cierre."""
+    """Genera imagen PNG dark-theme: índices a la izquierda, heatmap de sectores a la derecha."""
 
     # Calcular promedios sectoriales y ordenar mejor → peor
     sec_data: List[tuple] = []
     for s_name, s_stocks in sectors.items():
         vals = [x["change_pct"] for x in s_stocks if x.get("change_pct") is not None]
         if vals:
-            label = _SECTOR_SHORT.get(s_name, s_name[:16])
+            label = _SECTOR_SHORT.get(s_name, s_name[:18])
             sec_data.append((label, round(sum(vals) / len(vals), 2)))
     sec_data.sort(key=lambda x: x[1], reverse=True)
 
     # ── Figura ───────────────────────────────────────────────────────────
-    fig = plt.figure(figsize=(13, 6.2), facecolor=_BG)
-
+    fig = plt.figure(figsize=(12, 6.5), facecolor=_BG)
     gs = gridspec.GridSpec(
         2, 2,
         figure=fig,
-        height_ratios=[5, 1],
-        width_ratios=[2, 3],
-        hspace=0.06,
-        wspace=0.10,
+        height_ratios=[5.5, 1],
+        width_ratios=[2.6, 4.4],
+        hspace=0.06, wspace=0.08,
         left=0.03, right=0.97,
-        top=0.84, bottom=0.05,
+        top=0.87, bottom=0.03,
     )
-
-    ax_idx  = fig.add_subplot(gs[0, 0])   # Índices
-    ax_sec  = fig.add_subplot(gs[0, 1])   # Sectores
-    ax_foot = fig.add_subplot(gs[1, :])   # Footer
+    ax_left  = fig.add_subplot(gs[0, 0])
+    ax_right = fig.add_subplot(gs[0, 1])
+    ax_foot  = fig.add_subplot(gs[1, :])
+    for ax in (ax_left, ax_right, ax_foot):
+        ax.set_facecolor(_BG)
+        ax.axis("off")
+        ax.set_xlim(0, 1)
+        ax.set_ylim(0, 1)
 
     # ── Título ───────────────────────────────────────────────────────────
     today_str = dt.date.today().strftime("%d/%m/%Y")
-    fig.text(0.03, 0.965, "CIERRE DE WALL STREET",
-             fontsize=16, fontweight="bold", color=_TEXT,
+    fig.text(0.03, 0.960, "CIERRE DE WALL STREET",
+             fontsize=15, fontweight="bold", color=_TEXT,
              va="top", fontfamily="monospace")
-    fig.text(0.97, 0.965, f"InvestX  ·  {today_str}",
-             fontsize=9.5, color=_MUTED, va="top", ha="right")
+    fig.text(0.97, 0.960, f"InvestX  ·  {today_str}",
+             fontsize=9, color=_MUTED, va="top", ha="right")
+    fig.add_artist(plt.Line2D(
+        [0.03, 0.97], [0.878, 0.878],
+        transform=fig.transFigure, color=_BORDER, linewidth=0.8,
+    ))
 
-    # ── Helper: dibuja barras horizontales ───────────────────────────────
-    def _draw_bars(ax, labels: List[str], values: List[float], title: str) -> None:
-        ax.set_facecolor(_BG)
-        ax.spines["top"].set_visible(False)
-        ax.spines["right"].set_visible(False)
-        ax.spines["left"].set_color(_BORDER)
-        ax.spines["bottom"].set_color(_BORDER)
-        ax.tick_params(colors=_MUTED, length=0, labelsize=9.5)
+    # ── Panel izquierdo: índices + VIX ───────────────────────────────────
+    ax_left.text(0.06, 0.97, "ÍNDICES",
+                 color=_BLUE, fontsize=9, fontweight="bold",
+                 va="top", fontfamily="monospace")
 
-        if not labels:
-            ax.axis("off")
-            return
+    n_idx  = len(indices)
+    card_h = min(0.19, 0.78 / max(n_idx, 1))
+    gap    = (0.78 - n_idx * card_h) / max(n_idx, 1)
 
-        n = len(labels)
-        y = list(range(n - 1, -1, -1))
-        bar_colors = [_GREEN if v > 0 else _RED if v < 0 else "#444" for v in values]
+    for i, idx in enumerate(indices):
+        pct  = idx["change_pct"]
+        col  = _GREEN if pct > 0 else _RED if pct < 0 else _MUTED
+        sign = "+" if pct > 0 else ""
+        arrow = "▲" if pct > 0 else "▼" if pct < 0 else "—"
+        y0 = 0.90 - (i + 1) * card_h - i * gap
 
-        bars = ax.barh(y, values, color=bar_colors, height=0.56,
-                       zorder=3, linewidth=0)
+        rect = mpatches.FancyBboxPatch(
+            (0.04, y0), 0.92, card_h * 0.88,
+            boxstyle="round,pad=0.01",
+            facecolor=col + "28", edgecolor=col + "60",
+            linewidth=0.7, transform=ax_left.transAxes, clip_on=False,
+        )
+        ax_left.add_patch(rect)
+        mid_y = y0 + card_h * 0.42
+        ax_left.text(0.10, mid_y, idx["name"],
+                     color=_TEXT, fontsize=9.2, va="center")
+        ax_left.text(0.94, mid_y, f"{arrow} {sign}{pct:.2f}%",
+                     color=col, fontsize=10, fontweight="bold",
+                     va="center", ha="right")
 
-        ax.axvline(0, color=_BORDER, linewidth=1.2, zorder=2)
-        ax.grid(axis="x", color=_BORDER, linestyle=":", linewidth=0.5,
-                alpha=0.6, zorder=1)
-
-        ax.set_yticks(y)
-        ax.set_yticklabels(labels, color=_TEXT, fontsize=9.5)
-
-        max_abs = max(abs(v) for v in values) if values else 1
-        ax.set_xlim(-max_abs * 1.65, max_abs * 1.65)
-        ax.tick_params(axis="x", colors=_MUTED, labelsize=8)
-
-        for bar, val in zip(bars, values):
-            w     = bar.get_width()
-            pad   = max_abs * 0.08
-            x_pos = w + pad if w >= 0 else w - pad
-            ha    = "left"  if w >= 0 else "right"
-            sign  = "+" if val > 0 else ""
-            ax.text(x_pos, bar.get_y() + bar.get_height() / 2,
-                    f"{sign}{val:.2f}%",
-                    va="center", ha=ha, color=_TEXT,
-                    fontsize=9.5, fontweight="bold", zorder=4)
-
-        ax.set_title(title, color=_BLUE, fontsize=10.5, fontweight="bold",
-                     pad=9, loc="left", fontfamily="monospace")
-
-    _draw_bars(
-        ax_idx,
-        [idx["name"] for idx in indices],
-        [idx["change_pct"] for idx in indices],
-        "ÍNDICES",
-    )
-    _draw_bars(
-        ax_sec,
-        [s[0] for s in sec_data],
-        [s[1] for s in sec_data],
-        "SECTORES",
-    )
-
-    # ── Footer: VIX · F&G · Crypto ───────────────────────────────────────
-    ax_foot.set_facecolor(_BG)
-    ax_foot.axis("off")
-
-    badges: List[str] = []
+    # VIX debajo de los índices
     if vix:
-        sign = "+" if vix["change"] >= 0 else ""
-        direction = "↑" if vix["change"] >= 0 else "↓"
-        lbl = _vix_label(vix["value"])
-        badges.append(f"VIX  {vix['value']:.1f}  {direction}{sign}{vix['change']:.2f} pts  ({lbl})")
+        vy   = 0.90 - (n_idx * (card_h + gap)) - 0.06
+        vcol = _RED if vix["change"] > 0 else _GREEN
+        vsign = "+" if vix["change"] >= 0 else ""
+        vlbl  = _vix_label(vix["value"])
+        ax_left.text(0.06, vy,        "VIX",
+                     color=_MUTED, fontsize=8, fontweight="bold",
+                     va="top", fontfamily="monospace")
+        ax_left.text(0.06, vy - 0.10, f"{vix['value']:.1f}",
+                     color=vcol, fontsize=18, fontweight="bold", va="top")
+        ax_left.text(0.06, vy - 0.24, f"{vsign}{vix['change']:.2f} pts  ·  {vlbl}",
+                     color=_MUTED, fontsize=7.5, va="top")
+
+    # ── Panel derecho: tiles de sectores (heatmap) ────────────────────────
+    ax_right.text(0.02, 0.97, "SECTORES",
+                  color=_BLUE, fontsize=9, fontweight="bold",
+                  va="top", fontfamily="monospace")
+
+    if sec_data:
+        n_cols  = 3
+        n_rows  = math.ceil(len(sec_data) / n_cols)
+        tile_w  = 0.305
+        tile_h  = min(0.22, 0.84 / n_rows)
+        x_gap   = (1.0 - n_cols * tile_w) / (n_cols + 1)
+        y_start = 0.90
+        y_gap   = (0.88 - n_rows * tile_h) / max(n_rows, 1)
+
+        for i, (s_name, s_pct) in enumerate(sec_data):
+            col = i % n_cols
+            row = i // n_cols
+            x0  = x_gap + col * (tile_w + x_gap)
+            y0  = y_start - (row + 1) * tile_h - row * y_gap
+
+            bg = _tile_color(s_pct)
+            tile = mpatches.FancyBboxPatch(
+                (x0, y0), tile_w, tile_h * 0.92,
+                boxstyle="round,pad=0.015",
+                facecolor=bg, edgecolor="#00000040",
+                linewidth=0, transform=ax_right.transAxes, clip_on=False,
+            )
+            ax_right.add_patch(tile)
+
+            sign = "+" if s_pct > 0 else ""
+            cx   = x0 + tile_w / 2
+            cy   = y0 + tile_h * 0.46
+            ax_right.text(cx, cy + tile_h * 0.18, s_name,
+                          color="#ffffffcc", fontsize=8.5,
+                          ha="center", va="center", fontweight="bold")
+            ax_right.text(cx, cy - tile_h * 0.14,
+                          f"{sign}{s_pct:.2f}%",
+                          color="white", fontsize=12,
+                          ha="center", va="center", fontweight="bold")
+
+    # ── Footer: F&G + Crypto ──────────────────────────────────────────────
+    badges: List[str] = []
     if fg:
         rating_es = _FG_RATING_ES.get(fg["rating"], fg["rating"])
-        emoji = _fg_emoji(fg["score"])
+        emoji     = _fg_emoji(fg["score"])
         badges.append(f"Fear & Greed  {fg['score']}/100  —  {rating_es} {emoji}")
     for c in crypto:
         sign = "+" if c["change_pct"] > 0 else ""
-        col  = _GREEN if c["change_pct"] > 0 else _RED
         badges.append(f"{c['name']}  {sign}{c['change_pct']:.2f}%")
 
-    footer_txt = "     ·     ".join(badges)
-    ax_foot.text(0.5, 0.55, footer_txt,
-                 ha="center", va="center", color=_MUTED,
-                 fontsize=9, transform=ax_foot.transAxes)
-
-    # ── Línea separadora bajo el título ──────────────────────────────────
-    fig.add_artist(plt.Line2D(
-        [0.03, 0.97], [0.875, 0.875],
-        transform=fig.transFigure,
-        color=_BORDER, linewidth=0.8,
-    ))
+    if badges:
+        ax_foot.text(0.5, 0.52, "     ·     ".join(badges),
+                     ha="center", va="center", color=_MUTED, fontsize=9,
+                     transform=ax_foot.transAxes)
 
     # ── Export ───────────────────────────────────────────────────────────
     buf = BytesIO()
-    fig.savefig(buf, format="png", dpi=145,
-                facecolor=_BG, bbox_inches="tight", pad_inches=0.18)
+    fig.savefig(buf, format="png", dpi=150,
+                facecolor=_BG, bbox_inches="tight", pad_inches=0.15)
     plt.close(fig)
     buf.seek(0)
     return buf.getvalue()
