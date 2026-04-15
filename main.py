@@ -25,6 +25,7 @@ from news_es import run_news_once
 from earnings_weekly import run_weekly_earnings
 from market_close import run_market_close
 from insider_trading import run_daily_insider
+from congressional_trades import run_congressional_trades
 
 
 # ---------------------------
@@ -50,9 +51,10 @@ FORCE_NEWS = any(
     for var in ("FORCE_NEWS", "NEWS_FORCE", "news_force")
 )
 
-FORCE_EARNINGS = os.getenv("FORCE_EARNINGS", "0").strip().lower() in ("1", "true", "yes")
-CLOSE_FORCE    = os.getenv("CLOSE_FORCE",    "0").strip().lower() in ("1", "true", "yes")
-FORCE_INSIDER  = os.getenv("FORCE_INSIDER",  "0").strip().lower() in ("1", "true", "yes")
+FORCE_EARNINGS  = os.getenv("FORCE_EARNINGS",  "0").strip().lower() in ("1", "true", "yes")
+CLOSE_FORCE     = os.getenv("CLOSE_FORCE",     "0").strip().lower() in ("1", "true", "yes")
+FORCE_INSIDER   = os.getenv("FORCE_INSIDER",   "0").strip().lower() in ("1", "true", "yes")
+FORCE_CONGRESS  = os.getenv("FORCE_CONGRESS",  "0").strip().lower() in ("1", "true", "yes")
 
 
 # ======================================================
@@ -107,6 +109,9 @@ def main():
     INSIDER_HOUR   = 10
     INSIDER_MINUTE = 15
 
+    CONGRESS_HOUR   = 14
+    CONGRESS_MINUTE = 30
+
     PREMARKET_HOUR = 10
     PREMARKET_MINUTE = 30
 
@@ -128,6 +133,15 @@ def main():
     else:
         if weekday < 5 and hour == INSIDER_HOUR and minute >= INSIDER_MINUTE:
             run_daily_insider(force=False)
+
+    # ======================================================
+    # 0b) CONGRESISTAS USA (L-V 14:30, declaraciones recientes)
+    # ======================================================
+    if FORCE_CONGRESS:
+        run_congressional_trades(force=True)
+    else:
+        if weekday < 5 and hour == CONGRESS_HOUR and minute >= CONGRESS_MINUTE:
+            run_congressional_trades(force=False)
 
     # ======================================================
     # 1) PREMARKET
