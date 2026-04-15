@@ -1,8 +1,9 @@
 # === congressional_trades.py ===
 # InvestX — Operaciones bursátiles de congresistas USA
 #
-# Fuente:  housestockwatcher.com/api  (Cámara de Representantes)
-#          senatestockwatcher.com/api  (Senado)
+# Fuente primaria: QuiverQuant API (bulk/congresstrading) con Bearer token
+# Fuente fallback:  housestockwatcher.com/api  (Cámara de Representantes)
+#                   senatestockwatcher.com/api  (Senado)
 # Marco legal: STOCK Act (2012) → plazo de 30–45 días para declarar
 #
 # Lógica:
@@ -28,6 +29,9 @@ STATE_FILE = "congressional_trades_state.json"
 
 MIN_AMOUNT   = int(os.getenv("CONGRESS_MIN_AMOUNT", "250000"))  # $250K por defecto
 HTTP_TIMEOUT = 15
+QUIVER_TOKEN = os.getenv("QUIVER_TOKEN", "")  # Bearer token de QuiverQuant
+
+_QUIVER_URL = "https://api.quiverquant.com/beta/bulk/congresstrading"
 
 DIAS_ES  = ["lun", "mar", "mié", "jue", "vie", "sáb", "dom"]
 MESES_ES = ["ene", "feb", "mar", "abr", "may", "jun",
@@ -195,8 +199,90 @@ def _trade_key(name: str, ticker: str, t_type: str, tx_date: str) -> tuple:
 # Fetch APIs
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _fetch_json(urls: List[str], label: str):
-    """Intenta cada URL en orden hasta obtener JSON válido."""
+def _normalise_item_quiver(item: Dict, disc_from: date, disc_to: date) -> Optional[Dict]:
+    """Convierte un registro QuiverQuant al formato interno. None si no encaja."""
+    # QuiverQuant: Date = transaction_date, ReportDate = disclosure_date
+    disc_str = (item.get("ReportDate") or item.get("report_date") or "").strip()
+    try:
+        disc_date = date.fromisoformat(disc_str[:10])
+    except Exception:
+        return None
+    if not (disc_from <= disc_date <= disc_to):
+        return None
+
+    tx_str = (item.get("Date") or item.get("date") or disc_str).strip()
+    try:
+        tx_date = date.fromisoformat(tx_str[:10])
+    except Exception:
+        tx_date = disc_date
+
+    amount = (item.get("Range") or item.get("range") or item.get("Amount") or "").strip()
+    if _parse_amount_min(amount) < MIN_AMOUNT:
+        return None
+
+    ticker = (item.get("Ticker") or item.get("ticker") or "").strip().upper()
+    if not ticker or ticker in ("--", "N/A", ""):
+        return None
+
+    chamber_raw = (item.get("Chamber") or item.get("chamber") or "House").lower()
+    chamber = "senate" if "senate" in chamber_raw else "house"
+
+    name_raw = (
+        item.get("Representative") or item.get("representative")
+        or item.get("Senator")     or item.get("senator")
+        or item.get("Name")        or item.get("name") or ""
+    ).strip()
+
+    return {
+        "chamber":    chamber,
+        "name":       name_raw,
+        "party":      (item.get("Party") or item.get("party") or "").strip(),
+        "state":      (item.get("State") or item.get("state") or "").strip(),
+        "ticker":     ticker,
+        "asset":      (item.get("Asset") or item.get("asset")
+                       or item.get("Description") or item.get("description") or "").strip(),
+        "type":       (item.get("Transaction") or item.get("transaction") or "").strip(),
+        "amount":     amount,
+        "amount_min": _parse_amount_min(amount),
+        "tx_date":    tx_date,
+        "disc_date":  disc_date,
+    }
+
+
+def _fetch_quiverquant(disc_from: date, disc_to: date) -> Optional[List[Dict]]:
+    """
+    Descarga todas las operaciones desde QuiverQuant y filtra por ventana.
+    Devuelve lista (puede ser vacía) si la llamada tuvo éxito, None si falló.
+    """
+    if not QUIVER_TOKEN:
+        print("[congress] QUIVER_TOKEN no configurado; saltando QuiverQuant.")
+        return None
+
+    headers = {
+        "Authorization": f"Bearer {QUIVER_TOKEN}",
+        "Accept":        "application/json",
+        "User-Agent":    "InvestX-Bot/1.0",
+    }
+    try:
+        resp = requests.get(_QUIVER_URL, headers=headers, timeout=HTTP_TIMEOUT)
+        resp.raise_for_status()
+        raw = resp.json()
+        items = raw if isinstance(raw, list) else raw.get("data", [])
+        print(f"[congress] QuiverQuant OK: {len(items)} registros descargados.")
+    except Exception as e:
+        print(f"[congress] QuiverQuant fallo: {e}")
+        return None
+
+    results = []
+    for item in items:
+        norm = _normalise_item_quiver(item, disc_from, disc_to)
+        if norm:
+            results.append(norm)
+    return results
+
+
+def _fetch_json_fallback(urls: List[str], label: str):
+    """Intenta cada URL en orden hasta obtener JSON válido (fuentes fallback)."""
     for url in urls:
         try:
             resp = requests.get(url, headers=_HEADERS, timeout=HTTP_TIMEOUT)
@@ -209,98 +295,90 @@ def _fetch_json(urls: List[str], label: str):
     return None
 
 
-def _fetch_house(disc_from: date, disc_to: date) -> List[Dict]:
-    """Descarga operaciones de la Cámara con disclosure_date en el rango."""
-    items = _fetch_json(_HOUSE_URLS, "Cámara")
-    if items is None:
+def _parse_fallback_item(item: Dict, chamber: str,
+                         disc_from: date, disc_to: date) -> Optional[Dict]:
+    """Convierte un item de housestockwatcher/senatestockwatcher al formato interno."""
+    disc_str = (item.get("disclosure_date") or item.get("disclosureDate") or "").strip()
+    try:
+        disc_date = date.fromisoformat(disc_str[:10])
+    except Exception:
+        return None
+    if not (disc_from <= disc_date <= disc_to):
+        return None
+
+    tx_str = (item.get("transaction_date") or item.get("transactionDate") or disc_str).strip()
+    try:
+        tx_date = date.fromisoformat(tx_str[:10])
+    except Exception:
+        tx_date = disc_date
+
+    amount = item.get("amount") or item.get("transactionAmount") or ""
+    if _parse_amount_min(amount) < MIN_AMOUNT:
+        return None
+
+    ticker = (item.get("ticker") or "").strip().upper()
+    if not ticker or ticker in ("--", "N/A", ""):
+        return None
+
+    if chamber == "house":
+        name_raw = (item.get("representative") or item.get("name") or "").strip()
+    else:
+        name_raw = (item.get("senator") or item.get("name") or "").strip()
+
+    return {
+        "chamber":    chamber,
+        "name":       name_raw,
+        "party":      (item.get("party") or "").strip(),
+        "state":      (item.get("state") or "").strip(),
+        "ticker":     ticker,
+        "asset":      (item.get("asset_description") or item.get("assetDescription") or "").strip(),
+        "type":       (item.get("type") or item.get("transactionType") or "").strip(),
+        "amount":     amount,
+        "amount_min": _parse_amount_min(amount),
+        "tx_date":    tx_date,
+        "disc_date":  disc_date,
+    }
+
+
+def _fetch_fallback(disc_from: date, disc_to: date) -> List[Dict]:
+    """Fuente fallback: housestockwatcher + senatestockwatcher (si QuiverQuant falla)."""
+    results = []
+
+    house_items = _fetch_json_fallback(_HOUSE_URLS, "Cámara")
+    if house_items is None:
         print("[congress] Cámara: todos los endpoints fallaron.")
-        return []
+    else:
+        for item in house_items:
+            norm = _parse_fallback_item(item, "house", disc_from, disc_to)
+            if norm:
+                results.append(norm)
 
-    results = []
-    for item in items:
-        disc_str = (item.get("disclosure_date") or item.get("disclosureDate") or "").strip()
-        try:
-            disc_date = date.fromisoformat(disc_str[:10])
-        except Exception:
-            continue
-        if not (disc_from <= disc_date <= disc_to):
-            continue
-
-        tx_str = (item.get("transaction_date") or item.get("transactionDate") or disc_str).strip()
-        try:
-            tx_date = date.fromisoformat(tx_str[:10])
-        except Exception:
-            tx_date = disc_date
-
-        amount = item.get("amount") or item.get("transactionAmount") or ""
-        if _parse_amount_min(amount) < MIN_AMOUNT:
-            continue
-
-        ticker = (item.get("ticker") or "").strip().upper()
-        if not ticker or ticker in ("--", "N/A", ""):
-            continue
-
-        results.append({
-            "chamber":    "house",
-            "name":       (item.get("representative") or item.get("name") or "").strip(),
-            "party":      (item.get("party") or "").strip(),
-            "state":      (item.get("state") or "").strip(),
-            "ticker":     ticker,
-            "asset":      (item.get("asset_description") or item.get("assetDescription") or "").strip(),
-            "type":       (item.get("type") or item.get("transactionType") or "").strip(),
-            "amount":     amount,
-            "amount_min": _parse_amount_min(amount),
-            "tx_date":    tx_date,
-            "disc_date":  disc_date,
-        })
-    return results
-
-
-def _fetch_senate(disc_from: date, disc_to: date) -> List[Dict]:
-    """Descarga operaciones del Senado con disclosure_date en el rango."""
-    items = _fetch_json(_SENATE_URLS, "Senado")
-    if items is None:
+    senate_items = _fetch_json_fallback(_SENATE_URLS, "Senado")
+    if senate_items is None:
         print("[congress] Senado: todos los endpoints fallaron.")
-        return []
+    else:
+        for item in senate_items:
+            norm = _parse_fallback_item(item, "senate", disc_from, disc_to)
+            if norm:
+                results.append(norm)
 
-    results = []
-    for item in items:
-        disc_str = (item.get("disclosure_date") or item.get("disclosureDate") or "").strip()
-        try:
-            disc_date = date.fromisoformat(disc_str[:10])
-        except Exception:
-            continue
-        if not (disc_from <= disc_date <= disc_to):
-            continue
-
-        tx_str = (item.get("transaction_date") or item.get("transactionDate") or disc_str).strip()
-        try:
-            tx_date = date.fromisoformat(tx_str[:10])
-        except Exception:
-            tx_date = disc_date
-
-        amount = item.get("amount") or item.get("transactionAmount") or ""
-        if _parse_amount_min(amount) < MIN_AMOUNT:
-            continue
-
-        ticker = (item.get("ticker") or "").strip().upper()
-        if not ticker or ticker in ("--", "N/A", ""):
-            continue
-
-        results.append({
-            "chamber":    "senate",
-            "name":       (item.get("senator") or item.get("name") or "").strip(),
-            "party":      (item.get("party") or "").strip(),
-            "state":      (item.get("state") or "").strip(),
-            "ticker":     ticker,
-            "asset":      (item.get("asset_description") or item.get("assetDescription") or "").strip(),
-            "type":       (item.get("type") or item.get("transactionType") or "").strip(),
-            "amount":     amount,
-            "amount_min": _parse_amount_min(amount),
-            "tx_date":    tx_date,
-            "disc_date":  disc_date,
-        })
     return results
+
+
+def _fetch_all_trades(disc_from: date, disc_to: date) -> List[Dict]:
+    """
+    Intenta QuiverQuant primero; si falla, usa los endpoints fallback.
+    Devuelve lista unificada de operaciones filtradas por ventana y umbral.
+    """
+    trades = _fetch_quiverquant(disc_from, disc_to)
+    if trades is not None:
+        print(f"[congress] QuiverQuant: {len(trades)} ops en ventana (umbral ${MIN_AMOUNT:,}).")
+        return trades
+
+    print("[congress] QuiverQuant no disponible. Usando fuentes fallback...")
+    trades = _fetch_fallback(disc_from, disc_to)
+    print(f"[congress] Fallback: {len(trades)} ops en ventana.")
+    return trades
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -439,11 +517,8 @@ def run_congressional_trades(force: bool = False) -> None:
     print(f"[congress] Buscando declaraciones del {disc_from} al {disc_to} "
           f"(umbral ${MIN_AMOUNT:,})...")
 
-    house_raw  = _fetch_house(disc_from, disc_to)
-    senate_raw = _fetch_senate(disc_from, disc_to)
-    all_trades = house_raw + senate_raw
-
-    print(f"[congress] {len(house_raw)} Cámara + {len(senate_raw)} Senado = {len(all_trades)} total.")
+    all_trades = _fetch_all_trades(disc_from, disc_to)
+    print(f"[congress] {len(all_trades)} operaciones en ventana total.")
 
     # Filtrar ya enviados
     sent_keys = _get_sent_keys()
