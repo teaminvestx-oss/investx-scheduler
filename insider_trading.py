@@ -618,6 +618,11 @@ def run_daily_insider(force: bool = False) -> None:
         print("[insider] Ya enviado hoy. Skipping.")
         return
 
+    # Marcar AHORA como "en curso" para que si el cron vuelve a disparar
+    # mientras el scan está en marcha (el scan tarda varios minutos),
+    # la segunda ejecución vea sent_date=hoy y salga antes de empezar.
+    _mark_sent(today, [])
+
     # Ventana: reportDate de los últimos N días hasta ayer.
     # Los lunes ampliamos a 5 días para cubrir el fin de semana.
     date_to   = today - timedelta(days=1)
