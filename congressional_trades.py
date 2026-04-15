@@ -510,9 +510,21 @@ def run_congressional_trades(force: bool = False) -> None:
     _mark_sent(today, [])
 
     # Ventana de disclosure: últimos 3 días (los lunes, 5 para cubrir el fin de semana)
-    lookback  = 5 if today.weekday() == 0 else 3
-    disc_to   = today
-    disc_from = today - timedelta(days=lookback)
+    # Override via env (útil en entornos de test con fecha de sistema incorrecta)
+    _env_from = os.getenv("CONGRESS_DATE_FROM", "").strip()
+    _env_to   = os.getenv("CONGRESS_DATE_TO",   "").strip()
+    if _env_from and _env_to:
+        try:
+            disc_from = date.fromisoformat(_env_from)
+            disc_to   = date.fromisoformat(_env_to)
+            print(f"[congress] Fechas forzadas por env: {disc_from} – {disc_to}")
+        except ValueError:
+            _env_from = _env_to = ""
+
+    if not (_env_from and _env_to):
+        lookback  = 5 if today.weekday() == 0 else 3
+        disc_to   = today
+        disc_from = today - timedelta(days=lookback)
 
     print(f"[congress] Buscando declaraciones del {disc_from} al {disc_to} "
           f"(umbral ${MIN_AMOUNT:,})...")
