@@ -26,7 +26,7 @@ from utils import call_gpt_mini, send_telegram_message
 TZ         = ZoneInfo("Europe/Madrid")
 STATE_FILE = "congressional_trades_state.json"
 
-MIN_AMOUNT   = int(os.getenv("CONGRESS_MIN_AMOUNT", "50000"))   # $50 K
+MIN_AMOUNT   = int(os.getenv("CONGRESS_MIN_AMOUNT", "250000"))  # $250K por defecto
 HTTP_TIMEOUT = 15
 
 DIAS_ES  = ["lun", "mar", "mié", "jue", "vie", "sáb", "dom"]
@@ -41,14 +41,43 @@ _HEADERS = {
     "Accept":     "application/json",
 }
 
-# Políticos especialmente conocidos por su actividad (resaltado opcional)
-_NOTABLE = {
-    "nancy pelosi", "paul pelosi",
-    "dan crenshaw", "tommy tuberville", "josh gottheimer",
-    "brian higgins", "michael mccaul", "ro khanna",
-    "marjorie taylor greene", "pete sessions",
-    "richard burr",  # ex-senador famoso por insider pre-COVID
+# Cargo y comité principal de los políticos más activos en bolsa.
+# Clave: nombre en minúsculas tal como viene en la API.
+# "role" = cargo corto | "committee" = comité más relevante para inversión
+_CONGRESS_INFO: Dict[str, Dict[str, str]] = {
+    # Cámara de Representantes
+    "nancy pelosi":          {"role": "Representante",  "committee": "Expresidenta Cámara"},
+    "paul pelosi":           {"role": "Cónyuge",        "committee": "— (esposo de N. Pelosi)"},
+    "dan crenshaw":          {"role": "Representante",  "committee": "C. Seguridad Nacional"},
+    "josh gottheimer":       {"role": "Representante",  "committee": "C. Servicios Financieros"},
+    "brian higgins":         {"role": "Representante",  "committee": "C. Medios y Arbitrios"},
+    "michael mccaul":        {"role": "Representante",  "committee": "C. Asuntos Exteriores"},
+    "ro khanna":             {"role": "Representante",  "committee": "C. Fuerzas Armadas / C&T"},
+    "marjorie taylor greene":{"role": "Representante",  "committee": "C. Supervisión"},
+    "pete sessions":         {"role": "Representante",  "committee": "C. Reglas"},
+    "greg gianforte":        {"role": "Representante",  "committee": "C. Recursos Naturales"},
+    "chip roy":              {"role": "Representante",  "committee": "C. Presupuestos"},
+    "french hill":           {"role": "Representante",  "committee": "Pdte. C. Servicios Financieros"},
+    "bill huizenga":         {"role": "Representante",  "committee": "C. Servicios Financieros"},
+    "tim walberg":           {"role": "Representante",  "committee": "C. Trabajo y Educación"},
+    # Senado
+    "tommy tuberville":      {"role": "Senador",        "committee": "C. Fuerzas Armadas / Agricultura"},
+    "richard burr":          {"role": "Ex-Senador",     "committee": "Ex-pdte. C. Inteligencia"},
+    "kelly loeffler":        {"role": "Ex-Senadora",    "committee": "Ex-C. Sanidad / Agricultura"},
+    "david perdue":          {"role": "Ex-Senador",     "committee": "Ex-C. Banca"},
+    "mark warner":           {"role": "Senador",        "committee": "C. Inteligencia"},
+    "ron wyden":             {"role": "Senador",        "committee": "C. Finanzas"},
+    "john hoeven":           {"role": "Senador",        "committee": "C. Agricultura / Apropiaciones"},
+    "shelley moore capito":  {"role": "Senadora",       "committee": "C. Apropiaciones"},
+    "pat toomey":            {"role": "Ex-Senador",     "committee": "Ex-C. Banca"},
 }
+
+def _get_role(name: str, chamber: str) -> str:
+    """Devuelve el cargo y comité formateado, o un genérico según la cámara."""
+    info = _CONGRESS_INFO.get(name.lower())
+    if info:
+        return f"{info['role']} · {info['committee']}"
+    return "Representante" if chamber == "house" else "Senador/a"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -302,17 +331,17 @@ def _build_message(
         name    = t["name"] or "?"
         party   = t["party"] or "?"
         state   = t["state"] or "?"
+        role    = _get_role(name, t["chamber"])
         ticker  = t["ticker"]
-        # Acortar descripción del activo si es larga
         asset   = t["asset"]
         if len(asset) > 28:
             asset = asset[:26] + "…"
         ctx     = f"{ticker} ({asset})" if asset and asset.lower() not in (ticker.lower(), "") else ticker
         amt     = _format_amount(t["amount"])
         tx_day  = _fmt_date(t["tx_date"])
-        notable = "⭐ " if name.lower() in _NOTABLE else ""
         return (
-            f"{icon} {notable}*{name}* ({party} · {state})\n"
+            f"{icon} *{name}* ({party} · {state})\n"
+            f"   _{role}_\n"
             f"   {ctx}  ·  {action}  *{amt}*  _op: {tx_day}_"
         )
 
