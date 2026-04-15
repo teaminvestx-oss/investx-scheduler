@@ -26,6 +26,7 @@ from earnings_weekly import run_weekly_earnings
 from market_close import run_market_close
 from insider_trading import run_daily_insider
 from congressional_trades import run_congressional_trades
+from large_investors import run_large_investors
 
 
 # ---------------------------
@@ -54,7 +55,8 @@ FORCE_NEWS = any(
 FORCE_EARNINGS  = os.getenv("FORCE_EARNINGS",  "0").strip().lower() in ("1", "true", "yes")
 CLOSE_FORCE     = os.getenv("CLOSE_FORCE",     "0").strip().lower() in ("1", "true", "yes")
 FORCE_INSIDER   = os.getenv("FORCE_INSIDER",   "0").strip().lower() in ("1", "true", "yes")
-FORCE_CONGRESS  = os.getenv("FORCE_CONGRESS",  "0").strip().lower() in ("1", "true", "yes")
+FORCE_CONGRESS   = os.getenv("FORCE_CONGRESS",   "0").strip().lower() in ("1", "true", "yes")
+FORCE_INVESTORS  = os.getenv("FORCE_INVESTORS",  "0").strip().lower() in ("1", "true", "yes")
 
 
 # ======================================================
@@ -112,6 +114,9 @@ def main():
     CONGRESS_HOUR   = 14
     CONGRESS_MINUTE = 30
 
+    INVESTORS_HOUR   = 16
+    INVESTORS_MINUTE = 30
+
     PREMARKET_HOUR = 10
     PREMARKET_MINUTE = 30
 
@@ -142,6 +147,15 @@ def main():
     else:
         if weekday < 5 and hour == CONGRESS_HOUR and minute >= CONGRESS_MINUTE:
             run_congressional_trades(force=False)
+
+    # ======================================================
+    # 0c) GRANDES INVERSORES (L-V 16:30, filings 13D/13G recientes)
+    # ======================================================
+    if FORCE_INVESTORS:
+        run_large_investors(force=True)
+    else:
+        if weekday < 5 and hour == INVESTORS_HOUR and minute >= INVESTORS_MINUTE:
+            run_large_investors(force=False)
 
     # ======================================================
     # 1) PREMARKET
