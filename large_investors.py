@@ -239,25 +239,34 @@ def _search_filings(date_from: date, date_to: date) -> List[Dict]:
     """
     Busca en EDGAR EFTS todos los 13D/13G presentados en el rango de fechas.
     Filtra: (a) inversores conocidos en cualquier tipo, (b) SC 13D nuevos de cualquier inversor.
+
+    IMPORTANTE: requests urlencodea las comas en el param 'forms', convirtiéndolas
+    en %2C. EDGAR EFTS espera comas literales como separador. Por eso construimos
+    la URL manualmente para controlar el encoding exacto.
     """
-    params = {
-        "forms":     "SC 13D,SC 13G,SC 13D/A,SC 13G/A",
-        "dateRange": "custom",
-        "startdt":   date_from.isoformat(),
-        "enddt":     date_to.isoformat(),
-        "hits.hits.total.value": 1,
-    }
+    # Construir URL con comas literales y espacios como + pero slashes como %2F
+    forms_raw   = "SC 13D,SC 13G,SC 13D/A,SC 13G/A"
+    forms_enc   = forms_raw.replace(" ", "+").replace("/", "%2F")
+    url = (
+        f"{_EFTS_URL}"
+        f"?q=&forms={forms_enc}"
+        f"&dateRange=custom"
+        f"&startdt={date_from.isoformat()}"
+        f"&enddt={date_to.isoformat()}"
+        f"&hits.hits.total=true"    # pedir total de resultados en respuesta
+    )
+    print(f"[investors] EFTS URL: {url}")
     try:
-        resp = requests.get(_EFTS_URL, params=params,
-                            headers=_SEC_HEADERS, timeout=15)
+        resp = requests.get(url, headers=_SEC_HEADERS, timeout=15)
         resp.raise_for_status()
         data = resp.json()
     except Exception as e:
         print(f"[investors] Error EFTS: {e}")
         return []
 
-    hits = data.get("hits", {}).get("hits", [])
-    print(f"[investors] EFTS: {len(hits)} filings en {date_from}–{date_to}")
+    total = data.get("hits", {}).get("total", {})
+    hits  = data.get("hits", {}).get("hits", [])
+    print(f"[investors] EFTS: {len(hits)} filings (total={total}) en {date_from}–{date_to}")
 
     results = []
     for hit in hits:

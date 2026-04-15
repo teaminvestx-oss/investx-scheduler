@@ -33,11 +33,20 @@ DIAS_ES  = ["lun", "mar", "mié", "jue", "vie", "sáb", "dom"]
 MESES_ES = ["ene", "feb", "mar", "abr", "may", "jun",
             "jul", "ago", "sep", "oct", "nov", "dic"]
 
-_HOUSE_URL  = "https://housestockwatcher.com/api"
-_SENATE_URL = "https://senatestockwatcher.com/api"
+# Fuentes primarias y fallback para cada cámara
+# housestockwatcher / senatestockwatcher son los agregadores más completos.
+# Si el DNS falla desde el datacenter de Render, intentamos las alternativas.
+_HOUSE_URLS = [
+    "https://housestockwatcher.com/api",
+    "https://house-stock-watcher-data.s3-us-east-2.amazonaws.com/data/all_transactions.json",
+]
+_SENATE_URLS = [
+    "https://senatestockwatcher.com/api",
+    "https://senate-stock-watcher-data.s3-us-east-2.amazonaws.com/aggregate/all_transactions.json",
+]
 
 _HEADERS = {
-    "User-Agent": "InvestX-Bot/1.0 bot@investx.io",
+    "User-Agent": "Mozilla/5.0 (compatible; InvestX-Bot/1.0)",
     "Accept":     "application/json",
 }
 
@@ -186,16 +195,25 @@ def _trade_key(name: str, ticker: str, t_type: str, tx_date: str) -> tuple:
 # Fetch APIs
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _fetch_json(urls: List[str], label: str):
+    """Intenta cada URL en orden hasta obtener JSON válido."""
+    for url in urls:
+        try:
+            resp = requests.get(url, headers=_HEADERS, timeout=HTTP_TIMEOUT)
+            resp.raise_for_status()
+            raw = resp.json()
+            print(f"[congress] {label} OK desde {url}")
+            return raw if isinstance(raw, list) else raw.get("data", raw)
+        except Exception as e:
+            print(f"[congress] {label} fallo {url}: {e}")
+    return None
+
+
 def _fetch_house(disc_from: date, disc_to: date) -> List[Dict]:
     """Descarga operaciones de la Cámara con disclosure_date en el rango."""
-    try:
-        resp = requests.get(_HOUSE_URL, headers=_HEADERS, timeout=HTTP_TIMEOUT)
-        resp.raise_for_status()
-        raw = resp.json()
-        # La API devuelve una lista directa o {"data": [...]}
-        items = raw if isinstance(raw, list) else raw.get("data", [])
-    except Exception as e:
-        print(f"[congress] Error Cámara: {e}")
+    items = _fetch_json(_HOUSE_URLS, "Cámara")
+    if items is None:
+        print("[congress] Cámara: todos los endpoints fallaron.")
         return []
 
     results = []
@@ -240,13 +258,9 @@ def _fetch_house(disc_from: date, disc_to: date) -> List[Dict]:
 
 def _fetch_senate(disc_from: date, disc_to: date) -> List[Dict]:
     """Descarga operaciones del Senado con disclosure_date en el rango."""
-    try:
-        resp = requests.get(_SENATE_URL, headers=_HEADERS, timeout=HTTP_TIMEOUT)
-        resp.raise_for_status()
-        raw = resp.json()
-        items = raw if isinstance(raw, list) else raw.get("data", [])
-    except Exception as e:
-        print(f"[congress] Error Senado: {e}")
+    items = _fetch_json(_SENATE_URLS, "Senado")
+    if items is None:
+        print("[congress] Senado: todos los endpoints fallaron.")
         return []
 
     results = []
