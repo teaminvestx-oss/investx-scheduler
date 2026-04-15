@@ -153,47 +153,82 @@ def _cik_to_name(cik: str) -> Optional[str]:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Extracción de empresa objetivo desde cabecera SGML del filing
+# Parseo del filing: empresa objetivo + % del capital + acciones
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _extract_subject_cik(filer_cik: str, accession: str) -> Optional[str]:
+def _parse_filing(filer_cik: str, accession: str) -> Dict:
     """
-    Descarga los primeros 5 KB del filing .txt y extrae el CIK de la empresa
-    objetivo (SUBJECT-COMPANY) desde la cabecera SGML estándar de EDGAR.
+    Descarga los primeros 12 KB del filing .txt y extrae:
+      - CIK de la empresa objetivo (SUBJECT-COMPANY, cabecera SGML)
+      - Porcentaje del capital (Item 11 del formulario 13D/13G)
+      - Número de acciones (Item 9)
+    Devuelve dict con claves: subject_cik, pct, shares (None si no se encuentran).
     """
-    acc_clean  = accession.replace("-", "")
-    filer_cik  = filer_cik.lstrip("0")
+    acc_clean = accession.replace("-", "")
+    cik_clean = filer_cik.lstrip("0")
     url = (f"https://www.sec.gov/Archives/edgar/data/"
-           f"{filer_cik}/{acc_clean}/{accession}.txt")
+           f"{cik_clean}/{acc_clean}/{accession}.txt")
+    result: Dict = {"subject_cik": None, "pct": None, "shares": None}
     try:
         resp = requests.get(url, headers=_SEC_HEADERS, stream=True, timeout=12)
-        # Leer solo los primeros 5 KB (la cabecera SGML siempre está al inicio)
         raw = b""
         for chunk in resp.iter_content(1024):
             raw += chunk
-            if len(raw) >= 5120:
+            if len(raw) >= 12288:   # 12 KB — suficiente para cabecera + portada del form
                 break
         text = raw.decode("utf-8", errors="replace")
 
-        # Patrón SGML estándar de EDGAR para SUBJECT-COMPANY
+        # ── 1) CIK de la empresa objetivo (cabecera SGML) ────────────────────
         m = re.search(
             r"<SUBJECT-COMPANY>.*?<CIK>\s*(\d+)\s*</CIK>",
             text, re.DOTALL | re.IGNORECASE,
         )
         if m:
-            return m.group(1).lstrip("0") or m.group(1)
+            result["subject_cik"] = m.group(1).lstrip("0") or m.group(1)
+        else:
+            # Formato antiguo (sin XML tags)
+            m2 = re.search(
+                r"SUBJECT COMPANY[\s\S]{0,200}?CENTRAL INDEX KEY[:\s]+(\d+)",
+                text, re.IGNORECASE,
+            )
+            if m2:
+                result["subject_cik"] = m2.group(1).lstrip("0") or m2.group(1)
 
-        # Fallback: CONFORMED-NAME puede indicar la empresa en el bloque de cabecera
-        # (formato antiguo sin tags XML)
-        m2 = re.search(
-            r"SUBJECT COMPANY[:\s]+.*?CENTRAL INDEX KEY[:\s]+(\d+)",
-            text, re.DOTALL | re.IGNORECASE,
-        )
-        if m2:
-            return m2.group(1).lstrip("0") or m2.group(1)
+        # ── 2) Porcentaje del capital (Item 11 / Row 11) ─────────────────────
+        pct_patterns = [
+            # Formato tabla: "11." seguido de % en la misma línea o la siguiente
+            r'(?:^|\n)\s*11[\.\)]\s*[\s\S]{0,80}?(\d{1,3}\.?\d{0,3})\s*%',
+            # Texto libre: "percent of class ... X%"
+            r'percent\s+of\s+class[^%\n]{0,80}?(\d{1,3}\.?\d{0,3})\s*%',
+        ]
+        for pat in pct_patterns:
+            mp = re.search(pat, text, re.IGNORECASE | re.MULTILINE)
+            if mp:
+                try:
+                    pct = float(mp.group(1))
+                    if 0 < pct <= 100:
+                        result["pct"] = pct
+                        break
+                except ValueError:
+                    pass
+
+        # ── 3) Número de acciones (Item 9 / Row 9) ───────────────────────────
+        shares_patterns = [
+            r'(?:^|\n)\s*9[\.\)]\s*[\s\S]{0,80}?([\d,]+)\s*(?:shares|acciones)',
+            r'aggregate\s+amount[^0-9\n]{0,60}?([\d,]+)',
+        ]
+        for pat in shares_patterns:
+            ms = re.search(pat, text, re.IGNORECASE | re.MULTILINE)
+            if ms:
+                try:
+                    result["shares"] = int(ms.group(1).replace(",", ""))
+                    break
+                except ValueError:
+                    pass
+
     except Exception as e:
-        print(f"[investors] Error leyendo SGML {accession}: {e}")
-    return None
+        print(f"[investors] Error parseando {accession}: {e}")
+    return result
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -256,20 +291,23 @@ def _search_filings(date_from: date, date_to: date) -> List[Dict]:
 
 
 def _enrich_with_subject(filings: List[Dict]) -> List[Dict]:
-    """Añade ticker y nombre de la empresa objetivo a cada filing."""
+    """Añade ticker, nombre, % del capital y acciones a cada filing."""
+    import time
     _load_cik_maps()
     enriched = []
     for f in filings:
-        subject_cik = _extract_subject_cik(f["filer_cik"], f["accession"])
-        if subject_cik:
-            f["ticker"] = _cik_to_ticker(subject_cik) or "?"
-            f["company"] = _cik_to_name(subject_cik) or subject_cik
+        info = _parse_filing(f["filer_cik"], f["accession"])
+        cik  = info["subject_cik"]
+        if cik:
+            f["ticker"]  = _cik_to_ticker(cik) or "?"
+            f["company"] = _cik_to_name(cik)   or cik
         else:
             f["ticker"]  = "?"
             f["company"] = "?"
+        f["pct"]    = info["pct"]     # float o None
+        f["shares"] = info["shares"]  # int o None
         enriched.append(f)
-        # Respetar límite de la SEC (10 req/s)
-        import time; time.sleep(0.12)
+        time.sleep(0.12)   # respeta límite SEC 10 req/s
     return enriched
 
 
@@ -277,19 +315,30 @@ def _enrich_with_subject(filings: List[Dict]) -> List[Dict]:
 # Mensaje
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _form_label(form: str) -> str:
-    labels = {
-        "SC 13D":   "Nueva posición activista (>5%)",
-        "SC 13D/A": "Actualiza posición activista",
-        "SC 13G":   "Nueva posición pasiva (>5%)",
-        "SC 13G/A": "Actualiza posición pasiva",
-    }
-    return labels.get(form, form)
+def _action_label(form: str, pct: Optional[float]) -> str:
+    """
+    Devuelve icono + texto de acción.
 
+    Lógica:
+      13D / 13G (sin /A) → apertura de posición (cruce del 5%)
+      13D/A / 13G/A      → actualización; si pct~0 es cierre, si no es ajuste
+      ⚡ = activista (busca influir en la dirección)
+      📦 = posición pasiva (acumulación estratégica sin intención activista)
+    """
+    is_amendment = form.endswith("/A")
+    is_activist  = "13D" in form
 
-def _form_icon(form: str) -> str:
-    if "13D" in form: return "⚡"   # activista = más impacto
-    return "📦"                     # pasivo
+    icon = "⚡" if is_activist else "📦"
+
+    if not is_amendment:
+        kind = "Abre posición activista" if is_activist else "Abre posición"
+    else:
+        if pct is not None and pct < 0.5:
+            kind = "Cierra posición"
+        else:
+            kind = "Actualiza posición activista" if is_activist else "Actualiza posición"
+
+    return icon, kind
 
 
 def _fmt_date(d_str: str) -> str:
@@ -334,21 +383,34 @@ def _build_message(filings: List[Dict], date_from: date, date_to: date) -> str:
     )
 
     for f in ordered:
-        icon      = _form_icon(f["form"])
-        label     = _form_label(f["form"])
-        investor  = f["investor_label"]
-        ticker    = f["ticker"]
-        company   = f["company"]
+        icon, kind = _action_label(f["form"], f.get("pct"))
+        investor   = f["investor_label"]
+        ticker     = f["ticker"]
+        company    = f["company"]
         if len(company) > 28:
             company = company[:26] + "…"
-        ctx       = f"{ticker} ({company})" if company and company != "?" else ticker
-        filed_day = _fmt_date(f["filed"])
+        ctx        = f"{ticker} ({company})" if company and company != "?" else ticker
+        filed_day  = _fmt_date(f["filed"])
         period_day = _fmt_date(f["period"]) if f["period"] else "?"
+
+        # Línea de posición: % y acciones si disponibles
+        pct    = f.get("pct")
+        shares = f.get("shares")
+        if pct is not None:
+            pos_str = f"*{pct:.1f}% del capital*"
+            if shares:
+                s_fmt = f"{shares:,}".replace(",", ".")
+                pos_str += f" ({s_fmt} acc.)"
+        elif shares:
+            s_fmt   = f"{shares:,}".replace(",", ".")
+            pos_str = f"*{s_fmt} acciones*"
+        else:
+            pos_str = "_posición no disponible_"
 
         lines.append(
             f"{icon} *{investor}*\n"
-            f"   {ctx}  ·  _{label}_\n"
-            f"   Filing: {filed_day}  ·  Operación: {period_day}"
+            f"   {ctx}  ·  {kind}\n"
+            f"   Posición: {pos_str}  ·  _op: {period_day}_"
         )
         lines.append("")
 
