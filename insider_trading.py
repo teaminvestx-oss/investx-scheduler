@@ -271,13 +271,13 @@ def _fetch_xml_content(cik_int: int, accession: str, primary_doc: str) -> Option
 # ---------------------------------------------------------------------------
 def _get_form4_filings(cik: str, date_from: date, date_to: date) -> List[Dict]:
     """
-    Consulta submissions API y devuelve Form 4s cuya fecha de transacción
-    (reportDate) cae en el rango [date_from, date_to].
+    Consulta submissions API y devuelve Form 4s cuya filingDate
+    (fecha de presentación a la SEC) cae en el rango [date_from, date_to].
 
-    IMPORTANTE: filtramos por reportDate (fecha de la operación), NO por
-    filingDate (fecha de presentación a la SEC), porque los ejecutivos tienen
-    hasta 2 días hábiles para presentar, por lo que filings de operaciones
-    del viernes pueden aparecer el lunes/martes siguiente.
+    Filtramos por filingDate para que cada filing aparezca exactamente
+    un día: el día en que se presentó. Así no hay solapamiento entre
+    ejecuciones consecutivas aunque el contenedor sea efímero.
+    La fecha real de la operación (reportDate) se muestra en el mensaje.
     """
     url = f"https://data.sec.gov/submissions/CIK{cik}.json"
     try:
@@ -291,38 +291,27 @@ def _get_form4_filings(cik: str, date_from: date, date_to: date) -> List[Dict]:
     recent = data.get("filings", {}).get("recent", {})
     forms  = recent.get("form", [])
     fdates = recent.get("filingDate", [])
-    rdates = recent.get("reportDate", [])   # fecha real de la transacción
+    rdates = recent.get("reportDate", [])   # se guarda pero no se usa para filtrar
     accs   = recent.get("accessionNumber", [])
     pdocs  = recent.get("primaryDocument", [])
 
-    # Ventana de filing amplia: hasta 5 días después de date_to para no perder
-    # presentaciones tardías (2 días hábiles = hasta ~4 días naturales)
-    filing_cutoff = date_to + timedelta(days=5)
-
+    # La API devuelve filings en orden cronológico inverso (más reciente primero).
     filings = []
     for form, fd_str, rd_str, acc, pdoc in zip(forms, fdates, rdates, accs, pdocs):
-        if form not in ("4", "4/A"):
-            continue
-
         try:
             fd = date.fromisoformat(fd_str)
         except Exception:
             continue
 
-        if fd < date_from or fd > filing_cutoff:
+        # Una vez que los filings son más antiguos que nuestra ventana, paramos.
+        if fd < date_from:
+            break
+        if fd > date_to:
+            continue
+        if form not in ("4", "4/A"):
             continue
 
-        # Filtro principal: fecha de transacción (reportDate) dentro del rango
-        if rd_str:
-            try:
-                rd = date.fromisoformat(rd_str)
-                if date_from <= rd <= date_to:
-                    filings.append({"accession": acc, "primary_doc": pdoc or "", "filing_date": rd})
-            except Exception:
-                pass
-        else:
-            if date_from <= fd <= date_to:
-                filings.append({"accession": acc, "primary_doc": pdoc or "", "filing_date": fd})
+        filings.append({"accession": acc, "primary_doc": pdoc or "", "filing_date": fd})
 
     return filings
 
@@ -494,19 +483,14 @@ def _date_range_str(date_from: date, date_to: date) -> str:
 
 
 def _build_message(trades: List[Dict], date_from: date, date_to: date) -> str:
-    # Usar el rango real de las operaciones incluidas (más preciso que la ventana)
-    if trades:
-        real_from = min(t["date"] for t in trades)
-        real_to   = max(t["date"] for t in trades)
-    else:
-        real_from, real_to = date_from, date_to
-
-    date_str = _date_range_str(real_from, real_to)
+    # date_from/date_to = ventana de filingDate (cuándo se presentó el Form 4)
+    # Cada trade line muestra su fecha de operación real (t["date"])
+    filing_str = _date_range_str(date_from, date_to)
 
     header = (
         f"🕵️ *Lo que los directivos hicieron con su propio dinero*\n"
-        f"_Insider Trading · Operaciones del {date_str}_\n"
-        f"_⏱ La SEC concede 2 días hábiles para el filing_"
+        f"_Insider Trading · Filings presentados el {filing_str}_\n"
+        f"_⏱ La SEC concede 2 días hábiles para declarar_"
     )
 
     if not trades:
@@ -623,13 +607,15 @@ def run_daily_insider(force: bool = False) -> None:
     # la segunda ejecución vea sent_date=hoy y salga antes de empezar.
     _mark_sent(today, [])
 
-    # Ventana: reportDate de los últimos N días hasta ayer.
-    # Los lunes ampliamos a 5 días para cubrir el fin de semana.
+    # Ventana: filingDate = ayer exclusivamente.
+    # Los lunes ampliamos a 3 días para cubrir el viernes (sáb/dom no hay filings).
+    # Como filtramos por filingDate (no reportDate), las ventanas de días
+    # consecutivos nunca se solapan, sin necesidad de persistir estado.
     date_to   = today - timedelta(days=1)
-    lookback  = 5 if today.weekday() == 0 else 3
+    lookback  = 3 if today.weekday() == 0 else 1
     date_from = today - timedelta(days=lookback)
 
-    print(f"[insider] Buscando Form 4s con reportDate {date_from}–{date_to} "
+    print(f"[insider] Buscando Form 4s con filingDate {date_from}–{date_to} "
           f"(umbral {_format_value(MIN_VALUE)})...")
 
     all_trades = fetch_insider_trades(date_from, date_to)

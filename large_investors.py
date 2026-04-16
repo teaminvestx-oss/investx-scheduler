@@ -475,9 +475,21 @@ def run_large_investors(force: bool = False) -> None:
     # Marcar inmediatamente para evitar doble ejecución concurrente
     _mark_sent(today, [])
 
-    lookback  = 5 if today.weekday() == 0 else 3
-    date_to   = today
-    date_from = today - timedelta(days=lookback)
+    # Permitir override de fechas via env (útil en entornos de test)
+    _env_from = os.getenv("INVESTORS_DATE_FROM", "").strip()
+    _env_to   = os.getenv("INVESTORS_DATE_TO",   "").strip()
+    if _env_from and _env_to:
+        try:
+            date_from = date.fromisoformat(_env_from)
+            date_to   = date.fromisoformat(_env_to)
+            print(f"[investors] Fechas forzadas por env: {date_from} – {date_to}")
+        except ValueError:
+            _env_from = _env_to = ""
+
+    if not (_env_from and _env_to):
+        lookback  = 5 if today.weekday() == 0 else 3
+        date_to   = today
+        date_from = today - timedelta(days=lookback)
 
     print(f"[investors] Buscando 13D/13G del {date_from} al {date_to}...")
 
