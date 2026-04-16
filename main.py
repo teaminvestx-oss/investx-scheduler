@@ -136,7 +136,7 @@ def main():
     if FORCE_INSIDER:
         run_daily_insider(force=True)
     else:
-        if weekday < 5 and hour == INSIDER_HOUR and minute >= INSIDER_MINUTE:
+        if weekday < 5 and hour == INSIDER_HOUR and minute == INSIDER_MINUTE:
             run_daily_insider(force=False)
 
     # ======================================================

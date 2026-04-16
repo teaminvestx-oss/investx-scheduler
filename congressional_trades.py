@@ -42,11 +42,17 @@ MESES_ES = ["ene", "feb", "mar", "abr", "may", "jun",
 # Si el DNS falla desde el datacenter de Render, intentamos las alternativas.
 _HOUSE_URLS = [
     "https://housestockwatcher.com/api",
-    "https://house-stock-watcher-data.s3-us-east-2.amazonaws.com/data/all_transactions.json",
+    # S3 virtual-hosted style (formato moderno AWS)
+    "https://house-stock-watcher-data.s3.us-east-2.amazonaws.com/data/all_transactions.json",
+    # S3 path style (legacy, por si el bucket no admite virtual-hosted)
+    "https://s3.us-east-2.amazonaws.com/house-stock-watcher-data/data/all_transactions.json",
 ]
 _SENATE_URLS = [
     "https://senatestockwatcher.com/api",
-    "https://senate-stock-watcher-data.s3-us-east-2.amazonaws.com/aggregate/all_transactions.json",
+    # S3 virtual-hosted style
+    "https://senate-stock-watcher-data.s3.us-east-2.amazonaws.com/data/all_transactions.json",
+    # S3 path style
+    "https://s3.us-east-2.amazonaws.com/senate-stock-watcher-data/data/all_transactions.json",
 ]
 
 _HEADERS = {
@@ -286,9 +292,15 @@ def _fetch_json_fallback(urls: List[str], label: str):
     for url in urls:
         try:
             resp = requests.get(url, headers=_HEADERS, timeout=HTTP_TIMEOUT)
+            print(f"[congress] {label} HTTP {resp.status_code} desde {url} "
+                  f"(Content-Type: {resp.headers.get('Content-Type','?')}, "
+                  f"bytes: {len(resp.content)})")
             resp.raise_for_status()
+            if not resp.content:
+                print(f"[congress] {label} respuesta vacía en {url}")
+                continue
             raw = resp.json()
-            print(f"[congress] {label} OK desde {url}")
+            print(f"[congress] {label} OK: {len(raw) if isinstance(raw, list) else '?'} registros")
             return raw if isinstance(raw, list) else raw.get("data", raw)
         except Exception as e:
             print(f"[congress] {label} fallo {url}: {e}")
