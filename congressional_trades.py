@@ -29,9 +29,11 @@ STATE_FILE = "congressional_trades_state.json"
 
 MIN_AMOUNT   = int(os.getenv("CONGRESS_MIN_AMOUNT", "250000"))  # $250K por defecto
 HTTP_TIMEOUT = 15
-QUIVER_TOKEN = os.getenv("QUIVER_TOKEN", "")  # Bearer token de QuiverQuant
+QUIVER_TOKEN = os.getenv("QUIVER_TOKEN", "")   # Bearer token de QuiverQuant (paid)
+FMP_API_KEY  = os.getenv("FMP_API_KEY",  "")   # Financial Modeling Prep (free tier)
 
 _QUIVER_URL = "https://api.quiverquant.com/beta/bulk/congresstrading"
+_FMP_BASE   = "https://financialmodelingprep.com/stable"
 
 DIAS_ES  = ["lun", "mar", "mié", "jue", "vie", "sáb", "dom"]
 MESES_ES = ["ene", "feb", "mar", "abr", "may", "jun",
@@ -377,17 +379,104 @@ def _fetch_fallback(disc_from: date, disc_to: date) -> List[Dict]:
     return results
 
 
+def _normalise_fmp_item(item: Dict, chamber: str,
+                         disc_from: date, disc_to: date) -> Optional[Dict]:
+    """Convierte un registro FMP (senate-latest / house-latest) al formato interno."""
+    disc_str = (item.get("disclosureDate") or "").strip()
+    try:
+        disc_date = date.fromisoformat(disc_str[:10])
+    except Exception:
+        return None
+    if not (disc_from <= disc_date <= disc_to):
+        return None
+
+    tx_str = (item.get("transactionDate") or disc_str).strip()
+    try:
+        tx_date = date.fromisoformat(tx_str[:10])
+    except Exception:
+        tx_date = disc_date
+
+    amount = (item.get("amount") or "").strip()
+    if _parse_amount_min(amount) < MIN_AMOUNT:
+        return None
+
+    ticker = (item.get("symbol") or item.get("ticker") or "").strip().upper()
+    if not ticker or ticker in ("--", "N/A", ""):
+        return None
+
+    first = (item.get("firstName") or "").strip()
+    last  = (item.get("lastName")  or "").strip()
+    name  = f"{first} {last}".strip() or (item.get("name") or "").strip()
+
+    return {
+        "chamber":    chamber,
+        "name":       name,
+        "party":      (item.get("party") or "").strip(),
+        "state":      (item.get("state") or item.get("stateLong") or "").strip(),
+        "ticker":     ticker,
+        "asset":      (item.get("assetDescription") or item.get("asset") or "").strip(),
+        "type":       (item.get("type") or item.get("transactionType") or "").strip(),
+        "amount":     amount,
+        "amount_min": _parse_amount_min(amount),
+        "tx_date":    tx_date,
+        "disc_date":  disc_date,
+    }
+
+
+def _fetch_fmp(disc_from: date, disc_to: date) -> Optional[List[Dict]]:
+    """
+    Descarga operaciones desde FMP (Financial Modeling Prep).
+    Free tier: 250 req/día, sin Cloudflare, accesible desde Render.
+    Devuelve lista si al menos un endpoint responde, None si ambos fallan.
+    """
+    if not FMP_API_KEY:
+        print("[congress] FMP_API_KEY no configurado; saltando FMP.")
+        return None
+
+    results  = []
+    any_ok   = False
+    chambers = [("senate", "senate-latest"), ("house", "house-latest")]
+
+    for chamber, path in chambers:
+        url = f"{_FMP_BASE}/{path}?apikey={FMP_API_KEY}&limit=300"
+        try:
+            resp = requests.get(url, headers=_HEADERS, timeout=HTTP_TIMEOUT)
+            resp.raise_for_status()
+            raw   = resp.json()
+            items = raw if isinstance(raw, list) else (
+                raw.get("data") or raw.get("congressionalTrading") or []
+            )
+            print(f"[congress] FMP {chamber}: {len(items)} registros descargados.")
+            any_ok = True
+            for item in items:
+                norm = _normalise_fmp_item(item, chamber, disc_from, disc_to)
+                if norm:
+                    results.append(norm)
+        except Exception as e:
+            print(f"[congress] FMP {chamber} fallo: {e}")
+
+    return results if any_ok else None
+
+
 def _fetch_all_trades(disc_from: date, disc_to: date) -> List[Dict]:
     """
-    Intenta QuiverQuant primero; si falla, usa los endpoints fallback.
+    Cadena de fuentes: QuiverQuant → FMP → fallback (housestockwatcher S3).
     Devuelve lista unificada de operaciones filtradas por ventana y umbral.
     """
+    # 1. QuiverQuant (paid, si está configurado)
     trades = _fetch_quiverquant(disc_from, disc_to)
     if trades is not None:
-        print(f"[congress] QuiverQuant: {len(trades)} ops en ventana (umbral ${MIN_AMOUNT:,}).")
+        print(f"[congress] QuiverQuant: {len(trades)} ops en ventana.")
         return trades
 
-    print("[congress] QuiverQuant no disponible. Usando fuentes fallback...")
+    # 2. FMP — free tier (FMP_API_KEY env var)
+    trades = _fetch_fmp(disc_from, disc_to)
+    if trades is not None:
+        print(f"[congress] FMP: {len(trades)} ops en ventana (umbral ${MIN_AMOUNT:,}).")
+        return trades
+
+    # 3. Fallback histórico (housestockwatcher S3 — probablemente caído)
+    print("[congress] FMP no disponible. Usando fuentes fallback legacy...")
     trades = _fetch_fallback(disc_from, disc_to)
     print(f"[congress] Fallback: {len(trades)} ops en ventana.")
     return trades
