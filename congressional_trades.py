@@ -458,9 +458,151 @@ def _fetch_fmp(disc_from: date, disc_to: date) -> Optional[List[Dict]]:
     return results if any_ok else None
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Capitol Trades (bff.capitoltrades.com)
+# API sin key pero detrás de Cloudflare. Usa curl_cffi con TLS fingerprinting
+# si está instalado (requisito para saltar el bot detection de CF).
+# Fallback a requests puro (suele dar 403 desde datacenter).
+# ─────────────────────────────────────────────────────────────────────────────
+
+_CAPITOL_URL = "https://bff.capitoltrades.com/trades"
+_CAPITOL_HEADERS = {
+    "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                   "AppleWebKit/537.36 (KHTML, like Gecko) "
+                   "Chrome/120.0.0.0 Safari/537.36"),
+    "Accept":          "application/json, text/plain, */*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Origin":          "https://www.capitoltrades.com",
+    "Referer":         "https://www.capitoltrades.com/",
+    "Sec-Fetch-Dest":  "empty",
+    "Sec-Fetch-Mode":  "cors",
+    "Sec-Fetch-Site":  "same-site",
+}
+
+
+def _normalise_capitol_item(item: Dict, disc_from: date, disc_to: date) -> Optional[Dict]:
+    """Convierte un registro bff.capitoltrades.com al formato interno."""
+    disc_str = (item.get("filingDate") or item.get("pubDate") or "").strip()
+    try:
+        disc_date = date.fromisoformat(disc_str[:10])
+    except Exception:
+        return None
+    if not (disc_from <= disc_date <= disc_to):
+        return None
+
+    tx_str = (item.get("txDate") or disc_str).strip()
+    try:
+        tx_date = date.fromisoformat(tx_str[:10])
+    except Exception:
+        tx_date = disc_date
+
+    size_low  = int(item.get("sizeRangeLow")  or 0)
+    size_high = int(item.get("sizeRangeHigh") or 0)
+    if size_low < MIN_AMOUNT:
+        return None
+
+    if size_low and size_high:
+        amount = f"${size_low:,} - ${size_high:,}"
+    elif size_low:
+        amount = f">${size_low:,}"
+    else:
+        amount = "?"
+
+    issuer = item.get("issuer") or {}
+    asset  = item.get("asset")  or {}
+    ticker = (issuer.get("issuerTicker") or asset.get("assetTicker") or "").strip().upper()
+    if not ticker or ticker in ("--", "N/A", ""):
+        return None
+
+    pol = item.get("politician") or {}
+    first = (pol.get("firstName") or "").strip()
+    last  = (pol.get("lastName")  or "").strip()
+    name  = f"{first} {last}".strip()
+
+    chamber = (item.get("chamber") or pol.get("chamber") or "house").lower()
+    chamber = "senate" if "senate" in chamber else "house"
+
+    party_raw = (pol.get("party") or "").strip().lower()
+    if party_raw.startswith("democ"):
+        party = "D"
+    elif party_raw.startswith("repub"):
+        party = "R"
+    elif party_raw.startswith("indep"):
+        party = "I"
+    else:
+        party = pol.get("party") or ""
+
+    return {
+        "chamber":    chamber,
+        "name":       name,
+        "party":      party,
+        "state":      (pol.get("_stateId") or pol.get("state") or "").strip().upper(),
+        "ticker":     ticker,
+        "asset":      (issuer.get("issuerName") or "").strip(),
+        "type":       (item.get("txTypeExtended") or item.get("txType") or "").strip(),
+        "amount":     amount,
+        "amount_min": size_low,
+        "tx_date":    tx_date,
+        "disc_date":  disc_date,
+    }
+
+
+def _fetch_capitol_trades(disc_from: date, disc_to: date) -> Optional[List[Dict]]:
+    """
+    Descarga desde bff.capitoltrades.com. Preferencia: curl_cffi (bypass CF).
+    Devuelve lista si descarga algo, None si falla Cloudflare en la 1ª página.
+    """
+    try:
+        from curl_cffi import requests as cffi_requests
+        def _get(url: str):
+            return cffi_requests.get(url, headers=_CAPITOL_HEADERS,
+                                     impersonate="chrome120", timeout=HTTP_TIMEOUT)
+        mode = "curl_cffi"
+    except ImportError:
+        def _get(url: str):
+            return requests.get(url, headers=_CAPITOL_HEADERS, timeout=HTTP_TIMEOUT)
+        mode = "requests"
+
+    all_items: List[Dict] = []
+    # Paginar en orden descendente de filingDate hasta salirnos de la ventana.
+    for page in range(1, 8):
+        url = f"{_CAPITOL_URL}?page={page}&pageSize=100"
+        try:
+            resp = _get(url)
+            if resp.status_code == 403:
+                print(f"[congress] CapitolTrades ({mode}) 403 Cloudflare pág. {page}")
+                return None if page == 1 else all_items
+            resp.raise_for_status()
+            data  = resp.json()
+            items = data.get("data", []) if isinstance(data, dict) else []
+            if not items:
+                break
+            all_items.extend(items)
+            # Corte temprano: si el último elemento ya es anterior a disc_from
+            last_filing = (items[-1].get("filingDate") or "")[:10]
+            try:
+                if date.fromisoformat(last_filing) < disc_from:
+                    break
+            except Exception:
+                pass
+        except Exception as e:
+            print(f"[congress] CapitolTrades ({mode}) fallo pág. {page}: {e}")
+            if page == 1:
+                return None
+            break
+
+    print(f"[congress] CapitolTrades ({mode}): {len(all_items)} registros descargados.")
+    results: List[Dict] = []
+    for item in all_items:
+        norm = _normalise_capitol_item(item, disc_from, disc_to)
+        if norm:
+            results.append(norm)
+    return results
+
+
 def _fetch_all_trades(disc_from: date, disc_to: date) -> List[Dict]:
     """
-    Cadena de fuentes: QuiverQuant → FMP → fallback (housestockwatcher S3).
+    Cadena de fuentes: QuiverQuant → FMP → Capitol Trades → fallback legacy.
     Devuelve lista unificada de operaciones filtradas por ventana y umbral.
     """
     # 1. QuiverQuant (paid, si está configurado)
@@ -469,16 +611,23 @@ def _fetch_all_trades(disc_from: date, disc_to: date) -> List[Dict]:
         print(f"[congress] QuiverQuant: {len(trades)} ops en ventana.")
         return trades
 
-    # 2. FMP — free tier (FMP_API_KEY env var)
+    # 2. FMP (paid tier para endpoints de congress, devuelve 402 en free)
     trades = _fetch_fmp(disc_from, disc_to)
     if trades is not None:
         print(f"[congress] FMP: {len(trades)} ops en ventana (umbral ${MIN_AMOUNT:,}).")
         return trades
 
-    # 3. Fallback histórico (housestockwatcher S3 — probablemente caído)
-    print("[congress] FMP no disponible. Usando fuentes fallback legacy...")
+    # 3. Capitol Trades — free (requiere curl_cffi para saltar Cloudflare)
+    trades = _fetch_capitol_trades(disc_from, disc_to)
+    if trades is not None:
+        print(f"[congress] CapitolTrades: {len(trades)} ops en ventana (umbral ${MIN_AMOUNT:,}).")
+        return trades
+
+    # 4. Fallback histórico (housestockwatcher S3 — probablemente caído)
+    print("[congress] CapitolTrades no disponible. Usando fuentes fallback legacy...")
     trades = _fetch_fallback(disc_from, disc_to)
     print(f"[congress] Fallback: {len(trades)} ops en ventana.")
+    return trades
     return trades
 
 
