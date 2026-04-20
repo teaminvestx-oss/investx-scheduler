@@ -1,0 +1,433 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <title>InvestX — Insider Trading</title>
+    <style>
+    * {
+        margin: 0;
+        padding: 0;
+        box-sizing: border-box;
+    }
+
+    body {
+        background: #e8edf5;
+        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+        margin: 0;
+        padding: 0;
+    }
+
+    .reel {
+        width: 340px;
+        background: #F7F9FF;
+        border-radius: 22px;
+        overflow: hidden;
+        border: 0.5px solid #DDE5F5;
+    }
+
+    .hdr {
+        background: #0B1525;
+        padding: 16px 20px 14px;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+    }
+
+    .hdr-left {
+        display: flex;
+        align-items: center;
+        gap: 9px;
+    }
+
+    .hdr-logo {
+        width: 34px;
+        height: 34px;
+        background: linear-gradient(135deg, #1A8FFF, #00C896);
+        border-radius: 9px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        font-size: 12px;
+        font-weight: 800;
+        color: #fff;
+        letter-spacing: -0.5px;
+    }
+
+    .hdr-brand {
+        font-size: 17px;
+        font-weight: 700;
+        color: #fff;
+        letter-spacing: 1.5px;
+    }
+
+    .hdr-brand em {
+        color: #1A8FFF;
+        font-style: normal;
+    }
+
+    .hdr-pill {
+        font-size: 9px;
+        font-weight: 600;
+        letter-spacing: 1px;
+        background: rgba(26, 143, 255, 0.18);
+        color: #6AB4FF;
+        border: 0.5px solid rgba(26, 143, 255, 0.3);
+        border-radius: 20px;
+        padding: 4px 10px;
+    }
+
+    .hero {
+        background: linear-gradient(135deg, #0B1D3A 0%, #0F2E5A 100%);
+        padding: 14px 20px 16px;
+        display: flex;
+        gap: 13px;
+        align-items: flex-start;
+    }
+
+    .hero-badge {
+        width: 40px;
+        height: 40px;
+        background: rgba(26, 143, 255, 0.15);
+        border-radius: 10px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        font-size: 20px;
+        flex-shrink: 0;
+    }
+
+    .hero-title {
+        font-size: 15px;
+        font-weight: 700;
+        color: #fff;
+        line-height: 1.3;
+    }
+
+    .hero-meta {
+        font-size: 10px;
+        color: #5A8ABF;
+        margin-top: 4px;
+        letter-spacing: 0.3px;
+    }
+
+    .hero-stat {
+        margin-top: 8px;
+        display: flex;
+        gap: 8px;
+    }
+
+    .stat-pill {
+        font-size: 10px;
+        font-weight: 600;
+        border-radius: 20px;
+        padding: 3px 9px;
+    }
+
+    .sp-green {
+        background: #E6FBF2;
+        color: #00874F;
+    }
+
+    .sp-red {
+        background: #FFEEF1;
+        color: #C41E3A;
+    }
+
+    .sp-blue {
+        background: rgba(26, 143, 255, 0.15);
+        color: #6AB4FF;
+    }
+
+    .body {
+        padding: 14px 18px 16px;
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+    }
+
+    .day-row {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        margin-top: 4px;
+        margin-bottom: 2px;
+    }
+
+    .day-line {
+        flex: 1;
+        height: 0.5px;
+        background: #E0E8F5;
+    }
+
+    .day-chip {
+        font-size: 9px;
+        font-weight: 700;
+        color: #7A9ABF;
+        letter-spacing: 0.8px;
+        background: #EDF2FB;
+        border-radius: 20px;
+        padding: 2px 9px;
+    }
+
+    .card {
+        background: #fff;
+        border-radius: 12px;
+        border: 0.5px solid #E5EDF8;
+        padding: 11px 13px;
+        display: flex;
+        align-items: center;
+        gap: 11px;
+    }
+
+    .card-side {
+        width: 40px;
+        height: 40px;
+        border-radius: 9px;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        flex-shrink: 0;
+        gap: 1px;
+    }
+
+    .cs-buy  { background: #EDFBF3; }
+    .cs-sell { background: #FFF0F2; }
+
+    .cs-arrow {
+        font-size: 15px;
+        line-height: 1;
+    }
+
+    .cs-word {
+        font-size: 8px;
+        font-weight: 800;
+        letter-spacing: 0.5px;
+    }
+
+    .buy-c  { color: #00924F; }
+    .sell-c { color: #D41E38; }
+
+    .card-mid {
+        flex: 1;
+        min-width: 0;
+    }
+
+    .card-name {
+        font-size: 12px;
+        font-weight: 600;
+        color: #0B1525;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+    }
+
+    .card-role {
+        font-size: 10px;
+        color: #8AA0BF;
+        margin-top: 1px;
+    }
+
+    .card-ticker {
+        display: inline-block;
+        margin-top: 4px;
+        font-size: 10px;
+        font-weight: 700;
+        background: #EDF2FB;
+        color: #1A5FBF;
+        border-radius: 4px;
+        padding: 1px 7px;
+    }
+
+    .card-right {
+        text-align: right;
+        flex-shrink: 0;
+    }
+
+    .card-amount {
+        font-size: 15px;
+        font-weight: 700;
+    }
+
+    .card-shares {
+        font-size: 10px;
+        color: #9AAABF;
+        margin-top: 2px;
+    }
+
+    .more-row {
+        text-align: center;
+        font-size: 10px;
+        color: #8AA0BF;
+        background: #EDF2FB;
+        border-radius: 8px;
+        padding: 6px;
+    }
+
+    .lectura {
+        background: #0B1D3A;
+        border-radius: 14px;
+        padding: 14px 15px;
+        margin-top: 2px;
+    }
+
+    .lec-top {
+        display: flex;
+        align-items: center;
+        gap: 7px;
+        margin-bottom: 9px;
+    }
+
+    .lec-dot {
+        width: 7px;
+        height: 7px;
+        border-radius: 50%;
+        background: #1A8FFF;
+        flex-shrink: 0;
+    }
+
+    .lec-label {
+        font-size: 9px;
+        font-weight: 700;
+        color: #1A8FFF;
+        letter-spacing: 1.2px;
+    }
+
+    .lec-line {
+        flex: 1;
+        height: 0.5px;
+        background: rgba(26, 143, 255, 0.2);
+    }
+
+    .lec-body {
+        font-size: 11px;
+        color: #A0BDD8;
+        line-height: 1.65;
+    }
+
+    .lec-body strong {
+        color: #fff;
+        font-weight: 600;
+    }
+
+    .lec-tickers {
+        display: flex;
+        gap: 6px;
+        flex-wrap: wrap;
+        margin-top: 10px;
+    }
+
+    .lec-tick {
+        font-size: 10px;
+        font-weight: 600;
+        background: rgba(26, 143, 255, 0.15);
+        color: #6AB4FF;
+        border-radius: 20px;
+        padding: 3px 9px;
+    }
+
+    .ftr {
+        background: #0B1525;
+        padding: 9px 20px;
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+    }
+
+    .ftr-handle {
+        font-size: 10px;
+        color: #3A5A80;
+        font-weight: 600;
+    }
+
+    .ftr-disc {
+        font-size: 8px;
+        color: #263A52;
+    }
+    </style>
+</head>
+<body>
+    <div class="reel">
+
+        <!-- HEADER -->
+        <div class="hdr">
+            <div class="hdr-left">
+                <div class="hdr-logo">iX</div>
+                <div class="hdr-brand">INVEST<em>X</em></div>
+            </div>
+            <div class="hdr-pill">INSIDER TRADING</div>
+        </div>
+
+        <!-- HERO -->
+        <div class="hero">
+            <div class="hero-badge">🕵️</div>
+            <div>
+                <div class="hero-title">Movimientos de directivos</div>
+                <div class="hero-meta">{{ week_label }} &nbsp;·&nbsp; Operaciones +$500K &nbsp;·&nbsp; Form 4 SEC</div>
+                <div class="hero-stat">
+                    <span class="stat-pill sp-green">↑ {{ buys }} compras</span>
+                    <span class="stat-pill sp-red">↓ {{ sells }} ventas</span>
+                    <span class="stat-pill sp-blue">{{ companies }} empresas</span>
+                </div>
+            </div>
+        </div>
+
+        <!-- TRADES -->
+        <div class="body">
+            {% for day, trades in trades_by_day.items() %}
+            <div class="day-row">
+                <div class="day-line"></div>
+                <div class="day-chip">{{ day }}</div>
+                <div class="day-line"></div>
+            </div>
+            {% for trade in trades %}
+            {% set is_buy = trade.type == 'COMPRA' %}
+            <div class="card">
+                <div class="card-side {{ 'cs-buy' if is_buy else 'cs-sell' }}">
+                    <div class="cs-arrow {{ 'buy-c' if is_buy else 'sell-c' }}">{{ '↑' if is_buy else '↓' }}</div>
+                    <div class="cs-word  {{ 'buy-c' if is_buy else 'sell-c' }}">{{ trade.type }}</div>
+                </div>
+                <div class="card-mid">
+                    <div class="card-name">{{ trade.name }}</div>
+                    <div class="card-role">{{ trade.role }} · {{ trade.company }}</div>
+                    <div class="card-ticker">{{ trade.ticker }}</div>
+                </div>
+                <div class="card-right">
+                    <div class="card-amount {{ 'buy-c' if is_buy else 'sell-c' }}">{{ trade.amount }}</div>
+                    <div class="card-shares">{{ trade.shares }}</div>
+                </div>
+            </div>
+            {% endfor %}
+            {% endfor %}
+
+            {% if extra_trades > 0 %}
+            <div class="more-row">+{{ extra_trades }} operaciones más esta semana &nbsp;·&nbsp; Canal premium ↗</div>
+            {% endif %}
+
+            <!-- LECTURA INVESTX -->
+            <div class="lectura">
+                <div class="lec-top">
+                    <div class="lec-dot"></div>
+                    <div class="lec-label">LECTURA INVESTX</div>
+                    <div class="lec-line"></div>
+                </div>
+                <div class="lec-body">{{ lectura | safe }}</div>
+                {% if tags %}
+                <div class="lec-tickers">
+                    {% for tag in tags %}
+                    <span class="lec-tick">📈 {{ tag }}</span>
+                    {% endfor %}
+                </div>
+                {% endif %}
+            </div>
+        </div>
+
+        <!-- FOOTER -->
+        <div class="ftr">
+            <div class="ftr-handle">@investx_trading</div>
+            <div class="ftr-disc">No es asesoramiento financiero</div>
+        </div>
+
+    </div>
+</body>
+</html>
