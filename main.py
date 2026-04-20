@@ -27,6 +27,7 @@ from market_close import run_market_close
 from insider_trading import run_daily_insider
 from congressional_trades import run_congressional_trades
 from large_investors import run_large_investors
+from instagram.run_instagram_insider import run_instagram_insider
 
 
 # ---------------------------
@@ -54,9 +55,10 @@ FORCE_NEWS = any(
 
 FORCE_EARNINGS  = os.getenv("FORCE_EARNINGS",  "0").strip().lower() in ("1", "true", "yes")
 CLOSE_FORCE     = os.getenv("CLOSE_FORCE",     "0").strip().lower() in ("1", "true", "yes")
-FORCE_INSIDER   = os.getenv("FORCE_INSIDER",   "0").strip().lower() in ("1", "true", "yes")
+FORCE_INSIDER    = os.getenv("FORCE_INSIDER",    "0").strip().lower() in ("1", "true", "yes")
 FORCE_CONGRESS   = os.getenv("FORCE_CONGRESS",   "0").strip().lower() in ("1", "true", "yes")
 FORCE_INVESTORS  = os.getenv("FORCE_INVESTORS",  "0").strip().lower() in ("1", "true", "yes")
+FORCE_INSTAGRAM  = os.getenv("FORCE_INSTAGRAM",  "0").strip().lower() in ("1", "true", "yes")
 
 
 # ======================================================
@@ -202,6 +204,26 @@ def main():
             if ((hour == NEWS_HOUR_1 and minute >= NEWS_MINUTE) or
                 (hour == NEWS_HOUR_2 and minute >= NEWS_MINUTE)):
                 run_news_once(force=False)
+
+    # ======================================================
+    # 4b) INSTAGRAM — Insider Trading card (lunes 11:00)
+    # Runs after the 10:15 Telegram post has cached the data.
+    # Tolerant to failure: any exception is caught so the bot continues.
+    # ======================================================
+    INSTAGRAM_HOUR   = 11
+    INSTAGRAM_MINUTE = 0
+
+    if FORCE_INSTAGRAM:
+        try:
+            run_instagram_insider(force=True)
+        except Exception as e:
+            print(f"WARNING | __main__: Instagram falló (force): {e}")
+    else:
+        if weekday == 0 and hour == INSTAGRAM_HOUR and minute == INSTAGRAM_MINUTE:
+            try:
+                run_instagram_insider(force=False)
+            except Exception as e:
+                print(f"WARNING | __main__: Instagram falló: {e}")
 
     # ======================================================
     # 5) MARKET CLOSE (SIN CAMBIOS)

@@ -9,3 +9,5 @@ openai
 pandas-market-calendars
 setuptools
 matplotlib
+playwright
+jinja2

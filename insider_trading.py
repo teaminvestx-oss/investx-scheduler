@@ -592,6 +592,87 @@ def _ai_interpretation(trades: List[Dict], date_from: date, date_to: date) -> st
 
 
 # ---------------------------------------------------------------------------
+# Instagram cache
+# ---------------------------------------------------------------------------
+_INSTAGRAM_CACHE = "insider_instagram_cache.json"
+_MAX_VISIBLE_TRADES = 4
+
+
+def _build_instagram_template_data(
+    agg_trades: List[Dict], date_from: date, date_to: date, lectura: str
+) -> Dict:
+    """
+    Transforms aggregated trades into the dict expected by insider.html Jinja2 template.
+    Shows up to _MAX_VISIBLE_TRADES ordered by value descending; rest go to extra_trades.
+    """
+    buys  = [t for t in agg_trades if t["code"] == "P"]
+    sells = [t for t in agg_trades if t["code"] == "S"]
+
+    # Pick top trades: all buys first (they matter more), then top sells
+    top_buys  = sorted(buys,  key=lambda x: -x["value"])
+    top_sells = sorted(sells, key=lambda x: -x["value"])
+
+    # Interleave to keep variety, prioritising highest value
+    all_sorted = sorted(agg_trades, key=lambda x: (x["code"] != "P", -x["value"]))
+    visible    = all_sorted[:_MAX_VISIBLE_TRADES]
+    extra      = max(0, len(all_sorted) - _MAX_VISIBLE_TRADES)
+
+    # Group visible trades by day label
+    trades_by_day: Dict[str, List[Dict]] = {}
+    for t in visible:
+        d     = t["date"]
+        label = f"{DIAS_ES[d.weekday()]} {d.day} {MESES_ES[d.month - 1]}"
+        if label not in trades_by_day:
+            trades_by_day[label] = []
+        shares_fmt = f"{int(t['shares']):,}".replace(",", ".") + " acc."
+        trades_by_day[label].append({
+            "type":    "COMPRA" if t["code"] == "P" else "VENTA",
+            "name":    _fmt_name(t["owner_name"]),
+            "role":    t["role"][:30],
+            "company": _short_company(t.get("issuer_name") or t["ticker"]),
+            "ticker":  t["ticker"],
+            "amount":  _format_value(t["value"]),
+            "shares":  shares_fmt,
+        })
+
+    # Tags: tickers of top visible trades (unique, preserving order)
+    tags = list(dict.fromkeys(t["ticker"] for t in visible))
+
+    # week_label
+    iso_year, iso_week, _ = date_to.isocalendar()
+    date_str  = _date_range_str(date_from, date_to)
+    week_label = f"Semana {iso_week} · {date_str}"
+
+    companies = len({t["ticker"] for t in agg_trades})
+
+    return {
+        "week_label":    week_label,
+        "buys":          len(buys),
+        "sells":         len(sells),
+        "companies":     companies,
+        "trades_by_day": trades_by_day,
+        "extra_trades":  extra,
+        "lectura":       lectura,
+        "tags":          tags,
+    }
+
+
+def _save_instagram_cache(template_data: Dict, date_from: date, date_to: date) -> None:
+    payload = {
+        "template_data": template_data,
+        "date_from":     date_from.isoformat(),
+        "date_to":       date_to.isoformat(),
+        "saved_at":      datetime.now(TZ).isoformat(),
+    }
+    try:
+        with open(_INSTAGRAM_CACHE, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False)
+        print(f"[insider] Instagram cache guardado en {_INSTAGRAM_CACHE}")
+    except Exception as e:
+        print(f"[insider] WARNING: No se pudo guardar instagram cache: {e}")
+
+
+# ---------------------------------------------------------------------------
 # Entrypoint público
 # ---------------------------------------------------------------------------
 def run_daily_insider(force: bool = False) -> None:
@@ -643,3 +724,11 @@ def run_daily_insider(force: bool = False) -> None:
     send_telegram_message(msg)
     _mark_sent(today, [_trade_key(t) for t in new_trades])
     print(f"[insider] OK enviado (force={force}).")
+
+    # Persist Instagram-ready data (used by Monday 11:00 Instagram post)
+    try:
+        agg = _aggregate_trades(new_trades)
+        template_data = _build_instagram_template_data(agg, date_from, date_to, interp or "")
+        _save_instagram_cache(template_data, date_from, date_to)
+    except Exception as e:
+        print(f"[insider] WARNING: No se pudo preparar instagram cache: {e}")
