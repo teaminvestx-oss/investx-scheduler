@@ -294,18 +294,14 @@ def _fetch_json_fallback(urls: List[str], label: str):
     for url in urls:
         try:
             resp = requests.get(url, headers=_HEADERS, timeout=HTTP_TIMEOUT)
-            print(f"[congress] {label} HTTP {resp.status_code} desde {url} "
-                  f"(Content-Type: {resp.headers.get('Content-Type','?')}, "
-                  f"bytes: {len(resp.content)})")
             resp.raise_for_status()
             if not resp.content:
-                print(f"[congress] {label} respuesta vacía en {url}")
                 continue
             raw = resp.json()
-            print(f"[congress] {label} OK: {len(raw) if isinstance(raw, list) else '?'} registros")
+            print(f"[congress] {label} legacy OK: {len(raw) if isinstance(raw, list) else '?'} registros")
             return raw if isinstance(raw, list) else raw.get("data", raw)
-        except Exception as e:
-            print(f"[congress] {label} fallo {url}: {e}")
+        except Exception:
+            pass
     return None
 
 
@@ -355,26 +351,28 @@ def _parse_fallback_item(item: Dict, chamber: str,
 
 
 def _fetch_fallback(disc_from: date, disc_to: date) -> List[Dict]:
-    """Fuente fallback: housestockwatcher + senatestockwatcher (si QuiverQuant falla)."""
+    """Fuente fallback: housestockwatcher + senatestockwatcher (si resto falla)."""
     results = []
+    any_ok = False
 
     house_items = _fetch_json_fallback(_HOUSE_URLS, "Cámara")
-    if house_items is None:
-        print("[congress] Cámara: todos los endpoints fallaron.")
-    else:
+    if house_items is not None:
+        any_ok = True
         for item in house_items:
             norm = _parse_fallback_item(item, "house", disc_from, disc_to)
             if norm:
                 results.append(norm)
 
     senate_items = _fetch_json_fallback(_SENATE_URLS, "Senado")
-    if senate_items is None:
-        print("[congress] Senado: todos los endpoints fallaron.")
-    else:
+    if senate_items is not None:
+        any_ok = True
         for item in senate_items:
             norm = _parse_fallback_item(item, "senate", disc_from, disc_to)
             if norm:
                 results.append(norm)
+
+    if not any_ok:
+        print("[congress] Legacy fallback: todos los endpoints sin respuesta.")
 
     return results
 
@@ -624,10 +622,9 @@ def _fetch_all_trades(disc_from: date, disc_to: date) -> List[Dict]:
         return trades
 
     # 4. Fallback histórico (housestockwatcher S3 — probablemente caído)
-    print("[congress] CapitolTrades no disponible. Usando fuentes fallback legacy...")
+    print("[congress] CapitolTrades no disponible. Probando legacy fallback...")
     trades = _fetch_fallback(disc_from, disc_to)
     print(f"[congress] Fallback: {len(trades)} ops en ventana.")
-    return trades
     return trades
 
 
