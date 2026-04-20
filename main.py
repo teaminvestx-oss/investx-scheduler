@@ -130,6 +130,11 @@ def main():
     NEWS_HOUR_2 = 21
     NEWS_MINUTE = 30
 
+    print(
+        f"INFO | __main__: weekday={weekday} hour={hour} minute={minute} "
+        f"nyse_open={nyse_open_today}"
+    )
+
     # ======================================================
     # 0) INSIDER TRADING (L-V 10:15, operaciones de los últimos 2-3 días)
     # ======================================================
@@ -145,7 +150,7 @@ def main():
     if FORCE_CONGRESS:
         run_congressional_trades(force=True)
     else:
-        if weekday < 5 and hour == CONGRESS_HOUR and minute >= CONGRESS_MINUTE:
+        if weekday < 5 and hour == CONGRESS_HOUR and minute == CONGRESS_MINUTE:
             run_congressional_trades(force=False)
 
     # ======================================================
@@ -154,7 +159,7 @@ def main():
     if FORCE_INVESTORS:
         run_large_investors(force=True)
     else:
-        if weekday < 5 and hour == INVESTORS_HOUR and minute >= INVESTORS_MINUTE:
+        if weekday < 5 and hour == INVESTORS_HOUR and minute == INVESTORS_MINUTE:
             run_large_investors(force=False)
 
     # ======================================================
@@ -189,7 +194,7 @@ def main():
         run_econ_calendar(force=True)
 
     else:
-        if weekday < 5 and nyse_open_today and hour == ECON_HOUR and minute >= ECON_MINUTE:
+        if weekday < 5 and hour == ECON_HOUR and minute == ECON_MINUTE:
             run_econ_calendar(force=False)
 
     # ======================================================

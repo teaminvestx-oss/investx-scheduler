@@ -19,7 +19,9 @@ logger.setLevel(logging.INFO)
 STATE_FILE = "earnings_weekly_state.json"
 TZ_OFFSET = int(os.getenv("TZ_OFFSET", "1"))
 
-YF_TIMEOUT = int(os.getenv("EARNINGS_YF_TIMEOUT", "20"))
+YF_TIMEOUT    = int(os.getenv("EARNINGS_YF_TIMEOUT", "20"))
+EARNINGS_MIN_ESTS    = int(os.getenv("EARNINGS_MIN_ESTS",    "5"))   # mínimo analistas
+EARNINGS_MAX_PER_DAY = int(os.getenv("EARNINGS_MAX_PER_DAY", "15"))  # cap por día
 
 # =====================================================
 # Estado (solo 1 envío por día)
@@ -102,19 +104,31 @@ def _fetch_nasdaq_calendar_day(target_date: date) -> List[Dict[str, Any]]:
 
         if not ticker:
             continue
-        # Solo empresas con estimación de analistas = alto impacto
         if not eps_est or eps_est in ("N/A", "--", ""):
             continue
 
+        try:
+            n_ests_int = int(n_ests.replace(",", "")) if n_ests and n_ests not in ("N/A", "--") else 0
+        except ValueError:
+            n_ests_int = 0
+
+        if n_ests_int < EARNINGS_MIN_ESTS:
+            continue
+
         results.append({
-            "date": date_str,
+            "date":    date_str,
             "company": f"{company} ({ticker})",
-            "eps": f"Est. {eps_est}",
+            "eps":     f"Est. {eps_est}",
             "revenue": "--",
-            "time": row.get("time") or "—",
+            "time":    row.get("time") or "—",
+            "_n_ests": n_ests_int,
         })
 
-    logger.info(f"earnings | Nasdaq {date_str}: {len(results)} empresas con cobertura")
+    # Ordenar por número de analistas desc, limitar al cap diario
+    results.sort(key=lambda x: x["_n_ests"], reverse=True)
+    results = results[:EARNINGS_MAX_PER_DAY]
+
+    logger.info(f"earnings | Nasdaq {date_str}: {len(results)} empresas (min_ests={EARNINGS_MIN_ESTS})")
     return results
 
 
