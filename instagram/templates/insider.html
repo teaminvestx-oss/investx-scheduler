@@ -1,598 +1,433 @@
 <!DOCTYPE html>
 <html lang="es">
 <head>
-<meta charset="UTF-8">
-<style>
-* { margin: 0; padding: 0; box-sizing: border-box; }
+    <meta charset="UTF-8">
+    <title>InvestX — Insider Trading</title>
+    <style>
+    * {
+        margin: 0;
+        padding: 0;
+        box-sizing: border-box;
+    }
 
-body {
-  width: 1080px;
-  height: 1350px;
-  background: linear-gradient(160deg, #080c18 0%, #0d1424 60%, #090d1c 100%);
-  font-family: 'Inter', 'SF Pro Display', 'Segoe UI', system-ui, -apple-system, sans-serif;
-  color: #e2e8f4;
-  overflow: hidden;
-  position: relative;
-}
+    body {
+        background: #e8edf5;
+        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+        margin: 0;
+        padding: 0;
+    }
 
-/* Background grid */
-body::before {
-  content: '';
-  position: absolute;
-  inset: 0;
-  background-image:
-    linear-gradient(rgba(99, 130, 255, 0.04) 1px, transparent 1px),
-    linear-gradient(90deg, rgba(99, 130, 255, 0.04) 1px, transparent 1px);
-  background-size: 54px 54px;
-  pointer-events: none;
-}
+    .reel {
+        width: 340px;
+        background: #F7F9FF;
+        border-radius: 22px;
+        overflow: hidden;
+        border: 0.5px solid #DDE5F5;
+    }
 
-.card {
-  position: relative;
-  width: 1080px;
-  height: 1350px;
-  display: flex;
-  flex-direction: column;
-  padding: 0;
-}
+    .hdr {
+        background: #0B1525;
+        padding: 16px 20px 14px;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+    }
 
-/* ── HEADER ── */
-.header {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  padding: 52px 64px 36px;
-  border-bottom: 1px solid rgba(255,255,255,0.07);
-}
+    .hdr-left {
+        display: flex;
+        align-items: center;
+        gap: 9px;
+    }
 
-.brand {
-  display: flex;
-  align-items: center;
-  gap: 16px;
-}
+    .hdr-logo {
+        width: 34px;
+        height: 34px;
+        background: linear-gradient(135deg, #1A8FFF, #00C896);
+        border-radius: 9px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        font-size: 12px;
+        font-weight: 800;
+        color: #fff;
+        letter-spacing: -0.5px;
+    }
 
-.brand-icon {
-  width: 52px;
-  height: 52px;
-  background: linear-gradient(135deg, #f59e0b, #f97316);
-  border-radius: 12px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  font-size: 26px;
-  font-weight: 900;
-  color: #0a0e18;
-  letter-spacing: -1px;
-  flex-shrink: 0;
-}
+    .hdr-brand {
+        font-size: 17px;
+        font-weight: 700;
+        color: #fff;
+        letter-spacing: 1.5px;
+    }
 
-.brand-text {
-  display: flex;
-  flex-direction: column;
-  gap: 1px;
-}
+    .hdr-brand em {
+        color: #1A8FFF;
+        font-style: normal;
+    }
 
-.brand-name {
-  font-size: 22px;
-  font-weight: 800;
-  color: #f59e0b;
-  letter-spacing: 3px;
-  text-transform: uppercase;
-}
+    .hdr-pill {
+        font-size: 9px;
+        font-weight: 600;
+        letter-spacing: 1px;
+        background: rgba(26, 143, 255, 0.18);
+        color: #6AB4FF;
+        border: 0.5px solid rgba(26, 143, 255, 0.3);
+        border-radius: 20px;
+        padding: 4px 10px;
+    }
 
-.brand-sub {
-  font-size: 11px;
-  color: rgba(255,255,255,0.35);
-  letter-spacing: 1.5px;
-  text-transform: uppercase;
-}
+    .hero {
+        background: linear-gradient(135deg, #0B1D3A 0%, #0F2E5A 100%);
+        padding: 14px 20px 16px;
+        display: flex;
+        gap: 13px;
+        align-items: flex-start;
+    }
 
-.header-badge {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  background: rgba(245,158,11,0.1);
-  border: 1px solid rgba(245,158,11,0.25);
-  border-radius: 8px;
-  padding: 10px 18px;
-}
+    .hero-badge {
+        width: 40px;
+        height: 40px;
+        background: rgba(26, 143, 255, 0.15);
+        border-radius: 10px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        font-size: 20px;
+        flex-shrink: 0;
+    }
 
-.header-badge-icon {
-  font-size: 22px;
-}
+    .hero-title {
+        font-size: 15px;
+        font-weight: 700;
+        color: #fff;
+        line-height: 1.3;
+    }
 
-.header-badge-text {
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-}
+    .hero-meta {
+        font-size: 10px;
+        color: #5A8ABF;
+        margin-top: 4px;
+        letter-spacing: 0.3px;
+    }
 
-.header-badge-title {
-  font-size: 15px;
-  font-weight: 700;
-  color: #f59e0b;
-  letter-spacing: 0.5px;
-}
+    .hero-stat {
+        margin-top: 8px;
+        display: flex;
+        gap: 8px;
+    }
 
-.header-badge-sub {
-  font-size: 11px;
-  color: rgba(255,255,255,0.4);
-  letter-spacing: 0.5px;
-}
+    .stat-pill {
+        font-size: 10px;
+        font-weight: 600;
+        border-radius: 20px;
+        padding: 3px 9px;
+    }
 
-/* ── META BAR ── */
-.meta-bar {
-  padding: 20px 64px;
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  background: rgba(255,255,255,0.025);
-  border-bottom: 1px solid rgba(255,255,255,0.06);
-}
+    .sp-green {
+        background: #E6FBF2;
+        color: #00874F;
+    }
 
-.meta-week {
-  font-size: 16px;
-  font-weight: 600;
-  color: rgba(255,255,255,0.75);
-  letter-spacing: 0.3px;
-}
+    .sp-red {
+        background: #FFEEF1;
+        color: #C41E3A;
+    }
 
-.meta-filters {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  font-size: 12px;
-  color: rgba(255,255,255,0.35);
-  letter-spacing: 0.5px;
-}
+    .sp-blue {
+        background: rgba(26, 143, 255, 0.15);
+        color: #6AB4FF;
+    }
 
-.meta-dot {
-  width: 3px;
-  height: 3px;
-  background: rgba(255,255,255,0.25);
-  border-radius: 50%;
-}
+    .body {
+        padding: 14px 18px 16px;
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+    }
 
-/* ── STATS ── */
-.stats-bar {
-  display: flex;
-  padding: 28px 64px;
-  gap: 0;
-  border-bottom: 1px solid rgba(255,255,255,0.07);
-}
+    .day-row {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        margin-top: 4px;
+        margin-bottom: 2px;
+    }
 
-.stat-item {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  flex: 1;
-}
+    .day-line {
+        flex: 1;
+        height: 0.5px;
+        background: #E0E8F5;
+    }
 
-.stat-item + .stat-item {
-  border-left: 1px solid rgba(255,255,255,0.08);
-  padding-left: 40px;
-  margin-left: 0;
-}
+    .day-chip {
+        font-size: 9px;
+        font-weight: 700;
+        color: #7A9ABF;
+        letter-spacing: 0.8px;
+        background: #EDF2FB;
+        border-radius: 20px;
+        padding: 2px 9px;
+    }
 
-.stat-arrow {
-  font-size: 22px;
-  font-weight: 700;
-}
+    .card {
+        background: #fff;
+        border-radius: 12px;
+        border: 0.5px solid #E5EDF8;
+        padding: 11px 13px;
+        display: flex;
+        align-items: center;
+        gap: 11px;
+    }
 
-.stat-arrow.buy { color: #22c55e; }
-.stat-arrow.sell { color: #ef4444; }
-.stat-arrow.neutral { color: #64748b; }
+    .card-side {
+        width: 40px;
+        height: 40px;
+        border-radius: 9px;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        flex-shrink: 0;
+        gap: 1px;
+    }
 
-.stat-content {
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-}
+    .cs-buy  { background: #EDFBF3; }
+    .cs-sell { background: #FFF0F2; }
 
-.stat-value {
-  font-size: 28px;
-  font-weight: 800;
-  color: #f1f5f9;
-  line-height: 1;
-}
+    .cs-arrow {
+        font-size: 15px;
+        line-height: 1;
+    }
 
-.stat-label {
-  font-size: 12px;
-  color: rgba(255,255,255,0.38);
-  text-transform: uppercase;
-  letter-spacing: 1px;
-}
+    .cs-word {
+        font-size: 8px;
+        font-weight: 800;
+        letter-spacing: 0.5px;
+    }
 
-/* ── TRADES SECTION ── */
-.trades-section {
-  flex: 1;
-  overflow: hidden;
-  padding: 28px 64px 0;
-  display: flex;
-  flex-direction: column;
-  gap: 20px;
-}
+    .buy-c  { color: #00924F; }
+    .sell-c { color: #D41E38; }
 
-.day-group {
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-}
+    .card-mid {
+        flex: 1;
+        min-width: 0;
+    }
 
-.day-label {
-  font-size: 12px;
-  font-weight: 600;
-  color: rgba(255,255,255,0.35);
-  text-transform: uppercase;
-  letter-spacing: 1.5px;
-  padding-bottom: 4px;
-  border-bottom: 1px solid rgba(255,255,255,0.06);
-}
+    .card-name {
+        font-size: 12px;
+        font-weight: 600;
+        color: #0B1525;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+    }
 
-.trade-card {
-  display: flex;
-  align-items: center;
-  gap: 16px;
-  padding: 16px 20px;
-  border-radius: 10px;
-  border-left: 3px solid transparent;
-  background: rgba(255,255,255,0.04);
-  position: relative;
-}
+    .card-role {
+        font-size: 10px;
+        color: #8AA0BF;
+        margin-top: 1px;
+    }
 
-.trade-card.buy {
-  border-left-color: #22c55e;
-  background: rgba(34, 197, 94, 0.05);
-}
+    .card-ticker {
+        display: inline-block;
+        margin-top: 4px;
+        font-size: 10px;
+        font-weight: 700;
+        background: #EDF2FB;
+        color: #1A5FBF;
+        border-radius: 4px;
+        padding: 1px 7px;
+    }
 
-.trade-card.sell {
-  border-left-color: #ef4444;
-  background: rgba(239, 68, 68, 0.05);
-}
+    .card-right {
+        text-align: right;
+        flex-shrink: 0;
+    }
 
-.trade-icon {
-  font-size: 20px;
-  font-weight: 800;
-  width: 32px;
-  text-align: center;
-  flex-shrink: 0;
-}
+    .card-amount {
+        font-size: 15px;
+        font-weight: 700;
+    }
 
-.trade-icon.buy { color: #22c55e; }
-.trade-icon.sell { color: #ef4444; }
+    .card-shares {
+        font-size: 10px;
+        color: #9AAABF;
+        margin-top: 2px;
+    }
 
-.trade-type-badge {
-  font-size: 10px;
-  font-weight: 700;
-  padding: 3px 8px;
-  border-radius: 4px;
-  text-transform: uppercase;
-  letter-spacing: 0.8px;
-  flex-shrink: 0;
-}
+    .more-row {
+        text-align: center;
+        font-size: 10px;
+        color: #8AA0BF;
+        background: #EDF2FB;
+        border-radius: 8px;
+        padding: 6px;
+    }
 
-.trade-type-badge.buy {
-  background: rgba(34, 197, 94, 0.15);
-  color: #22c55e;
-}
+    .lectura {
+        background: #0B1D3A;
+        border-radius: 14px;
+        padding: 14px 15px;
+        margin-top: 2px;
+    }
 
-.trade-type-badge.sell {
-  background: rgba(239, 68, 68, 0.15);
-  color: #ef4444;
-}
+    .lec-top {
+        display: flex;
+        align-items: center;
+        gap: 7px;
+        margin-bottom: 9px;
+    }
 
-.trade-info {
-  flex: 1;
-  min-width: 0;
-  display: flex;
-  flex-direction: column;
-  gap: 3px;
-}
+    .lec-dot {
+        width: 7px;
+        height: 7px;
+        border-radius: 50%;
+        background: #1A8FFF;
+        flex-shrink: 0;
+    }
 
-.trade-name {
-  font-size: 15px;
-  font-weight: 700;
-  color: #f1f5f9;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
+    .lec-label {
+        font-size: 9px;
+        font-weight: 700;
+        color: #1A8FFF;
+        letter-spacing: 1.2px;
+    }
 
-.trade-role {
-  font-size: 12px;
-  color: rgba(255,255,255,0.42);
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
+    .lec-line {
+        flex: 1;
+        height: 0.5px;
+        background: rgba(26, 143, 255, 0.2);
+    }
 
-.trade-ticker {
-  display: flex;
-  flex-direction: column;
-  align-items: flex-end;
-  gap: 3px;
-  flex-shrink: 0;
-}
+    .lec-body {
+        font-size: 11px;
+        color: #A0BDD8;
+        line-height: 1.65;
+    }
 
-.trade-ticker-label {
-  font-size: 16px;
-  font-weight: 800;
-  color: #f59e0b;
-  letter-spacing: 0.5px;
-}
+    .lec-body strong {
+        color: #fff;
+        font-weight: 600;
+    }
 
-.trade-ticker-shares {
-  font-size: 11px;
-  color: rgba(255,255,255,0.35);
-}
+    .lec-tickers {
+        display: flex;
+        gap: 6px;
+        flex-wrap: wrap;
+        margin-top: 10px;
+    }
 
-.trade-amount {
-  text-align: right;
-  flex-shrink: 0;
-  display: flex;
-  flex-direction: column;
-  align-items: flex-end;
-  gap: 3px;
-}
+    .lec-tick {
+        font-size: 10px;
+        font-weight: 600;
+        background: rgba(26, 143, 255, 0.15);
+        color: #6AB4FF;
+        border-radius: 20px;
+        padding: 3px 9px;
+    }
 
-.trade-amount-value {
-  font-size: 18px;
-  font-weight: 800;
-  color: #f1f5f9;
-}
+    .ftr {
+        background: #0B1525;
+        padding: 9px 20px;
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+    }
 
-.trade-amount-label {
-  font-size: 11px;
-  color: rgba(255,255,255,0.35);
-  text-transform: uppercase;
-  letter-spacing: 0.5px;
-}
+    .ftr-handle {
+        font-size: 10px;
+        color: #3A5A80;
+        font-weight: 600;
+    }
 
-/* ── EXTRA TRADES BADGE ── */
-.extra-badge {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  padding: 14px 20px;
-  background: rgba(245,158,11,0.08);
-  border: 1px solid rgba(245,158,11,0.2);
-  border-radius: 10px;
-  margin-top: 4px;
-}
-
-.extra-badge-text {
-  font-size: 14px;
-  font-weight: 600;
-  color: #f59e0b;
-}
-
-.extra-badge-cta {
-  font-size: 12px;
-  color: rgba(245,158,11,0.65);
-  letter-spacing: 0.5px;
-}
-
-/* ── LECTURA INVESTX ── */
-.lectura-section {
-  margin: 20px 64px 0;
-  padding: 24px 28px;
-  background: rgba(255,255,255,0.035);
-  border: 1px solid rgba(255,255,255,0.08);
-  border-radius: 12px;
-}
-
-.lectura-header {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  margin-bottom: 12px;
-}
-
-.lectura-dot {
-  width: 6px;
-  height: 6px;
-  background: #f59e0b;
-  border-radius: 50%;
-}
-
-.lectura-title {
-  font-size: 11px;
-  font-weight: 700;
-  color: #f59e0b;
-  text-transform: uppercase;
-  letter-spacing: 2px;
-}
-
-.lectura-text {
-  font-size: 14px;
-  line-height: 1.65;
-  color: rgba(255,255,255,0.62);
-}
-
-/* ── TAGS ── */
-.tags-section {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  padding: 16px 64px 0;
-  flex-wrap: wrap;
-}
-
-.tag {
-  font-size: 12px;
-  color: rgba(255,255,255,0.45);
-  background: rgba(255,255,255,0.05);
-  border: 1px solid rgba(255,255,255,0.08);
-  border-radius: 6px;
-  padding: 5px 12px;
-  letter-spacing: 0.3px;
-}
-
-/* ── FOOTER ── */
-.footer {
-  margin-top: auto;
-  padding: 20px 64px 44px;
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  border-top: 1px solid rgba(255,255,255,0.07);
-}
-
-.footer-handle {
-  font-size: 14px;
-  font-weight: 700;
-  color: rgba(255,255,255,0.45);
-  letter-spacing: 0.5px;
-}
-
-.footer-disclaimer {
-  font-size: 11px;
-  color: rgba(255,255,255,0.22);
-  letter-spacing: 0.3px;
-}
-
-.footer-brand {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-}
-
-.footer-brand-dot {
-  width: 6px;
-  height: 6px;
-  background: linear-gradient(135deg, #f59e0b, #f97316);
-  border-radius: 50%;
-}
-
-.footer-brand-text {
-  font-size: 13px;
-  font-weight: 700;
-  color: rgba(245,158,11,0.6);
-  letter-spacing: 1.5px;
-  text-transform: uppercase;
-}
-</style>
+    .ftr-disc {
+        font-size: 8px;
+        color: #263A52;
+    }
+    </style>
 </head>
 <body>
-<div class="card">
+    <div class="reel">
 
-  <!-- HEADER -->
-  <div class="header">
-    <div class="brand">
-      <div class="brand-icon">iX</div>
-      <div class="brand-text">
-        <div class="brand-name">InvestX</div>
-        <div class="brand-sub">Market Intelligence</div>
-      </div>
-    </div>
-    <div class="header-badge">
-      <div class="header-badge-icon">🕵️</div>
-      <div class="header-badge-text">
-        <div class="header-badge-title">Insider Trading</div>
-        <div class="header-badge-sub">Movimientos de directivos</div>
-      </div>
-    </div>
-  </div>
-
-  <!-- META BAR -->
-  <div class="meta-bar">
-    <div class="meta-week">{{ week_label }}</div>
-    <div class="meta-filters">
-      <span>Operaciones +$500K</span>
-      <div class="meta-dot"></div>
-      <span>Form 4 SEC</span>
-      <div class="meta-dot"></div>
-      <span>Open-market</span>
-    </div>
-  </div>
-
-  <!-- STATS -->
-  <div class="stats-bar">
-    <div class="stat-item">
-      <div class="stat-arrow buy">↑</div>
-      <div class="stat-content">
-        <div class="stat-value">{{ buys }}</div>
-        <div class="stat-label">compras</div>
-      </div>
-    </div>
-    <div class="stat-item">
-      <div class="stat-arrow sell">↓</div>
-      <div class="stat-content">
-        <div class="stat-value">{{ sells }}</div>
-        <div class="stat-label">ventas</div>
-      </div>
-    </div>
-    <div class="stat-item">
-      <div class="stat-arrow neutral">◈</div>
-      <div class="stat-content">
-        <div class="stat-value">{{ companies }}</div>
-        <div class="stat-label">empresas</div>
-      </div>
-    </div>
-  </div>
-
-  <!-- TRADES -->
-  <div class="trades-section">
-    {% for day, trades in trades_by_day.items() %}
-    <div class="day-group">
-      <div class="day-label">{{ day }}</div>
-      {% for trade in trades %}
-      <div class="trade-card {{ 'buy' if trade.type == 'COMPRA' else 'sell' }}">
-        <div class="trade-icon {{ 'buy' if trade.type == 'COMPRA' else 'sell' }}">{{ '↑' if trade.type == 'COMPRA' else '↓' }}</div>
-        <div class="trade-type-badge {{ 'buy' if trade.type == 'COMPRA' else 'sell' }}">{{ trade.type }}</div>
-        <div class="trade-info">
-          <div class="trade-name">{{ trade.name }}</div>
-          <div class="trade-role">{{ trade.role }} · {{ trade.company }}</div>
+        <!-- HEADER -->
+        <div class="hdr">
+            <div class="hdr-left">
+                <div class="hdr-logo">iX</div>
+                <div class="hdr-brand">INVEST<em>X</em></div>
+            </div>
+            <div class="hdr-pill">INSIDER TRADING</div>
         </div>
-        <div class="trade-ticker">
-          <div class="trade-ticker-label">{{ trade.ticker }}</div>
-          <div class="trade-ticker-shares">{{ trade.shares }}</div>
+
+        <!-- HERO -->
+        <div class="hero">
+            <div class="hero-badge">🕵️</div>
+            <div>
+                <div class="hero-title">Movimientos de directivos</div>
+                <div class="hero-meta">{{ week_label }} &nbsp;·&nbsp; Operaciones +$500K &nbsp;·&nbsp; Form 4 SEC</div>
+                <div class="hero-stat">
+                    <span class="stat-pill sp-green">↑ {{ buys }} compras</span>
+                    <span class="stat-pill sp-red">↓ {{ sells }} ventas</span>
+                    <span class="stat-pill sp-blue">{{ companies }} empresas</span>
+                </div>
+            </div>
         </div>
-        <div class="trade-amount">
-          <div class="trade-amount-value">{{ trade.amount }}</div>
-          <div class="trade-amount-label">total</div>
+
+        <!-- TRADES -->
+        <div class="body">
+            {% for day, trades in trades_by_day.items() %}
+            <div class="day-row">
+                <div class="day-line"></div>
+                <div class="day-chip">{{ day }}</div>
+                <div class="day-line"></div>
+            </div>
+            {% for trade in trades %}
+            {% set is_buy = trade.type == 'COMPRA' %}
+            <div class="card">
+                <div class="card-side {{ 'cs-buy' if is_buy else 'cs-sell' }}">
+                    <div class="cs-arrow {{ 'buy-c' if is_buy else 'sell-c' }}">{{ '↑' if is_buy else '↓' }}</div>
+                    <div class="cs-word  {{ 'buy-c' if is_buy else 'sell-c' }}">{{ trade.type }}</div>
+                </div>
+                <div class="card-mid">
+                    <div class="card-name">{{ trade.name }}</div>
+                    <div class="card-role">{{ trade.role }} · {{ trade.company }}</div>
+                    <div class="card-ticker">{{ trade.ticker }}</div>
+                </div>
+                <div class="card-right">
+                    <div class="card-amount {{ 'buy-c' if is_buy else 'sell-c' }}">{{ trade.amount }}</div>
+                    <div class="card-shares">{{ trade.shares }}</div>
+                </div>
+            </div>
+            {% endfor %}
+            {% endfor %}
+
+            {% if extra_trades > 0 %}
+            <div class="more-row">+{{ extra_trades }} operaciones más esta semana &nbsp;·&nbsp; Canal premium ↗</div>
+            {% endif %}
+
+            <!-- LECTURA INVESTX -->
+            <div class="lectura">
+                <div class="lec-top">
+                    <div class="lec-dot"></div>
+                    <div class="lec-label">LECTURA INVESTX</div>
+                    <div class="lec-line"></div>
+                </div>
+                <div class="lec-body">{{ lectura | safe }}</div>
+                {% if tags %}
+                <div class="lec-tickers">
+                    {% for tag in tags %}
+                    <span class="lec-tick">📈 {{ tag }}</span>
+                    {% endfor %}
+                </div>
+                {% endif %}
+            </div>
         </div>
-      </div>
-      {% endfor %}
+
+        <!-- FOOTER -->
+        <div class="ftr">
+            <div class="ftr-handle">@investx_trading</div>
+            <div class="ftr-disc">No es asesoramiento financiero</div>
+        </div>
+
     </div>
-    {% endfor %}
-
-    {% if extra_trades > 0 %}
-    <div class="extra-badge">
-      <div class="extra-badge-text">+{{ extra_trades }} operaciones más esta semana</div>
-      <div class="extra-badge-cta">Canal premium ↗</div>
-    </div>
-    {% endif %}
-  </div>
-
-  <!-- LECTURA INVESTX -->
-  <div class="lectura-section">
-    <div class="lectura-header">
-      <div class="lectura-dot"></div>
-      <div class="lectura-title">Lectura InvestX</div>
-    </div>
-    <div class="lectura-text">{{ lectura | safe }}</div>
-  </div>
-
-  <!-- TAGS -->
-  {% if tags %}
-  <div class="tags-section">
-    {% for tag in tags %}
-    <div class="tag">📈 {{ tag }}</div>
-    {% endfor %}
-  </div>
-  {% endif %}
-
-  <!-- FOOTER -->
-  <div class="footer">
-    <div class="footer-handle">@investx_trading</div>
-    <div class="footer-disclaimer">No es asesoramiento financiero</div>
-    <div class="footer-brand">
-      <div class="footer-brand-dot"></div>
-      <div class="footer-brand-text">InvestX</div>
-    </div>
-  </div>
-
-</div>
 </body>
 </html>

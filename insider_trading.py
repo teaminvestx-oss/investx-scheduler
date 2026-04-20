@@ -617,11 +617,15 @@ def _build_instagram_template_data(
     visible    = all_sorted[:_MAX_VISIBLE_TRADES]
     extra      = max(0, len(all_sorted) - _MAX_VISIBLE_TRADES)
 
-    # Group visible trades by day label
+    _DIAS_SHORT  = ["LUN", "MAR", "MIE", "JUE", "VIE", "SAB", "DOM"]
+    _MESES_SHORT = ["ENE", "FEB", "MAR", "ABR", "MAY", "JUN",
+                    "JUL", "AGO", "SEP", "OCT", "NOV", "DIC"]
+
+    # Group visible trades by day label ("MAR 8 ABR")
     trades_by_day: Dict[str, List[Dict]] = {}
     for t in visible:
         d     = t["date"]
-        label = f"{DIAS_ES[d.weekday()]} {d.day} {MESES_ES[d.month - 1]}"
+        label = f"{_DIAS_SHORT[d.weekday()]} {d.day} {_MESES_SHORT[d.month - 1]}"
         if label not in trades_by_day:
             trades_by_day[label] = []
         shares_fmt = f"{int(t['shares']):,}".replace(",", ".") + " acc."
@@ -638,10 +642,9 @@ def _build_instagram_template_data(
     # Tags: tickers of top visible trades (unique, preserving order)
     tags = list(dict.fromkeys(t["ticker"] for t in visible))
 
-    # week_label
-    iso_year, iso_week, _ = date_to.isocalendar()
-    date_str  = _date_range_str(date_from, date_to)
-    week_label = f"Semana {iso_week} · {date_str}"
+    # week_label: "Semana 7–11 abr" — matches hero-meta in template
+    date_str   = _date_range_str(date_from, date_to)
+    week_label = f"Semana {date_str}"
 
     companies = len({t["ticker"] for t in agg_trades})
 
