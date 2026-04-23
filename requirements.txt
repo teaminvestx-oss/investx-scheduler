@@ -11,3 +11,4 @@ setuptools
 matplotlib
 playwright
 jinja2
+instagrapi
