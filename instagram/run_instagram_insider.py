@@ -14,6 +14,30 @@ TZ         = ZoneInfo("Europe/Madrid")
 CACHE_FILE = "insider_instagram_cache.json"
 STATE_FILE = "insider_instagram_state.json"
 
+_TEST_DATA = {
+    "week_label": "Semana 7–11 abr",
+    "buys": 2,
+    "sells": 1,
+    "companies": 3,
+    "trades_by_day": {
+        "MAR 8 ABR": [
+            {"type": "COMPRA", "name": "Jensen Huang",   "role": "CEO", "company": "Nvidia",    "ticker": "NVDA",  "amount": "$10.5M", "shares": "12.000 acc."},
+            {"type": "COMPRA", "name": "Sundar Pichai",  "role": "CEO", "company": "Alphabet",  "ticker": "GOOGL", "amount": "$857K",  "shares": "5.000 acc."},
+        ],
+        "JUE 10 ABR": [
+            {"type": "VENTA",  "name": "Mark Zuckerberg","role": "CEO", "company": "Meta",      "ticker": "META",  "amount": "$25.6M", "shares": "50.000 acc."},
+        ],
+    },
+    "extra_trades": 3,
+    "lectura": (
+        "Balance <strong>comprador en semiconductores</strong>. "
+        "Dos CEOs comprando en mercado abierto — convicción interna fuerte. "
+        "Venta Zuckerberg es plan <strong>10b5-1</strong> programado, "
+        "sin valor informativo. Vigilar <strong>NVDA y GOOGL</strong>."
+    ),
+    "tags": ["NVDA", "GOOGL", "Semiconductores"],
+}
+
 
 # ── State helpers ──────────────────────────────────────────────────────────────
 
@@ -62,21 +86,25 @@ def _load_cache() -> dict | None:
 # ── Main runner ────────────────────────────────────────────────────────────────
 
 def run_instagram_insider(force: bool = False) -> None:
-    now = datetime.now(TZ)
+    now       = datetime.now(TZ)
+    test_mode = os.getenv("INSTAGRAM_TEST_MODE", "0").strip().lower() in ("1", "true", "yes")
 
     if not force and _already_posted_this_week(now):
         print("[instagram] Ya publicado en Instagram esta semana. Skipping.")
         return
 
-    cache = _load_cache()
-    if not cache:
-        print("[instagram] No hay datos cacheados del Insider Trading. Skipping.")
-        return
-
-    data      = cache.get("template_data")
-    if not data:
-        print("[instagram] Cache sin template_data. Skipping.")
-        return
+    if test_mode:
+        print("[instagram] MODO TEST — usando datos de prueba.")
+        data = _TEST_DATA
+    else:
+        cache = _load_cache()
+        if not cache:
+            print("[instagram] No hay datos cacheados del Insider Trading. Skipping.")
+            return
+        data = cache.get("template_data")
+        if not data:
+            print("[instagram] Cache sin template_data. Skipping.")
+            return
 
     week_label = data.get("week_label", "")
     lectura    = data.get("lectura", "")
