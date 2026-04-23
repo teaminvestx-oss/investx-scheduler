@@ -9,6 +9,8 @@
 
 import math
 import os
+import subprocess
+import sys
 from pathlib import Path
 
 from jinja2 import Environment, FileSystemLoader
@@ -44,6 +46,20 @@ def render_insider_card(data: dict, output_path: str = OUTPUT_PATH) -> str:
         f.write(html_content)
 
     print(f"[instagram/render] HTML escrito en {tmp_html}")
+
+    # Instala Chromium si no está disponible (necesario en Render donde el
+    # cache de /opt/render/.cache/ms-playwright no persiste entre runs)
+    try:
+        from playwright.sync_api import sync_playwright as _check
+        with _check() as _p:
+            _p.chromium.executable_path  # lanza excepción si no existe
+    except Exception:
+        print("[instagram/render] Chromium no encontrado, instalando...")
+        subprocess.run(
+            [sys.executable, "-m", "playwright", "install", "chromium"],
+            check=True,
+        )
+        print("[instagram/render] Chromium instalado.")
 
     from playwright.sync_api import sync_playwright
 
