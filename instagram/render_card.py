@@ -4,8 +4,6 @@
 # Strategy: the template is designed at 340 px (natural card width).
 # Playwright renders at device_scale_factor = 1080/340 ≈ 3.176, which
 # produces a physical 1080 px wide output without any CSS scaling tricks.
-#
-# Requires: pip install playwright jinja2 && playwright install chromium
 
 import math
 import os
@@ -22,6 +20,22 @@ NATURAL_WIDTH  = 340
 DPR            = CARD_WIDTH / NATURAL_WIDTH          # 3.1764...
 NATURAL_HEIGHT = math.ceil(CARD_HEIGHT / DPR)       # 425 px — CSS clip height
 OUTPUT_PATH    = "/tmp/insider_card.png"
+
+
+def _ensure_chromium() -> None:
+    """Installs Chromium if the executable is missing. Fast no-op if already present."""
+    from playwright.sync_api import sync_playwright
+    with sync_playwright() as p:
+        exe = Path(p.chromium.executable_path)
+    if not exe.exists():
+        print(f"[instagram/render] Chromium no encontrado en {exe}, instalando...")
+        subprocess.run(
+            [sys.executable, "-m", "playwright", "install", "chromium"],
+            check=True,
+        )
+        print("[instagram/render] Chromium instalado.")
+    else:
+        print(f"[instagram/render] Chromium OK: {exe}")
 
 
 def render_insider_card(data: dict, output_path: str = OUTPUT_PATH) -> str:
@@ -47,19 +61,7 @@ def render_insider_card(data: dict, output_path: str = OUTPUT_PATH) -> str:
 
     print(f"[instagram/render] HTML escrito en {tmp_html}")
 
-    # Instala Chromium si no está disponible (necesario en Render donde el
-    # cache de /opt/render/.cache/ms-playwright no persiste entre runs)
-    try:
-        from playwright.sync_api import sync_playwright as _check
-        with _check() as _p:
-            _p.chromium.executable_path  # lanza excepción si no existe
-    except Exception:
-        print("[instagram/render] Chromium no encontrado, instalando...")
-        subprocess.run(
-            [sys.executable, "-m", "playwright", "install", "chromium"],
-            check=True,
-        )
-        print("[instagram/render] Chromium instalado.")
+    _ensure_chromium()
 
     from playwright.sync_api import sync_playwright
 
