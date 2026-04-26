@@ -16,25 +16,26 @@ from pathlib import Path
 def _get_client():
     from instagrapi import Client
 
-    username = os.environ["INSTAGRAM_USERNAME"]
-    password = os.environ["INSTAGRAM_PASSWORD"]
+    username    = os.environ["INSTAGRAM_USERNAME"]
+    password    = os.environ["INSTAGRAM_PASSWORD"]
     session_b64 = os.environ.get("INSTAGRAM_SESSION", "")
 
     cl = Client()
     cl.delay_range = [1, 3]
 
-    # Opción 1: sesión pre-autenticada desde env var (sin challenge)
+    # Opción 1: sesión pre-autenticada (generada con login_by_sessionid en Mac)
+    # NO llamamos a login() encima — eso corrompe la sesión en cuentas vinculadas a FB
     if session_b64:
         try:
             session = json.loads(base64.b64decode(session_b64).decode())
             cl.set_settings(session)
-            cl.login(username, password)
+            cl.set_user(username)
             print("[instagram/post] Sesión restaurada desde INSTAGRAM_SESSION.")
             return cl
         except Exception as e:
-            print(f"[instagram/post] Sesión expirada, intentando login limpio: {e}")
+            print(f"[instagram/post] Sesión inválida, intentando login directo: {e}")
 
-    # Opción 2: login directo (puede pedir challenge si es IP nueva)
+    # Opción 2: login directo (solo si no hay sesión guardada)
     print(f"[instagram/post] Login como @{username}...")
     cl.login(username, password)
     print("[instagram/post] Login OK.")
