@@ -3,14 +3,13 @@
 #
 # Required env vars:
 #   INSTAGRAM_USERNAME  — username sin @
-#   INSTAGRAM_PASSWORD  — contraseña
-#   INSTAGRAM_SESSION   — sesión base64 generada con setup_session.py (recomendado)
+#   INSTAGRAM_PASSWORD  — contraseña propia de Instagram (no la de Facebook)
+#   INSTAGRAM_SESSION   — sesión base64 (opcional, generada con setup_session.py)
 
 import base64
 import json
 import os
 import re
-from pathlib import Path
 
 
 def _get_client():
@@ -23,19 +22,16 @@ def _get_client():
     cl = Client()
     cl.delay_range = [1, 3]
 
-    # Opción 1: sesión pre-autenticada (generada con login_by_sessionid en Mac)
-    # NO llamamos a login() encima — eso corrompe la sesión en cuentas vinculadas a FB
     if session_b64:
         try:
             session = json.loads(base64.b64decode(session_b64).decode())
             cl.set_settings(session)
-            cl.set_user(username)
-            print("[instagram/post] Sesión restaurada desde INSTAGRAM_SESSION.")
+            cl.login(username, password)
+            print("[instagram/post] Sesión restaurada + re-auth OK.")
             return cl
         except Exception as e:
-            print(f"[instagram/post] Sesión inválida, intentando login directo: {e}")
+            print(f"[instagram/post] Sesión falló ({e}), intentando login limpio...")
 
-    # Opción 2: login directo (solo si no hay sesión guardada)
     print(f"[instagram/post] Login como @{username}...")
     cl.login(username, password)
     print("[instagram/post] Login OK.")
