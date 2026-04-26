@@ -12,3 +12,6 @@ matplotlib
 playwright
 jinja2
 instagrapi
+supabase
+openpyxl
+python-telegram-bot
