@@ -39,8 +39,13 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_analiza(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    # Only respond in private chats
+    # In groups, redirect to private chat
     if update.message.chat.type != "private":
+        bot_username = (await context.bot.get_me()).username
+        await update.message.reply_text(
+            f"🔒 Los análisis se envían en privado.\n"
+            f"Escríbeme aquí: @{bot_username}"
+        )
         return
 
     user = update.effective_user

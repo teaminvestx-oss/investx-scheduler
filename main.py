@@ -241,4 +241,19 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    import time
+    import threading
+    from research.bot_handler import run_bot
+
+    def _scheduler_loop():
+        while True:
+            try:
+                main()
+            except Exception as e:
+                print(f"ERROR | scheduler: {e}")
+            time.sleep(60)
+
+    t = threading.Thread(target=_scheduler_loop, daemon=True)
+    t.start()
+    print("INFO | __main__: Scheduler arrancado. Iniciando bot de Telegram...")
+    run_bot()
