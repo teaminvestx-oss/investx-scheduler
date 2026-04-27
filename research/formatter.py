@@ -6,7 +6,9 @@ from openai import OpenAI
 
 logger = logging.getLogger(__name__)
 
-_openai_client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+
+def _get_openai_client() -> OpenAI:
+    return OpenAI(api_key=os.environ["OPENAI_API_KEY"])
 
 SYSTEM_PROMPT = (
     "Eres el analista InvestX. Formatea este análisis para Telegram en español. "
@@ -65,7 +67,7 @@ def format_analysis(data: dict, queries_remaining: int, queries_limit: int) -> s
         f"⚠️ No es asesoramiento financiero · @investx_trading"
     )
 
-    response = _openai_client.chat.completions.create(
+    response = _get_openai_client().chat.completions.create(
         model="gpt-4o-mini",
         messages=[
             {"role": "system", "content": SYSTEM_PROMPT},
