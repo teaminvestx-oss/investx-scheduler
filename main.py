@@ -241,4 +241,7 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    import time
+    while True:
+        main()
+        time.sleep(60 * 15)  # check every 15 minutes
